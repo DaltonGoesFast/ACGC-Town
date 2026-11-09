@@ -24,11 +24,13 @@ f32 fatan2(f32, f32);
 f32 fsqrt(f32);
 f32 facos(f32);
 #else
-/* PC stubs - these will be implemented in pc_mtx.c */
+/* PC stubs - these will be implemented in pc_mtx.c.
+ * glibc's C++ <math.h> already declares float fsqrt(double); the game function is renamed. */
 s16 sins(u16);
 s16 coss(u16);
 f32 fatan2(f32, f32);
-f32 fsqrt(f32);
+f32 pc_fsqrt(f32);
+#define fsqrt pc_fsqrt
 f32 facos(f32);
 #endif
 

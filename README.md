@@ -80,29 +80,35 @@ More details are in [pc/DOCUMENTATION.md](https://github.com/vsimochi/ACGC-PC-Mu
 
 ## Linux dedicated server
 
-The dedicated server is the same `AnimalCrossing` binary with `--dedicated`. On Linux that flag does not open a window, a GL context, or a sound device. The town is stored in `servers/default/` and loaded again the next time the process starts.
+The dedicated server is the same `AnimalCrossing` binary with `--dedicated`. On Linux that flag does not open a window, a GL context, or a sound device. The process still links SDL2 and OpenGL because the client is the same binary.
 
-You need a C toolchain, CMake, SDL2, and OpenGL headers (the dedicated server does not use them at run time; the single binary still links them for the client). The decomp casts pointers to 32-bit integers. Upstream's supported setup is a 32-bit compiler (`pc/cmake/Toolchain-linux32.cmake`). A 64-bit build is experimental (`-DPC_ALLOW_64BIT=ON`) and links the image below 4 GB.
+Build it as 32-bit. The decomp's `long` is a 32-bit GameCube type, and i386 System V aligns `double` on 4 bytes unless `-malign-double` is set. That flag keeps `Save_t` on the layout the multiplayer code checks. A 64-bit Linux link is not the build to use yet: `u32`/`s32` are `unsigned int`/`int` under `__LP64__` (they stay `long` on Windows), but many headers still say `long` where they mean 32 bits.
 
 ```bash
-sudo apt install build-essential cmake libsdl2-dev libgl1-mesa-dev
-# 32-bit, when the i686 toolchain and :i386 SDL2 packages are installed:
-# cmake -S pc -B pc/build32 -DCMAKE_TOOLCHAIN_FILE=pc/cmake/Toolchain-linux32.cmake -DPC_TEST_HOOKS=OFF
-cmake -S pc -B pc/build64 -DPC_ALLOW_64BIT=ON -DPC_TEST_HOOKS=OFF
-cmake --build pc/build64 -j
+sudo dpkg --add-architecture i386
+sudo apt install build-essential gcc-multilib g++-multilib cmake libsdl2-dev:i386 libgl1-mesa-dev:i386
+export PKG_CONFIG_PATH=/usr/lib/i386-linux-gnu/pkgconfig
+export PKG_CONFIG_LIBDIR=/usr/lib/i386-linux-gnu/pkgconfig
+cmake -S pc -B pc/build32 \
+  -DCMAKE_C_COMPILER=gcc -DCMAKE_CXX_COMPILER=g++ \
+  -DCMAKE_C_FLAGS="-m32 -malign-double" \
+  -DCMAKE_CXX_FLAGS="-m32 -malign-double" \
+  -DCMAKE_EXE_LINKER_FLAGS="-m32" \
+  -DPC_TEST_HOOKS=OFF
+cmake --build pc/build32 -j
 ```
 
-The transport self-test does not need a disc image:
+The transport self-test does not need a disc image. It checks the WebSocket accept string from RFC 6455, a binary-frame round trip, and an ACNP reliable ping/ack over both UDP and WebSocket:
 
 ```bash
-cmake --build pc/build64 --target ac_xport_selftest -j
-./pc/build64/bin/ac_xport_selftest
+cmake --build pc/build32 --target ac_xport_selftest -j
+./pc/build32/bin/ac_xport_selftest
 ```
 
-Place your own USA GAFE01 disc image in `rom/` next to the binary (`pc/build64/bin/rom/`). Do not commit it. Then:
+Place your own USA GAFE01 disc image in `rom/` next to the binary (`pc/build32/bin/rom/`). Do not commit it. Then:
 
 ```bash
-cd pc/build64/bin
+cd pc/build32/bin
 cp ../../../pc/server/server_config.ini ../../../pc/server/start-server.sh .
 chmod +x start-server.sh
 ./start-server.sh ./AnimalCrossing
@@ -116,9 +122,9 @@ Or without the script:
 
 - UDP `7777` is the native client port (`--connect ip:7777`).
 - TCP `7778` is the WebSocket port. Each binary frame is one ACNP datagram, the same bytes as a UDP packet. `ws_port = 0` in `server_config.ini` turns it off.
-- First launch with an empty `servers/default/` asks for a town name on stdin (1–8 characters). Later launches load `servers/default/town/`.
-- Console: `help`, `status`, `players`, `save`, `stop`. Ctrl+C saves and exits.
-- Without a disc image the process cannot load assets or simulate the town. It should exit at the disc check rather than invent a town.
+- First launch creates `servers/default/` and, once a disc is present, asks for a town name on stdin (1–8 characters) if the town file is missing. Later launches load `servers/default/town/`.
+- Console: `help`, `status`, `players`, `save`, `stop`. Ctrl+C asks the game loop to stop.
+- Without a disc image the process creates the server directory, binds UDP and WebSocket, prints that the ROM is missing, and exits 1. It does not invent a town.
 
 The plan for Android, the browser client, and touch controls is [docs/ROADMAP.md](docs/ROADMAP.md).
 

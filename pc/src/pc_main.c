@@ -1,4 +1,7 @@
 /* pc_main.c - PC entry point: SDL2/GL init and boot sequence */
+#ifndef _WIN32
+#define _GNU_SOURCE /* Dl_info / dladdr */
+#endif
 #include "pc_platform.h"
 #include "pc_guest_admit.h" /* --max-guests range */
 #include "pc_nook_house.h" /* guest Nook dialogue (M4): the rejoin hold */
@@ -61,9 +64,9 @@ int           g_pc_widescreen_stretch = 0;
 unsigned int pc_image_base = 0;
 unsigned int pc_image_end  = 0;
 
-#ifdef _WIN32
 #include <signal.h>
 
+#ifdef _WIN32
 /* Stage M1-2: headless graceful termination. Sets the SAME shutdown flag the existing SDL_QUIT
  * handling already uses (pc_platform_poll_events, below) -- the actual final save still only
  * ever runs later, on the normal single-threaded shutdown path in src/main.c, once graph_proc()
@@ -104,11 +107,12 @@ static BOOL WINAPI pc_console_ctrl_handler(DWORD ctrl_type) {
     }
 }
 
+#endif
+
 static void pc_signal_handler(int sig) {
     (void)sig;
     g_pc_running = 0;
 }
-#endif
 
 /* Test aid: AC_DISPLAY_NAME=<text> puts the window on the display whose name contains <text> (case-insensitive). Matched against the SDL display name, the Windows monitor
  * friendly name (QueryDisplayConfig / DISPLAYCONFIG_TARGET_DEVICE_NAME, joined to the SDL display through its GDI device) and the EDID vendor (3 letters + a short vendor
@@ -2752,13 +2756,20 @@ int main(int argc, char* argv[]) {
     {
         Dl_info dl;
         if (dladdr((void*)main, &dl) && dl.dli_fbase) {
+#if UINTPTR_MAX > 0xFFFFFFFFu
+            typedef Elf64_Ehdr PcElfEhdr;
+            typedef Elf64_Phdr PcElfPhdr;
+#else
+            typedef Elf32_Ehdr PcElfEhdr;
+            typedef Elf32_Phdr PcElfPhdr;
+#endif
             pc_image_base = (unsigned int)(uintptr_t)dl.dli_fbase;
-            Elf32_Ehdr* ehdr = (Elf32_Ehdr*)dl.dli_fbase;
-            Elf32_Phdr* phdr = (Elf32_Phdr*)((char*)dl.dli_fbase + ehdr->e_phoff);
+            PcElfEhdr* ehdr = (PcElfEhdr*)dl.dli_fbase;
+            PcElfPhdr* phdr = (PcElfPhdr*)((char*)dl.dli_fbase + ehdr->e_phoff);
             unsigned int max_end = 0;
             for (int i = 0; i < ehdr->e_phnum; i++) {
                 if (phdr[i].p_type == PT_LOAD) {
-                    unsigned int seg_end = phdr[i].p_vaddr + phdr[i].p_memsz;
+                    unsigned int seg_end = (unsigned int)phdr[i].p_vaddr + (unsigned int)phdr[i].p_memsz;
                     if (seg_end > max_end) max_end = seg_end;
                 }
             }
@@ -2863,8 +2874,11 @@ int main(int argc, char* argv[]) {
             "Place a disc image (.iso, .gcm, or .ciso) to the \"rom\" subfolder.";
         fprintf(stderr, "[PC] %s\n", msg);
         pc_lowaddr_report();
-        SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_ERROR,
-                                 "Animal Crossing - Missing ROM", msg, g_pc_window);
+        /* A headless dedicated server has no window. The dialog would wait forever. */
+        if (g_pc_window != NULL) {
+            SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_ERROR,
+                                     "Animal Crossing - Missing ROM", msg, g_pc_window);
+        }
         pc_platform_shutdown();
         return 1;
     }

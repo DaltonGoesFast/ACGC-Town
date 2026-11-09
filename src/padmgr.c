@@ -6,6 +6,8 @@
 
 #ifdef TARGET_PC
 #include "dolphin/pad.h"
+/* glibc's errno macro would rewrite the controller status field of the same name. */
+#undef errno
 #endif
 
 static int frame = 0;

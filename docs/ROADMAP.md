@@ -71,6 +71,6 @@ The server does not render this HUD. It already sends the inventory and field st
 
 ## Build notes for the server
 
-The decomp still casts pointers to `u32`. A 64-bit build is the experimental `PC_ALLOW_64BIT` / low-address link (`--image-base=0x400000`). A 32-bit toolchain (`pc/cmake/Toolchain-linux32.cmake`) is the configuration upstream documents as the supported one. See the README for the exact commands.
+The Linux server that was built and started is 32-bit (`-m32 -malign-double`), which matches the GameCube/`long`-is-32-bit ABI and the 8-byte alignment of `double` the save layout expects. `u32` and `s32` are `int` on LP64 so a future 64-bit Linux build does not treat them as 8-byte `long`, but many other headers still use `long` for 32-bit fields, so `-DPC_ALLOW_64BIT=ON` is not a finished Linux configuration. See the README for the exact commands.
 
 Do not commit disc images, extracted assets, `servers/`, or `save/`.

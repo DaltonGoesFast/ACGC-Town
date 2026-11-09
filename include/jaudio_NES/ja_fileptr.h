@@ -47,9 +47,14 @@ typedef struct JaFilePtr32_ { u32 mAddr; } JaFilePtr32;
 #define JA_LAYOUT_OFF(T, f, off) _Static_assert(offsetof(T, f) == (off), #T "." #f " must match the GameCube/file-format offset")
 #endif
 #else
-/* expands to a valid, repeatable declaration so "JA_LAYOUT_SIZE(...);" is not a stray semicolon on any compiler */
-#define JA_LAYOUT_SIZE(T, sz) extern int _ja_layout_unused
-#define JA_LAYOUT_OFF(T, f, off) extern int _ja_layout_unused
+/* No-op declaration. T may be `struct Name`, so it cannot be pasted into an identifier. */
+#ifdef __cplusplus
+#define JA_LAYOUT_SIZE(T, sz) static_assert(true, "")
+#define JA_LAYOUT_OFF(T, f, off) static_assert(true, "")
+#else
+#define JA_LAYOUT_SIZE(T, sz) _Static_assert(1, "")
+#define JA_LAYOUT_OFF(T, f, off) _Static_assert(1, "")
+#endif
 #endif
 
 #endif

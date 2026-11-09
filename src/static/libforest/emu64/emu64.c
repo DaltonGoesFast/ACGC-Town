@@ -6003,11 +6003,14 @@ extern void emu64_cleanup(void) {
     emu64_class.emu64_cleanup();
 }
 
+#ifdef TARGET_PC
+extern "C" int g_pc_gl_live;
+#endif
+
 // hack - inlines in emu64_taskstart C wrapper otherwise
 #pragma dont_inline on
 extern void emu64_taskstart(Gfx* gfx) {
 #ifdef TARGET_PC
-    extern "C" int g_pc_gl_live;
     if (!g_pc_gl_live) return;
 #endif
     emu64_class.emu64_taskstart(gfx);
