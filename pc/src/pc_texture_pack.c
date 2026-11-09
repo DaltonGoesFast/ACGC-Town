@@ -674,6 +674,7 @@ static void neg_cache_insert(xxh_u64 key) {
 
 static void check_compressed_texture_support(void) {
     GLint num_ext = 0;
+    if (!g_pc_gl_live) return;
     glGetIntegerv(GL_NUM_EXTENSIONS, &num_ext);
     for (GLint i = 0; i < num_ext; i++) {
         const char* ext = (const char*)glGetStringi(GL_EXTENSIONS, i);

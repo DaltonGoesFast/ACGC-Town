@@ -1060,6 +1060,14 @@ void pc_dedicated_platform_summary(void) {
         return;
     }
     s_start_ticks = SDL_GetTicks();
+    if (g_pc_headless) {
+        snprintf(s_audio_driver, sizeof(s_audio_driver), "null");
+        s_audio_ok = 1;
+        pc_dedicated_say("platform: headless (no window, no GL context, no audio device) audio=null render=skipped "
+                         "(display lists, pc_gx_begin_frame, buffer swap; game loop, network and saves kept)");
+        PC_LOG(PCL_GENERAL, "dedicated platform: headless audio=null\n");
+        return;
+    }
     wf = g_pc_window != NULL ? SDL_GetWindowFlags(g_pc_window) : 0;
     pc_dedicated_say("platform: window=%s (GL 3.3 context kept) vsync=%s audio_driver=%s render=skipped "
                      "(emu64_taskstart, pc_gx_begin_frame, pc_gx_draw_pending, buffer swap; JW_EndFrame/VIWaitForRetrace kept)",

@@ -39,6 +39,8 @@ __declspec(dllexport) int AmdPowerXpressRequestHighPerformance = 1;
 
 SDL_Window*   g_pc_window = NULL;
 SDL_GLContext  g_pc_gl_context = NULL;
+int            g_pc_gl_live = 0;
+int            g_pc_headless = 0;
 atomic_int    g_pc_running = 1;
 int           g_pc_frame_limit_override = -1;
 int           g_pc_speedhack_enabled = 0; /* the F3 10x game-speed toggle was REMOVED (user request: it sped the whole game up); nothing sets this any more, it stays 0 */
@@ -246,13 +248,28 @@ void pc_platform_init(void) {
     SetConsoleCtrlHandler(pc_console_ctrl_handler, TRUE);
     signal(SIGINT, pc_signal_handler);
     signal(SIGTERM, pc_signal_handler);
+#else
+    /* A dedicated server on Linux has no desktop. SIGINT/SIGTERM still save and exit. */
+    signal(SIGINT, pc_signal_handler);
+    signal(SIGTERM, pc_signal_handler);
+    if (g_pc_dedicated) g_pc_headless = 1;
 #endif
-    if (g_pc_dedicated) {
+    if (g_pc_dedicated && !g_pc_headless) {
         pc_dedicated_pre_sdl_init(); /* --dedicated: dummy audio driver, selected BEFORE SDL_Init reads the driver choice */
     }
-    if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_GAMECONTROLLER | SDL_INIT_AUDIO | SDL_INIT_TIMER) < 0) {
+    if (SDL_Init(g_pc_headless ? (SDL_INIT_TIMER | SDL_INIT_EVENTS)
+                               : (SDL_INIT_VIDEO | SDL_INIT_GAMECONTROLLER | SDL_INIT_AUDIO | SDL_INIT_TIMER)) < 0) {
         fprintf(stderr, "SDL_Init failed: %s\n", SDL_GetError());
         exit(1);
+    }
+    if (g_pc_headless) {
+        g_pc_gl_live = 0;
+        g_pc_window_w = PC_SCREEN_WIDTH;
+        g_pc_window_h = PC_SCREEN_HEIGHT;
+        pc_gx_init();
+        pc_texture_pack_init();
+        if (g_pc_dedicated) pc_dedicated_platform_summary();
+        return;
     }
     if (g_pc_dedicated && !pc_dedicated_post_sdl_init()) {
         SDL_Quit();
@@ -312,6 +329,7 @@ void pc_platform_init(void) {
         SDL_Quit();
         exit(1);
     }
+    g_pc_gl_live = 1;
 
     SDL_GL_SetSwapInterval(g_pc_dedicated ? 0 : g_pc_settings.vsync); /* --dedicated: no vsync */
 
@@ -356,6 +374,11 @@ void pc_platform_shutdown(void) {
 }
 
 void pc_platform_update_window_size(void) {
+    if (g_pc_window == NULL) {
+        if (g_pc_window_w <= 0) g_pc_window_w = PC_SCREEN_WIDTH;
+        if (g_pc_window_h <= 0) g_pc_window_h = PC_SCREEN_HEIGHT;
+        return;
+    }
     SDL_GL_GetDrawableSize(g_pc_window, &g_pc_window_w, &g_pc_window_h);
     if (g_pc_window_w <= 0) g_pc_window_w = PC_SCREEN_WIDTH;
     if (g_pc_window_h <= 0) g_pc_window_h = PC_SCREEN_HEIGHT;
@@ -984,6 +1007,7 @@ int pc_settings_town_serve_effective(void) {
     return (g_pc_dedicated && g_pc_net_role == 1) ? 1 : 0;
 }
 static uint16_t g_pc_net_port = 7777;
+static int       g_pc_ws_port = -1; /* -1 = default (7778 on --dedicated, off otherwise); 0 = disabled */
 static char     g_pc_net_host_ip[64] = "127.0.0.1";
 
 /* M-A / M-B (town cache, multiplayer phase 2): --town-dir DIR (hidden, CLIENT-only, requires --connect) selects DIR (e.g. save/mp/towns/<townkey>) as the Card-A
@@ -1746,10 +1770,13 @@ int main(int argc, char* argv[]) {
             printf("                      can be claimed by clients. Default off; plain --host is unchanged. See pc_host_observer.h.\n");
             printf("  --dedicated         HOST-only option (requires --host; exit code 2 otherwise; cannot be combined with --connect,\n");
             printf("                      --bootstrap-resident, --bootstrap-guest or the host-self test hooks): run as an unattended\n");
-            printf("                      server. Implies --host-observer (no host resident), creates a HIDDEN window, no vsync, draws\n");
-            printf("                      nothing, uses SDL's dummy audio driver, keeps the console on and reads commands from stdin:\n");
-            printf("                      help, status, players, save, stop (Ctrl+C also stops gracefully). Default off; plain --host,\n");
-            printf("                      --host-observer and --bootstrap-resident are unchanged. See pc_dedicated.h.\n");
+            printf("                      server. Implies --host-observer (no host resident). On Linux it is headless: no window, no\n");
+            printf("                      OpenGL and no audio device (a null consumer keeps the audio clock moving). On Windows it\n");
+            printf("                      keeps a hidden window and SDL's dummy audio driver. Draws nothing. The console reads\n");
+            printf("                      help, status, players, save, stop (Ctrl+C also stops gracefully). The town is stored under\n");
+            printf("                      servers/default/ and reloaded on the next start. Default off. See pc_dedicated.h.\n");
+            printf("  --ws-port N         HOST: also listen for the same datagrams on a WebSocket (TCP) port. Default 7778 when\n");
+            printf("                      --dedicated is set, otherwise off. 0 disables it. One binary frame = one UDP packet.\n");
             printf("  --bootstrap-guest NAME,LAND,PLAYER_ID,LAND_ID[,GENDER[,FACE]]  TEST-ONLY, CLIENT role only, default off:\n");
             printf("                      become a GUEST (foreigner with that HOME PersonalID) in the loaded town\n");
             printf("                      and spawn at the station; no save is ever written. The guest is a FRESH\n");
@@ -2194,6 +2221,15 @@ int main(int argc, char* argv[]) {
         } else if (strcmp(argv[i], "--dedicated") == 0) {
             g_pc_dedicated = 1;
             pc_dedicated_early_console(); /* attach/allocate a console now so even the refusal text below is visible (valid redirected handles are kept) */
+        } else if (strcmp(argv[i], "--ws-port") == 0) {
+            int p = (i + 1 < argc) ? atoi(argv[i + 1]) : -1;
+            if (i + 1 >= argc || p < 0 || p > 65535) {
+                fprintf(stderr, "[PC] --ws-port: REFUSED: the option needs a TCP port 0..65535 (0 disables WebSocket)\n"
+                                "usage: AnimalCrossing --host [udp-port] --dedicated --ws-port N\n");
+                return 2;
+            }
+            g_pc_ws_port = p;
+            i++;
         } else if (strcmp(argv[i], "--no-authoritative-wildlife") == 0) {
             g_pc_authoritative_wildlife = 0; /* a HOST then lets every process roll its own vanilla fish / bugs again (clients follow the host's HOST_CONFIG) */
         } else if (strcmp(argv[i], "--authoritative-wildlife") == 0) {
@@ -2755,6 +2791,9 @@ int main(int argc, char* argv[]) {
      * unavailable) is logged inside pc_net_game_start_*() and just leaves g_pc_net_role's
      * request unfulfilled -- single-player continues exactly as if neither flag was passed. */
     if (g_pc_net_role == 1) {
+        int ws = g_pc_ws_port;
+        if (ws < 0) ws = g_pc_dedicated ? 7778 : 0;
+        (void)pc_net_set_ws_port((uint16_t)ws);
         pc_net_game_start_host(g_pc_net_port);
     } else if (g_pc_net_role == 2 && !g_pc_town_fetch) { /* --town-fetch starts the client after the pre-boot fetch (below) */
         pc_net_game_start_client(g_pc_net_host_ip, g_pc_net_port);

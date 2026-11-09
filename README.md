@@ -28,8 +28,9 @@ The game reads all assets directly from the disc image at startup. No extraction
 
 - **Host:** run `ACLauncher.exe --host` (UDP port 7777, or `--host <port>`).
 - **Join:** on the title screen choose *Play Online* and add the host's address and port, or run `ACLauncher.exe --connect <ip>[:port]`.
-- **Dedicated server:** edit `server_config.ini`, then double-click `Start Server.bat`. The server opens its own console (type `help`).
-- The host needs to allow inbound UDP on its port (firewall and, over the internet, a router port forward). Everyone should run the same version.
+- **Dedicated server (Windows):** edit `server_config.ini`, then double-click `Start Server.bat`. The server opens its own console (type `help`).
+- **Dedicated server (Linux):** see [Linux dedicated server](#linux-dedicated-server) below. The process is headless (no window, no OpenGL, no audio device). It listens on UDP and on a WebSocket port so a later browser client can use the same protocol.
+- The host needs to allow inbound UDP on its port, and TCP on the WebSocket port (firewall and, over the internet, a router port forward). Everyone should run the same version.
 - Players join as **residents** (their own house and character) or as **guests** (no house; they can buy a house from Nook).
 
 What the multiplayer includes: a host-run world (items, digging, planting, shops, events), other players shown walking, fishing, sitting and more, shared villagers and wildlife, chat, emotes, dresser storage, outdoor furniture, guest mail and museum donations, and a server console with operator and moderation commands. See the release notes for what each version added.
@@ -77,6 +78,50 @@ pacman -S mingw-w64-ucrt-x86_64-gcc mingw-w64-ucrt-x86_64-cmake mingw-w64-ucrt-x
 
 More details are in [pc/DOCUMENTATION.md](https://github.com/vsimochi/ACGC-PC-Multiplayer/blob/multiplayer/pc/DOCUMENTATION.md).
 
+## Linux dedicated server
+
+The dedicated server is the same `AnimalCrossing` binary with `--dedicated`. On Linux that flag does not open a window, a GL context, or a sound device. The town is stored in `servers/default/` and loaded again the next time the process starts.
+
+You need a C toolchain, CMake, SDL2, and OpenGL headers (the dedicated server does not use them at run time; the single binary still links them for the client). The decomp casts pointers to 32-bit integers. Upstream's supported setup is a 32-bit compiler (`pc/cmake/Toolchain-linux32.cmake`). A 64-bit build is experimental (`-DPC_ALLOW_64BIT=ON`) and links the image below 4 GB.
+
+```bash
+sudo apt install build-essential cmake libsdl2-dev libgl1-mesa-dev
+# 32-bit, when the i686 toolchain and :i386 SDL2 packages are installed:
+# cmake -S pc -B pc/build32 -DCMAKE_TOOLCHAIN_FILE=pc/cmake/Toolchain-linux32.cmake -DPC_TEST_HOOKS=OFF
+cmake -S pc -B pc/build64 -DPC_ALLOW_64BIT=ON -DPC_TEST_HOOKS=OFF
+cmake --build pc/build64 -j
+```
+
+The transport self-test does not need a disc image:
+
+```bash
+cmake --build pc/build64 --target ac_xport_selftest -j
+./pc/build64/bin/ac_xport_selftest
+```
+
+Place your own USA GAFE01 disc image in `rom/` next to the binary (`pc/build64/bin/rom/`). Do not commit it. Then:
+
+```bash
+cd pc/build64/bin
+cp ../../../pc/server/server_config.ini ../../../pc/server/start-server.sh .
+chmod +x start-server.sh
+./start-server.sh ./AnimalCrossing
+```
+
+Or without the script:
+
+```bash
+./AnimalCrossing --host 7777 --dedicated --ws-port 7778
+```
+
+- UDP `7777` is the native client port (`--connect ip:7777`).
+- TCP `7778` is the WebSocket port. Each binary frame is one ACNP datagram, the same bytes as a UDP packet. `ws_port = 0` in `server_config.ini` turns it off.
+- First launch with an empty `servers/default/` asks for a town name on stdin (1–8 characters). Later launches load `servers/default/town/`.
+- Console: `help`, `status`, `players`, `save`, `stop`. Ctrl+C saves and exits.
+- Without a disc image the process cannot load assets or simulate the town. It should exit at the disc check rather than invent a town.
+
+The plan for Android, the browser client, and touch controls is [docs/ROADMAP.md](docs/ROADMAP.md).
+
 ## Controls
 
 Keyboard bindings are customizable in the game (Esc menu > Settings > Controls > Keybindings) or via `keybindings.ini` next to the executable. Mouse buttons (Mouse1/Mouse2/Mouse3) can also be assigned.
@@ -109,7 +154,8 @@ SDL2 game controllers are supported with automatic hotplug detection. Button map
 |------|-------------|
 | `--host [port]` | Host a game (default port 7777) |
 | `--connect <ip>[:port]` | Join a host directly |
-| `--dedicated` | Run a dedicated server (see `Start Server.bat`) |
+| `--dedicated` | Run a dedicated server (Windows: `Start Server.bat`; Linux: headless, see above) |
+| `--ws-port N` | Host: WebSocket TCP port for the same datagrams (default 7778 with `--dedicated`, `0` off) |
 | `--verbose` | Enable diagnostic logging |
 | `--no-framelimit` | Disable frame limiter (unlocked FPS) |
 | `--time HOUR` | Override in-game hour (0-23) |

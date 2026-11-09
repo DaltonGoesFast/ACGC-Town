@@ -1,9 +1,10 @@
 /* pc_dedicated.h - the opt-in DEDICATED SERVER mode (--dedicated, HOST role only).
  *
- * `AnimalCrossing.exe --host [port] --dedicated` is a hosted process meant to run unattended:
+ * `AnimalCrossing --host [port] --dedicated` is a hosted process meant to run unattended:
  *   - it implies --host-observer: the SAME observer init is reused (pc_main.c sets g_pc_host_observer; there is no second init), so the host plays
  *     no resident and all four residents are claimable by clients;
- *   - the window is created HIDDEN (SDL_WINDOW_HIDDEN, never shown; a GL 3.3 context still exists on it), vsync is off;
+ *   - Linux: headless. No SDL window, no GL context, no audio device (a null consumer advances the audio ring). g_pc_headless is set.
+ *   - Windows: the window is created HIDDEN (SDL_WINDOW_HIDDEN, never shown; a GL 3.3 context still exists on it), vsync is off;
  *   - nothing is drawn: the per-frame display-list interpretation (emu64_taskstart), pc_gx_begin_frame, pc_gx_draw_pending and the buffer swap are
  *     skipped. Game logic, JW_EndFrame/VIWaitForRetrace (network poll, saves, 60 Hz pacing) and audio state run exactly as in a normal host;
  *   - audio uses SDL's DUMMY driver (selected before SDL_Init) so the audio state machine keeps advancing and the producer thread keeps draining;

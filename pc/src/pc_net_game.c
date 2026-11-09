@@ -38635,6 +38635,9 @@ int pc_net_game_start_host(uint16_t port) {
     pcnetgame_reset_host_world_state();
     printf("[NET] hosting on UDP port %u (protocol %u), peer capacity %d (slots 0..%d, id %d reserved for the host)\n", (unsigned)port, (unsigned)PC_NETGAME_PROTOCOL_VERSION, pc_net_peer_capacity(),
            pc_net_peer_span() - 1, (int)PC_NETGAME_HOST_WIRE_ID);
+    if (pc_net_ws_bound_port() != 0) {
+        printf("[NET] WebSocket listening on TCP port %u (one binary frame = one UDP datagram)\n", (unsigned)pc_net_ws_bound_port());
+    }
     printf("[NET][GUEST] admission: max_guests=%d (configured, most guests bound at once), transport capacity %d, guests that can really be admitted: %d; resident slots stay %d\n",
            pcnetgame_host_max_guests(), pc_net_peer_capacity(), pc_guest_admit_effective_cap(pcnetgame_host_max_guests(), pc_net_peer_capacity()), PLAYER_NUM);
     if (pcnetgame_host_max_guests() > pc_net_peer_capacity()) {

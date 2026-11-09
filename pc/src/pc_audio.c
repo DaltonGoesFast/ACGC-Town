@@ -29,6 +29,31 @@ static s16 ring_buffer[RING_BUF_SAMPLES];
 static SDL_atomic_t ring_write_pos; /* written by audio producer thread */
 static SDL_atomic_t ring_read_pos;  /* written by SDL audio callback */
 static SDL_AudioDeviceID audio_device = 0;
+static int audio_null = 0;
+static SDL_atomic_t audio_null_running;
+static SDL_Thread* audio_null_thread = NULL;
+
+/* Headless dedicated server: no SDL audio device. Drain the ring at 32 kHz stereo so the
+ * producer thread keeps generating samples (fades and message waits follow that clock). */
+static int pc_audio_null_func(void* unused) {
+    Uint32 last = SDL_GetTicks();
+    (void)unused;
+    while (SDL_AtomicGet(&audio_null_running)) {
+        Uint32 now = SDL_GetTicks();
+        Uint32 dt = now - last;
+        u32 wp, rp, used, want;
+        last = now;
+        if (dt > 100) dt = 100;
+        want = (u32)(((uint64_t)dt * 64000ull) / 1000ull) & ~1u;
+        wp = (u32)SDL_AtomicGet(&ring_write_pos);
+        rp = (u32)SDL_AtomicGet(&ring_read_pos);
+        used = wp - rp;
+        if (want > used) want = used & ~1u;
+        if (want != 0) SDL_AtomicSet(&ring_read_pos, (int)(rp + want));
+        SDL_Delay(5);
+    }
+    return 0;
+}
 
 typedef void (*AIDMACallback)(void);
 static AIDMACallback ai_dma_callback = NULL;
@@ -98,7 +123,16 @@ static void pc_audio_callback(void* userdata, Uint8* stream, int len) {
 
 void AIInit(u8* stack) {
     (void)stack;
-    if (audio_device != 0) return;
+    if (audio_device != 0 || audio_null) return;
+
+    if (g_pc_headless) {
+        audio_null = 1;
+        SDL_AtomicSet(&audio_null_running, 1);
+        audio_null_thread = SDL_CreateThread(pc_audio_null_func, "AudioNull", NULL);
+        printf("[AUDIO] headless null consumer (no device) rate=%d\n", PC_AUDIO_SAMPLE_RATE);
+        if (g_pc_dedicated) pc_dedicated_audio_opened(audio_null_thread != NULL, PC_AUDIO_SAMPLE_RATE, 2, 512);
+        return;
+    }
 
     SDL_AudioSpec want, have;
     memset(&want, 0, sizeof(want));
@@ -229,12 +263,18 @@ int pc_audio_consumed_samples(void) {
 }
 
 int pc_audio_is_active(void) {
-    return audio_device != 0;
+    return audio_device != 0 || audio_null;
 }
 
 void pc_audio_shutdown(void) {
     /* Stop producer thread first */
     SDL_AtomicSet(&audio_thread_running, 0);
+    SDL_AtomicSet(&audio_null_running, 0);
+    if (audio_null_thread) {
+        SDL_WaitThread(audio_null_thread, NULL);
+        audio_null_thread = NULL;
+    }
+    audio_null = 0;
     if (audio_producer_thread) {
         SDL_WaitThread(audio_producer_thread, NULL);
         audio_producer_thread = NULL;

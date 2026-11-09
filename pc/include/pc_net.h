@@ -1,13 +1,16 @@
-/* pc_net.h - minimal PC-native networking layer (Winsock/UDP).
+/* pc_net.h - datagram networking for the PC port (UDP and WebSocket).
  *
  * This is a PC-only module (decomp-independent: no game header is included here). It was first
  * proven standalone by pc/tools/net_spike/ and is driven in-game by pc_net_game.c.
  *
  * Design summary
  * ---------------
- *   - Transport is a single UDP socket. One process is either idle, "hosting" (can accept
- *     multiple peers), or a "client" (connects to exactly one host). Call pc_net_host_start()
- *     or pc_net_client_connect() at most once between pc_net_init()/pc_net_shutdown().
+ *   - The wire image of every packet is the ACNP datagram below. UDP carries one datagram per
+ *     packet. WebSocket carries that same byte string as one binary frame (pc_xport.h), which
+ *     is what a browser can send. pc_net_set_ws_port() before pc_net_host_start() listens on
+ *     both. One process is either idle, "hosting" (can accept multiple peers), or a "client"
+ *     (connects to exactly one host). Call pc_net_host_start() or pc_net_client_connect() /
+ *     pc_net_client_connect_ws() at most once between pc_net_init()/pc_net_shutdown().
  *   - UDP has no real connection state, so a tiny HELLO / HELLO_ACK handshake plus periodic
  *     heartbeats let each side detect "peer connected" and "peer disconnected (timed out or
  *     said goodbye)" without inventing anything heavier. A client's HELLO carries a random
@@ -137,12 +140,12 @@ typedef struct PCNetStats {
 
 /* --- lifecycle --- */
 
-/* Initializes Winsock and resets all internal state. Call once before any other pc_net_*
- * function. Returns 1 on success, 0 on failure (Winsock unavailable). */
+/* Starts the socket layer and resets all internal state. Call once before any other pc_net_*
+ * function. Returns 1 on success, 0 on failure. */
 int pc_net_init(void);
 
-/* Closes any open socket/peers and calls WSACleanup(). Safe to call even if pc_net_init()
- * was never called or already failed. After this, pc_net_init() may be called again. */
+/* Closes any open socket/peers. Safe to call even if pc_net_init() was never called or already
+ * failed. After this, pc_net_init() may be called again. */
 void pc_net_shutdown(void);
 
 /* --- host / client setup ---
@@ -159,6 +162,12 @@ int pc_net_set_peer_capacity(int capacity);
  * success, 0 on failure (e.g. the port is already in use, or the tables for the configured capacity could not be allocated). */
 int pc_net_host_start(uint16_t port);
 
+/* Host, before pc_net_host_start: also accept the same datagrams on a WebSocket (TCP) port.
+ * 0 disables the listener (the default). Returns 0 if a socket is already open. */
+int pc_net_set_ws_port(uint16_t port);
+uint16_t pc_net_ws_port(void);       /* the port requested with pc_net_set_ws_port */
+uint16_t pc_net_ws_bound_port(void); /* the port actually listening, host order; 0 if none */
+
 /* Creates a UDP socket and sends the first HELLO to host_ip:port. Returns 1 if the socket was
  * created and the first HELLO was sent, 0 on failure (bad address, socket error). This does NOT
  * mean the connection is established yet -- poll for a PC_NET_EVENT_PEER_CONNECTED event (or
@@ -171,6 +180,10 @@ int pc_net_host_start(uint16_t port);
  * caller should pc_net_shutdown()). A host that never answers at all produces no event: HELLO
  * is simply resent every 500 ms, as before. */
 int pc_net_client_connect(const char* host_ip, uint16_t port);
+
+/* Like pc_net_client_connect, but the datagrams ride a WebSocket (one binary frame each).
+ * Browser clients use this path; native clients keep pc_net_client_connect (UDP). */
+int pc_net_client_connect_ws(const char* host_ip, uint16_t port);
 
 /* Client only (auto-reconnect): after the link was lost, re-arms the PENDING state toward the same host on
  * the same socket/local port with a fresh nonce and sends HELLO. Returns 0 if unavailable. Cancel an
@@ -218,7 +231,7 @@ int pc_net_send(PCNetPeerId peer, PCNetMsgKind kind, const void* data, uint16_t 
  * send to `peer` succeeds iff this is < PC_NET_RELIABLE_WINDOW. */
 int pc_net_reliable_backlog(PCNetPeerId peer);
 
-/* Copies the cumulative transport counters into *out (zeroed on non-Windows builds). */
+/* Copies the cumulative transport counters into *out. */
 void pc_net_get_stats(PCNetStats* out);
 
 /* --- peer / connection queries --- */

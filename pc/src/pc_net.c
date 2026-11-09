@@ -1,8 +1,9 @@
-/* pc_net.c - minimal PC-native networking layer (Winsock/UDP).
+/* pc_net.c - ACNP networking (UDP and WebSocket datagrams; see pc_xport.h).
  *
  * See pc_net.h for the full design summary. Implementation notes:
  *
- *   - One UDP socket total, always non-blocking. The same socket is used whether this process
+ *   - One datagram transport (pc_xport): UDP and, when configured, a WebSocket listener.
+ *     The same socket role is used whether this process
  *     is hosting (bound to a port, tracks up to the configured peer capacity (pc_net_set_peer_capacity, default 8) peers by address) or is a
  *     client (unbound, remembers exactly one peer -- the host -- in slot 0).
  *   - Every packet starts with an 8-byte PCNetWireHeader (magic + type + kind + size). The
@@ -81,46 +82,9 @@
 #include "pc_test_hooks.h" /* the PC_NET_FAULT_* switches are test hooks */
 #endif
 
-/* Stage 0/1 scope is explicitly Windows/Winsock only (see pc_net.h). On any other platform this
- * whole module compiles down to a safe "networking is simply unavailable" stub: every entry
- * point still exists and behaves per its documented contract (init fails, nothing else can be
- * called meaningfully afterwards), so pc_net_game.c and anything above it needs no platform
- * checks of its own -- a failed pc_net_init() already means "continue single-player." */
-#ifndef _WIN32
 
-#include <string.h>
+#include "pc_xport.h"
 
-int pc_net_init(void) { return 0; }
-void pc_net_shutdown(void) {}
-int pc_net_set_peer_capacity(int capacity) { (void)capacity; return 0; }
-int pc_net_host_start(uint16_t port) { (void)port; return 0; }
-int pc_net_client_connect(const char* host_ip, uint16_t port) { (void)host_ip; (void)port; return 0; }
-int pc_net_client_restart(void) { return 0; }
-void pc_net_poll(void) {}
-int pc_net_next_event(PCNetEvent* out) { (void)out; return 0; }
-int pc_net_send(PCNetPeerId peer, PCNetMsgKind kind, const void* data, uint16_t size) {
-    (void)peer; (void)kind; (void)data; (void)size;
-    return 0;
-}
-int pc_net_reliable_backlog(PCNetPeerId peer) { (void)peer; return -1; }
-void pc_net_get_stats(PCNetStats* out) { if (out != NULL) memset(out, 0, sizeof(*out)); }
-int pc_net_is_host(void) { return 0; }
-int pc_net_is_connected(void) { return 0; }
-int pc_net_peer_count(void) { return 0; }
-int pc_net_peer_capacity(void) { return 0; }
-int pc_net_peer_span(void) { return 0; }
-void pc_net_disconnect(PCNetPeerId peer) { (void)peer; }
-int pc_net_peer_idle_ms(PCNetPeerId peer) { (void)peer; return -1; }
-int pc_net_client_rtt_ms(uint32_t* rtt_ms, uint32_t* age_ms) { (void)rtt_ms; (void)age_ms; return 0; }
-uint32_t pc_net_peer_ip(PCNetPeerId peer) { (void)peer; return 0; }
-void pc_net_evict(PCNetPeerId peer) { (void)peer; }
-
-#else /* _WIN32 */
-
-#define WIN32_LEAN_AND_MEAN
-#include <winsock2.h>
-#include <ws2tcpip.h>
-#include <windows.h>
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -195,15 +159,15 @@ typedef enum PCNetPeerState {
 
 typedef struct PCNetPeerSlot {
     PCNetPeerState      state;
-    struct sockaddr_in  addr;
-    uint32_t            last_recv_tick; /* GetTickCount() of the last packet received from this peer */
-    uint32_t            last_send_tick; /* GetTickCount() of the last packet we sent to this peer */
+    PCXportAddr  addr;
+    uint32_t            last_recv_tick; /* pc_xport_tick_ms() of the last packet received from this peer */
+    uint32_t            last_send_tick; /* pc_xport_tick_ms() of the last packet we sent to this peer */
     uint32_t            nonce;          /* host: remote's HELLO nonce; client slot 0: our own nonce */
     /* reliable send side */
     uint32_t            tx_next_seq;    /* seq the next pc_net_send(RELIABLE) will use */
     uint32_t            tx_base_seq;    /* oldest seq not yet cumulatively acknowledged */
     uint32_t            srtt_ms;        /* smoothed RTT (Karn samples only); 0 = no sample yet */
-    uint32_t            rtt_tick;       /* GetTickCount() of the last Karn sample (0 = none); read-only, for pc_net_client_rtt_ms */
+    uint32_t            rtt_tick;       /* pc_xport_tick_ms() of the last Karn sample (0 = none); read-only, for pc_net_client_rtt_ms */
     /* reliable receive side */
     uint32_t            rx_next_expected; /* first seq not yet received (reported in ACKs) */
     uint32_t            rx_deliver_seq;   /* next seq to hand to the event queue */
@@ -255,12 +219,13 @@ typedef struct PCNetFaultState {
     uint32_t ack_counter;
     int      held_len;  /* > 0: a reordered RDATA is waiting in held_buf */
     int      held_peer;
-    struct sockaddr_in held_addr;
+    PCXportAddr held_addr;
     uint8_t  held_buf[PCNET_MAX_DATAGRAM];
 } PCNetFaultState;
 
-static int            s_wsa_started = 0;
-static SOCKET         s_socket = INVALID_SOCKET;
+static int            s_up = 0;
+static int            s_open = 0;
+static uint16_t       s_ws_port_cfg = 0;
 static int            s_is_host = 0;
 /* Peer table: s_peer_span slots, indexed by PCNetPeerId (host: span from the configured capacity; client: 1). The reliable windows are allocated per peer when its slot
  * is first opened and kept until shutdown (the memory follows the high-water mark of simultaneous peers, ~130 KB each). All of it is NULL / 0 until a host / client starts. */
@@ -276,7 +241,7 @@ static uint32_t       s_nonce_counter = 0;
 
 /* Rate limiter for the "[pc_net] legacy client" log line (bounded, fixed; round-robin eviction). */
 typedef struct PCNetLegacyLogEntry {
-    struct sockaddr_in addr;
+    PCXportAddr addr;
     uint32_t           last_log_tick;
     int                used;
 } PCNetLegacyLogEntry;
@@ -294,11 +259,11 @@ static int        s_event_count = 0;
 /* ------------------------------------------------------------------------------------------ */
 /* small helpers                                                                               */
 
-static int pcnet_addr_eq(const struct sockaddr_in* a, const struct sockaddr_in* b) {
-    return a->sin_addr.s_addr == b->sin_addr.s_addr && a->sin_port == b->sin_port;
+static int pcnet_addr_eq(const PCXportAddr* a, const PCXportAddr* b) {
+    return pc_xport_addr_eq(a, b);
 }
 
-static PCNetPeerId pcnet_find_peer(const struct sockaddr_in* from) {
+static PCNetPeerId pcnet_find_peer(const PCXportAddr* from) {
     int i;
     for (i = 0; i < s_peer_span; i++) {
         if (s_peers[i].state != PCNET_PEER_FREE && pcnet_addr_eq(&s_peers[i].addr, from)) return (PCNetPeerId)i;
@@ -351,12 +316,12 @@ static void pcnet_reset_events(void) {
     s_event_head = s_event_tail = s_event_count = 0;
 }
 
-static int pcnet_sendto(const struct sockaddr_in* to, const void* buf, int len) {
-    return sendto(s_socket, (const char*)buf, len, 0, (const struct sockaddr*)to, (int)sizeof(*to)) != SOCKET_ERROR;
+static int pcnet_sendto(const PCXportAddr* to, const void* buf, int len) {
+    return pc_xport_send(to, buf, len);
 }
 
 /* Header-only or small-payload (<= 8 bytes) control packet. */
-static int pcnet_send_ctrl(const struct sockaddr_in* to, PCNetWireType type, const void* payload, uint16_t size) {
+static int pcnet_send_ctrl(const PCXportAddr* to, PCNetWireType type, const void* payload, uint16_t size) {
     uint8_t buf[sizeof(PCNetWireHeader) + 8];
     PCNetWireHeader hdr;
     if (size > 8) return 0;
@@ -370,12 +335,9 @@ static int pcnet_send_ctrl(const struct sockaddr_in* to, PCNetWireType type, con
 }
 
 static uint32_t pcnet_make_nonce(void) {
-    LARGE_INTEGER qpc;
     uint32_t n;
-    QueryPerformanceCounter(&qpc);
     s_nonce_counter++;
-    n = (uint32_t)qpc.LowPart ^ ((uint32_t)qpc.HighPart << 7) ^ ((uint32_t)GetCurrentProcessId() * 2654435761u) ^
-        (GetTickCount() << 13) ^ (s_nonce_counter * 0x9E3779B9u);
+    n = pc_xport_nonce_mix() ^ (s_nonce_counter * 0x9E3779B9u);
     return n != 0 ? n : 1u; /* keep 0 out of real use (it is what a HELLO without a nonce would decode as) */
 }
 
@@ -494,11 +456,15 @@ static void pcnet_free_slot(int i) {
  * considers them delivered) get one last chance to reach the queue ahead of the DISCONNECTED
  * event, then the slot is wiped and DISCONNECTED is queued. */
 static void pcnet_rx_deliver(int i);
-static void pcnet_lose_peer(int i) {
+/* close_transport: drop a WebSocket session. A nonce restart keeps it (the new HELLO arrived on it). */
+static void pcnet_lose_peer_ex(int i, int close_transport) {
+    PCXportAddr addr = s_peers[i].addr;
     if (s_peers[i].state == PCNET_PEER_CONNECTED) pcnet_rx_deliver(i);
     pcnet_free_slot(i);
     pcnet_push_control(PC_NET_EVENT_PEER_DISCONNECTED, (PCNetPeerId)i);
+    if (close_transport) pc_xport_close(&addr);
 }
+static void pcnet_lose_peer(int i) { pcnet_lose_peer_ex(i, 1); }
 
 /* Removes not-yet-popped DATA events from `peer` (used by pc_net_disconnect(), which queues no
  * DISCONNECTED event: without this, stale data could be popped after a NEW logical peer took
@@ -519,7 +485,7 @@ static void pcnet_purge_peer_data_events(PCNetPeerId peer) {
 }
 
 /* Host: brings a free slot up as a brand-new logical peer and queues CONNECTED. */
-static void pcnet_open_slot(int i, const struct sockaddr_in* from, uint32_t nonce, uint32_t now) {
+static void pcnet_open_slot(int i, const PCXportAddr* from, uint32_t nonce, uint32_t now) {
     pcnet_reset_reliable(i);
     s_peers[i].state = PCNET_PEER_CONNECTED;
     s_peers[i].addr = *from;
@@ -551,7 +517,7 @@ static void pcnet_tx_transmit(int i, uint32_t seq) {
     memcpy(buf + sizeof(hdr), &seq, PCNET_WIRE_SEQ_BYTES);
     if (e->size) memcpy(buf + sizeof(hdr) + PCNET_WIRE_SEQ_BYTES, e->data, e->size);
     if (pcnet_emit_rdata(i, buf, (int)sizeof(hdr) + PCNET_WIRE_SEQ_BYTES + e->size)) {
-        s_peers[i].last_send_tick = GetTickCount();
+        s_peers[i].last_send_tick = pc_xport_tick_ms();
     }
 }
 
@@ -561,7 +527,7 @@ static int pcnet_tx_window_full(int i) {
 
 /* Caller guarantees: slot CONNECTED, window not full, size <= PC_NET_MAX_PAYLOAD. */
 static void pcnet_tx_queue(int i, const void* data, uint16_t size) {
-    uint32_t now = GetTickCount();
+    uint32_t now = pc_xport_tick_ms();
     uint32_t seq = s_peers[i].tx_next_seq++;
     PCNetTxEntry* e = &s_tx[i][seq & PCNET_WINDOW_MASK];
     e->in_use = 1;
@@ -714,7 +680,7 @@ static void pcnet_send_ack(int i) {
         return;
     }
     if (pcnet_send_ctrl(&p->addr, PCNET_WIRE_ACK, &ack, (uint16_t)sizeof(ack))) {
-        p->last_send_tick = GetTickCount();
+        p->last_send_tick = pc_xport_tick_ms();
         s_stats.acks_sent++;
     }
 }
@@ -770,136 +736,109 @@ static void pcnet_reset_all_state(void) {
     pcnet_reset_events();
 }
 
-static int pcnet_create_socket(void) {
-    u_long mode = 1;
-    int bufsz = PCNET_SOCKET_BUFFER_BYTES;
-    s_socket = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
-    if (s_socket == INVALID_SOCKET) return 0;
-    if (ioctlsocket(s_socket, FIONBIO, &mode) != 0) {
-        closesocket(s_socket);
-        s_socket = INVALID_SOCKET;
-        return 0;
-    }
-    /* Headroom for reliable bursts (e.g. a world snapshot); failure is harmless (OS default). */
-    setsockopt(s_socket, SOL_SOCKET, SO_RCVBUF, (const char*)&bufsz, (int)sizeof(bufsz));
-    setsockopt(s_socket, SOL_SOCKET, SO_SNDBUF, (const char*)&bufsz, (int)sizeof(bufsz));
-    return 1;
-}
-
 int pc_net_init(void) {
-    WSADATA wsa;
-    if (s_wsa_started) return 1;
-    if (WSAStartup(MAKEWORD(2, 2), &wsa) != 0) return 0;
-    s_wsa_started = 1;
-    s_socket = INVALID_SOCKET;
+    if (s_up) return 1;
+    if (!pc_xport_startup()) return 0;
+    s_up = 1;
+    s_open = 0;
     pcnet_reset_all_state();
     pcnet_fault_init();
     return 1;
 }
 
 void pc_net_shutdown(void) {
-    if (s_socket != INVALID_SOCKET) {
-        closesocket(s_socket);
-        s_socket = INVALID_SOCKET;
-    }
-    if (s_wsa_started) {
-        WSACleanup();
-        s_wsa_started = 0;
-    }
+    pc_xport_shutdown();
+    s_up = 0;
+    s_open = 0;
     pcnet_reset_all_state();
     s_fault.held_len = 0;
     s_fault.held_peer = -1;
 }
 
+int pc_net_set_ws_port(uint16_t port) {
+    if (s_open) return 0;
+    s_ws_port_cfg = port;
+    return 1;
+}
+
+uint16_t pc_net_ws_port(void) { return s_ws_port_cfg; }
+
+uint16_t pc_net_ws_bound_port(void) { return pc_xport_ws_port(); }
+
 int pc_net_set_peer_capacity(int capacity) {
-    if (s_socket != INVALID_SOCKET || pc_peer_span(capacity, PC_NET_RESERVED_PEER_ID) == 0) return 0;
+    if (s_open || pc_peer_span(capacity, PC_NET_RESERVED_PEER_ID) == 0) return 0;
     s_peer_capacity_cfg = capacity;
     return 1;
 }
 
 int pc_net_host_start(uint16_t port) {
-    struct sockaddr_in addr;
     const int span = pc_peer_span(s_peer_capacity_cfg, PC_NET_RESERVED_PEER_ID);
-    if (!s_wsa_started || s_socket != INVALID_SOCKET) return 0;
+    if (!s_up || s_open) return 0;
     if (span == 0 || !pcnet_alloc_tables(span, s_peer_capacity_cfg)) return 0;
-    if (!pcnet_create_socket()) {
+    if (!pc_xport_udp_bind(port)) {
         pcnet_free_tables();
         return 0;
     }
-
-    memset(&addr, 0, sizeof(addr));
-    addr.sin_family = AF_INET;
-    addr.sin_addr.s_addr = INADDR_ANY;
-    addr.sin_port = htons(port);
-    if (bind(s_socket, (struct sockaddr*)&addr, sizeof(addr)) == SOCKET_ERROR) {
-        closesocket(s_socket);
-        s_socket = INVALID_SOCKET;
+    if (s_ws_port_cfg != 0 && !pc_xport_ws_listen(s_ws_port_cfg)) {
+        pc_xport_close_sockets();
         pcnet_free_tables();
         return 0;
     }
     s_is_host = 1;
+    s_open = 1;
     s_peer_capacity = s_peer_capacity_cfg;
     return 1;
 }
 
 /* Client only: the host address of the last successful pc_net_client_connect() (for pc_net_client_restart). */
-static struct sockaddr_in s_client_host;
+static PCXportAddr s_client_host;
 static int s_client_host_valid = 0;
 
-/* Client only: IPv4 literal (fast path, no DNS) or DNS hostname, resolved ONCE per connect through getaddrinfo (AF_INET, UDP; the OS resolver, so hosts file / DNS /
- * tunnel hostnames all work). Blocks for the resolver's duration; the first IPv4 result wins. 1 = ok. */
-static int pcnet_resolve_host(const char* host, struct in_addr* out) {
-    struct addrinfo hints, *res = NULL;
-    int ok = 0;
-    if (inet_pton(AF_INET, host, out) == 1) return 1;
-    memset(&hints, 0, sizeof(hints));
-    hints.ai_family = AF_INET;
-    hints.ai_socktype = SOCK_DGRAM;
-    hints.ai_protocol = IPPROTO_UDP;
-    if (getaddrinfo(host, NULL, &hints, &res) != 0 || res == NULL) return 0;
-    if (res->ai_family == AF_INET && res->ai_addrlen >= sizeof(struct sockaddr_in)) {
-        *out = ((const struct sockaddr_in*)res->ai_addr)->sin_addr;
-        ok = 1;
-    }
-    freeaddrinfo(res);
-    return ok;
-}
-
-int pc_net_client_connect(const char* host_ip, uint16_t port) {
-    struct sockaddr_in addr;
-    if (!s_wsa_started || s_socket != INVALID_SOCKET) return 0;
-    if (host_ip == NULL) return 0;
-    if (!pcnet_alloc_tables(1, PC_PEER_DEFAULT_CAPACITY) || !pcnet_ensure_buffers(0)) { /* a client has exactly one link: slot 0 */
-        pcnet_free_tables();
-        return 0;
-    }
-    if (!pcnet_create_socket()) {
-        pcnet_free_tables();
-        return 0;
-    }
-
-    memset(&addr, 0, sizeof(addr));
-    addr.sin_family = AF_INET;
-    addr.sin_port = htons(port);
-    if (!pcnet_resolve_host(host_ip, &addr.sin_addr)) {
-        closesocket(s_socket);
-        s_socket = INVALID_SOCKET;
-        pcnet_free_tables();
-        return 0;
-    }
-
-    s_client_host = addr;
+static int pcnet_arm_client(const PCXportAddr* addr) {
+    s_client_host = *addr;
     s_client_host_valid = 1;
     s_is_host = 0;
+    s_open = 1;
     s_peer_capacity = 1;
     pcnet_free_slot(0); /* fresh sequence/ack/retransmit/reorder state for the new connection */
     s_peers[0].state = PCNET_PEER_PENDING;
-    s_peers[0].addr = addr;
+    s_peers[0].addr = *addr;
     s_peers[0].nonce = pcnet_make_nonce();
-    s_peers[0].last_recv_tick = GetTickCount();
-    s_peers[0].last_send_tick = GetTickCount();
-    pcnet_send_ctrl(&addr, PCNET_WIRE_HELLO, &s_peers[0].nonce, PCNET_WIRE_NONCE_BYTES);
+    s_peers[0].last_recv_tick = pc_xport_tick_ms();
+    s_peers[0].last_send_tick = pc_xport_tick_ms();
+    pcnet_send_ctrl(addr, PCNET_WIRE_HELLO, &s_peers[0].nonce, PCNET_WIRE_NONCE_BYTES);
     return 1;
+}
+
+static int pcnet_prepare_client(void) {
+    if (!s_up || s_open) return 0;
+    if (!pcnet_alloc_tables(1, PC_PEER_DEFAULT_CAPACITY) || !pcnet_ensure_buffers(0)) {
+        pcnet_free_tables();
+        return 0;
+    }
+    return 1;
+}
+
+int pc_net_client_connect(const char* host_ip, uint16_t port) {
+    PCXportAddr addr;
+    if (host_ip == NULL || !pcnet_prepare_client()) return 0;
+    if (!pc_xport_udp_open() || !pc_xport_resolve_udp(host_ip, port, &addr)) {
+        pc_xport_close_sockets();
+        pcnet_free_tables();
+        return 0;
+    }
+    return pcnet_arm_client(&addr);
+}
+
+int pc_net_client_connect_ws(const char* host_ip, uint16_t port) {
+    PCXportAddr addr;
+    if (host_ip == NULL || !pcnet_prepare_client()) return 0;
+    if (!pc_xport_ws_connect(host_ip, port, &addr)) {
+        pc_xport_close_sockets();
+        pcnet_free_tables();
+        return 0;
+    }
+    return pcnet_arm_client(&addr);
 }
 
 /* Client auto-reconnect: re-arms slot 0 as a fresh PENDING logical peer toward the SAME host over
@@ -908,10 +847,10 @@ int pc_net_client_connect(const char* host_ip, uint16_t port) {
  * client socket / saved host address. */
 int pc_net_client_restart(void) {
     uint32_t now;
-    if (s_socket == INVALID_SOCKET || s_is_host || !s_client_host_valid) return 0;
+    if (!s_open || s_is_host || !s_client_host_valid) return 0;
     pcnet_free_slot(0);
     pcnet_purge_peer_data_events(0);
-    now = GetTickCount();
+    now = pc_xport_tick_ms();
     s_peers[0].state = PCNET_PEER_PENDING;
     s_peers[0].addr = s_client_host;
     s_peers[0].nonce = pcnet_make_nonce();
@@ -925,8 +864,8 @@ int pc_net_client_restart(void) {
 /* receive path                                                                                */
 
 /* Logs the legacy-client refusal at most once per address per PCNET_LEGACY_LOG_INTERVAL_MS. */
-static void pcnet_log_legacy_client(const struct sockaddr_in* from, uint32_t now) {
-    char ip[INET_ADDRSTRLEN];
+static void pcnet_log_legacy_client(const PCXportAddr* from, uint32_t now) {
+    char ip[64];
     int k;
     PCNetLegacyLogEntry* e = NULL;
 
@@ -944,11 +883,14 @@ static void pcnet_log_legacy_client(const struct sockaddr_in* from, uint32_t now
         e->used = 1;
     }
     e->last_log_tick = now;
-    if (inet_ntop(AF_INET, (void*)&from->sin_addr, ip, sizeof(ip)) == NULL) strcpy(ip, "?");
-    printf("[pc_net] legacy client (no nonce) at %s:%u; refusing\n", ip, (unsigned)ntohs(from->sin_port));
+    {
+        unsigned port_h = 0;
+        pc_xport_addr_format(from, ip, sizeof(ip), &port_h);
+        printf("[pc_net] legacy client (no nonce) at %s:%u; refusing\n", ip, port_h);
+    }
     fflush(stdout);
 }
-static void pcnet_handle_packet(const struct sockaddr_in* from, const uint8_t* buf, int len) {
+static void pcnet_handle_packet(const PCXportAddr* from, const uint8_t* buf, int len) {
     PCNetWireHeader hdr;
     PCNetPeerId pid;
     uint32_t now;
@@ -957,7 +899,7 @@ static void pcnet_handle_packet(const struct sockaddr_in* from, const uint8_t* b
     memcpy(&hdr, buf, sizeof(hdr));
     if (hdr.magic != PCNET_MAGIC) return; /* not our protocol (stray UDP traffic); ignore silently */
 
-    now = GetTickCount();
+    now = pc_xport_tick_ms();
     pid = pcnet_find_peer(from);
 
     switch ((PCNetWireType)hdr.type) {
@@ -988,7 +930,7 @@ static void pcnet_handle_packet(const struct sockaddr_in* from, const uint8_t* b
                 /* Same address, different nonce: the remote process restarted. The old logical
                  * peer is gone (its reliable streams can never complete); start a fresh one. */
                 s_stats.nonce_restarts++;
-                pcnet_lose_peer((int)pid);
+                pcnet_lose_peer_ex((int)pid, 0); /* same WebSocket/UDP address, new logical peer */
                 pcnet_open_slot((int)pid, from, nonce, now);
             } else {
                 s_peers[pid].last_recv_tick = now; /* duplicate HELLO (our ACK was likely lost); just refresh */
@@ -1088,35 +1030,33 @@ static void pcnet_handle_packet(const struct sockaddr_in* from, const uint8_t* b
 
 void pc_net_poll(void) {
     uint8_t buf[PCNET_MAX_DATAGRAM];
-    struct sockaddr_in from;
-    int fromlen, n, i, errors = 0;
+    PCXportAddr from;
+    int n, i;
     uint32_t now;
 
-    if (s_socket == INVALID_SOCKET) return;
+    if (!s_open) return;
 
     /* Reliable payloads held back by a full queue get first claim on room the game freed. */
     for (i = 0; i < s_peer_span; i++) {
         if (s_peers[i].state == PCNET_PEER_CONNECTED) pcnet_rx_deliver(i);
     }
 
-    /* Drain every datagram currently waiting; recvfrom on a non-blocking socket returns
-     * WSAEWOULDBLOCK the instant nothing is left, so this loop always terminates promptly.
-     * WSAECONNRESET (ICMP port-unreachable from an earlier send to a dead peer) and
-     * WSAEMSGSIZE (oversized datagram, discarded) are per-datagram conditions: skip them,
-     * bounded by PCNET_RECV_ERROR_BUDGET, rather than abandoning the rest of the drain. */
+    /* Drain UDP datagrams and WebSocket binary frames. pc_xport_recv never blocks; a hard
+     * socket error ends this cycle (the next poll tries again). */
     for (;;) {
-        fromlen = (int)sizeof(from);
-        n = recvfrom(s_socket, (char*)buf, (int)sizeof(buf), 0, (struct sockaddr*)&from, &fromlen);
-        if (n == SOCKET_ERROR) {
-            int err = WSAGetLastError();
-            if ((err == WSAECONNRESET || err == WSAEMSGSIZE) && ++errors < PCNET_RECV_ERROR_BUDGET) continue;
-            break; /* WSAEWOULDBLOCK (no more data) or any other socket error: stop this poll cycle */
-        }
-        if (n == 0) continue; /* zero-length datagram; nothing to do */
+        n = pc_xport_recv(&from, buf, (int)sizeof(buf));
+        if (n < 0) break;
+        if (n == 0) break;
         pcnet_handle_packet(&from, buf, n);
     }
+    while (pc_xport_take_dead(&from)) {
+        PCNetPeerId dead = pcnet_find_peer(&from);
+        if (dead != PC_NET_INVALID_PEER && s_peers[dead].state != PCNET_PEER_FREE) {
+            pcnet_lose_peer((int)dead);
+        }
+    }
 
-    now = GetTickCount();
+    now = pc_xport_tick_ms();
     for (i = 0; i < s_peer_span; i++) {
         if (s_peers[i].state == PCNET_PEER_FREE) continue;
 
@@ -1180,7 +1120,7 @@ static int pcnet_send_unreliable_to_slot(int i, const void* data, uint16_t size)
     total = (int)(sizeof(hdr) + size);
 
     if (!pcnet_sendto(&s_peers[i].addr, buf, total)) return 0;
-    s_peers[i].last_send_tick = GetTickCount();
+    s_peers[i].last_send_tick = pc_xport_tick_ms();
     return 1;
 }
 
@@ -1227,7 +1167,7 @@ int pc_net_send(PCNetPeerId peer, PCNetMsgKind kind, const void* data, uint16_t 
 
 static int pcnet_send_impl(PCNetPeerId peer, PCNetMsgKind kind, const void* data, uint16_t size) {
     int i;
-    if (s_socket == INVALID_SOCKET) return 0;
+    if (!s_open) return 0;
     if (size > PC_NET_MAX_PAYLOAD) return 0;
     if (size != 0 && data == NULL) return 0;
     if (kind != PC_NET_UNRELIABLE && kind != PC_NET_RELIABLE) return 0;
@@ -1268,7 +1208,7 @@ static int pcnet_send_impl(PCNetPeerId peer, PCNetMsgKind kind, const void* data
 }
 
 int pc_net_reliable_backlog(PCNetPeerId peer) {
-    if (s_socket == INVALID_SOCKET) return -1;
+    if (!s_open) return -1;
     if (peer < 0 || peer >= s_peer_span) return -1;
     if (s_peers[peer].state != PCNET_PEER_CONNECTED) return -1;
     return (int)(s_peers[peer].tx_next_seq - s_peers[peer].tx_base_seq);
@@ -1282,21 +1222,21 @@ void pc_net_get_stats(PCNetStats* out) {
 /* queries / teardown                                                                          */
 
 int pc_net_is_host(void) {
-    return s_socket != INVALID_SOCKET && s_is_host;
+    return s_open && s_is_host;
 }
 
 int pc_net_is_connected(void) {
-    if (s_socket == INVALID_SOCKET) return 0;
+    if (!s_open) return 0;
     if (s_is_host) return 1; /* "up and listening"; a host is never itself "connected" to anyone */
     return s_peers[0].state == PCNET_PEER_CONNECTED;
 }
 
 int pc_net_peer_capacity(void) {
-    return s_socket != INVALID_SOCKET ? s_peer_capacity : 0;
+    return s_open ? s_peer_capacity : 0;
 }
 
 int pc_net_peer_span(void) {
-    return s_socket != INVALID_SOCKET ? s_peer_span : 0;
+    return s_open ? s_peer_span : 0;
 }
 
 int pc_net_peer_count(void) {
@@ -1311,31 +1251,31 @@ int pc_net_peer_count(void) {
  * exists (*rtt_ms, and *age_ms = how long ago the newest sample was taken); 0 = not a connected client or no sample yet. Never feeds heartbeat/timeout logic. */
 int pc_net_client_rtt_ms(uint32_t* rtt_ms, uint32_t* age_ms) {
     const PCNetPeerSlot* p;
-    if (s_socket == INVALID_SOCKET || s_is_host || s_peers == NULL) return 0;
+    if (!s_open || s_is_host || s_peers == NULL) return 0;
     p = &s_peers[0];
     if (p->state != PCNET_PEER_CONNECTED || p->srtt_ms == 0 || p->rtt_tick == 0) return 0;
     if (rtt_ms) *rtt_ms = p->srtt_ms;
-    if (age_ms) *age_ms = GetTickCount() - p->rtt_tick;
+    if (age_ms) *age_ms = pc_xport_tick_ms() - p->rtt_tick;
     return 1;
 }
 
 int pc_net_peer_idle_ms(PCNetPeerId peer) {
     uint32_t idle;
-    if (s_socket == INVALID_SOCKET || !s_is_host) return -1;
+    if (!s_open || !s_is_host) return -1;
     if (peer < 0 || peer >= s_peer_span || s_peers[peer].state != PCNET_PEER_CONNECTED) return -1;
-    idle = (uint32_t)GetTickCount() - s_peers[peer].last_recv_tick;
+    idle = (uint32_t)pc_xport_tick_ms() - s_peers[peer].last_recv_tick;
     return idle > 0x7FFFFFFFu ? 0 : (int)idle; /* a tick newer than `now` (wrap/ordering) reads as 0 */
 }
 
 /* Guests: the peer's IPv4 address (network byte order) for per-address admission limits; 0 = unknown / not a connected host-side peer. Read-only. */
 uint32_t pc_net_peer_ip(PCNetPeerId peer) {
-    if (s_socket == INVALID_SOCKET || !s_is_host) return 0;
+    if (!s_open || !s_is_host) return 0;
     if (peer < 0 || peer >= s_peer_span || s_peers[peer].state != PCNET_PEER_CONNECTED) return 0;
-    return (uint32_t)s_peers[peer].addr.sin_addr.s_addr;
+    return pc_xport_addr_ip(&s_peers[peer].addr);
 }
 
 void pc_net_evict(PCNetPeerId peer) {
-    if (s_socket == INVALID_SOCKET || !s_is_host) return;
+    if (!s_open || !s_is_host) return;
     if (peer < 0 || peer >= s_peer_span || s_peers[peer].state != PCNET_PEER_CONNECTED) return;
     if (s_fault.enabled) pcnet_fault_flush_held();
     pcnet_send_ctrl(&s_peers[peer].addr, PCNET_WIRE_DISCONNECT, NULL, 0); /* best effort: a falsely evicted live peer learns at once */
@@ -1344,7 +1284,7 @@ void pc_net_evict(PCNetPeerId peer) {
 
 void pc_net_disconnect(PCNetPeerId peer) {
     int idx;
-    if (s_socket == INVALID_SOCKET) return;
+    if (!s_open) return;
 
     if (!s_is_host) {
         idx = 0; /* the only slot a client ever uses; PC_NET_INVALID_PEER (or anything) means "leave" */
@@ -1355,8 +1295,8 @@ void pc_net_disconnect(PCNetPeerId peer) {
     if (s_peers[idx].state == PCNET_PEER_FREE) return;
     if (s_fault.enabled) pcnet_fault_flush_held(); /* keep "one transmission before goodbye" under test faults */
     pcnet_send_ctrl(&s_peers[idx].addr, PCNET_WIRE_DISCONNECT, NULL, 0);
+    pc_xport_close(&s_peers[idx].addr);
     pcnet_free_slot(idx);
     pcnet_purge_peer_data_events((PCNetPeerId)idx);
 }
 
-#endif /* _WIN32 */

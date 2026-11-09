@@ -68,6 +68,10 @@ extern "C" {
 /* --- Global state --- */
 extern SDL_Window*   g_pc_window;
 extern SDL_GLContext  g_pc_gl_context;
+/* 1 after a GL context is current. Linux --dedicated leaves this 0: GX keeps CPU state and does not call GL. */
+extern int g_pc_gl_live;
+/* 1 = no window, no GL, no audio device. Set for a Linux dedicated server. */
+extern int g_pc_headless;
 /* g_pc_running is written from the SetConsoleCtrlHandler thread and from signal(SIGINT/SIGTERM)
  * handlers (pc/src/pc_main.c) and read every frame by the main loop (graph_proc(), src/graph.c).
  * It is declared atomic_int (C11 <stdatomic.h>) so that ordinary reads and plain `= 0` writes at

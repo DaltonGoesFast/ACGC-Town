@@ -340,6 +340,7 @@ set(PC_SOURCES
     ${CMAKE_CURRENT_SOURCE_DIR}/src/pc_assets.c
     ${CMAKE_CURRENT_SOURCE_DIR}/src/pc_disc.c
     ${CMAKE_CURRENT_SOURCE_DIR}/src/pc_net.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/pc_xport.c
     ${CMAKE_CURRENT_SOURCE_DIR}/src/pc_peer_table.c
     ${CMAKE_CURRENT_SOURCE_DIR}/src/pc_guest_admit.c
     ${CMAKE_CURRENT_SOURCE_DIR}/src/pc_interest.c
@@ -657,6 +658,23 @@ endif()
 # =============================================================================
 # Install rules (cmake --install . --prefix <dest>)
 # =============================================================================
+# Datagram transport self-test (UDP + WebSocket). No SDL, no disc image, no game code.
+add_executable(ac_xport_selftest
+    ${CMAKE_CURRENT_SOURCE_DIR}/tools/xport_selftest.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/pc_xport.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/pc_net.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/pc_peer_table.c
+)
+target_include_directories(ac_xport_selftest PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+if(WIN32)
+    target_link_libraries(ac_xport_selftest PRIVATE ws2_32)
+else()
+    target_link_libraries(ac_xport_selftest PRIVATE pthread)
+endif()
+set_target_properties(ac_xport_selftest PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
+)
+
 install(TARGETS ac_pc RUNTIME DESTINATION bin)
 install(DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/shaders/"
     DESTINATION bin/shaders

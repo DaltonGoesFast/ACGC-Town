@@ -337,6 +337,12 @@ void pc_gx_init(void) {
         quad_index_buf[q * 6 + 5] = base + 3;
     }
 
+    if (!g_pc_gl_live) {
+        pc_gx_texture_init();
+        g_gx.dirty = PC_GX_DIRTY_ALL;
+        return;
+    }
+
     glGenVertexArrays(1, &g_gx.vao);
     glGenBuffers(1, &g_gx.vbo);
     glGenBuffers(1, &g_gx.ebo);
@@ -718,6 +724,10 @@ int pc_gx_draw_call_count = 0;
  * so the run renders with the state it was built under. */
 void pc_gx_draw_pending(void) {
     int count = g_gx.pending_verts;
+    if (!g_pc_gl_live) {
+        g_gx.pending_verts = 0;
+        return;
+    }
     if (count == 0) return;
 
     glBindVertexArray(g_gx.vao);
@@ -752,6 +762,10 @@ void pc_gx_draw_pending(void) {
 
 void pc_gx_flush_vertices(void) {
     int count = g_gx.current_vertex_idx - g_gx.pending_verts;
+    if (!g_pc_gl_live) {
+        g_gx.pending_verts = g_gx.current_vertex_idx;
+        return;
+    }
     if (count <= 0) return;
 
     Uint64 flush_start = pc_profiler_begin_timer();
