@@ -30,6 +30,8 @@ int  pc_play_online_menu_nav_down(void);
 int  pc_play_online_menu_nav_left(void);
 int  pc_play_online_menu_nav_right(void);
 int  pc_play_online_menu_confirm(void);
+/* Tap in font space. Selects that row and confirms it. 0 while text entry is up. */
+int  pc_play_online_menu_pointer(float font_x, float font_y);
 int  pc_play_online_menu_cancel(void);
 
 void pc_play_online_menu_tick(void);

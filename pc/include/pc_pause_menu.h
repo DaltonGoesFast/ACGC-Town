@@ -21,6 +21,8 @@ void pc_pause_menu_toggle(void);
 
 /* Forward an SDL event for menu navigation. Returns 1 if consumed. No-op if not paused. */
 int  pc_pause_menu_handle_event(const SDL_Event* e);
+/* Tap in font space. Selects that row and activates it. 1 = handled. */
+int  pc_pause_menu_pointer(float font_x, float font_y);
 
 /* Append the pause overlay to the game's font display list, from graph_main
  * after game_main() returns. No-op if not paused. */

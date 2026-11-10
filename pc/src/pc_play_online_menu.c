@@ -154,6 +154,29 @@ static int row_count(void) {
     return 2;
 }
 
+int pc_play_online_menu_pointer(float font_x, float font_y) {
+    int i, n, vis;
+    if (!s_active || s_text != T_NONE) return 0;
+    if (s_page == PG_DELETE || s_page == PG_ICONF) {
+        if (font_y < 155.0f || font_y > 190.0f) return 0;
+        s_del_sel = (font_x < 160.0f) ? 0 : 1;
+        pc_play_online_menu_confirm();
+        return 1;
+    }
+    n = row_count();
+    if (s_page == PG_CHARS || s_page == PG_MCHARS) {
+        i = (int)((font_y - 44.0f) / 30.0f);
+        vis = 5;
+    } else {
+        i = (int)((font_y - 55.0f) / 15.0f);
+        vis = VISIBLE;
+    }
+    if (i < 0 || i >= vis || s_scroll + i >= n) return 0;
+    s_sel = s_scroll + i;
+    pc_play_online_menu_confirm();
+    return 1;
+}
+
 static void sel_clamp(void) {
     const int n = row_count();
     if (s_sel < 0) s_sel = 0;

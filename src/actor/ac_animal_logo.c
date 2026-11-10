@@ -27,6 +27,7 @@
 #include "pc_play_online_menu.h"
 #include "pc_menu_util.h"
 #include "pc_pause_menu.h" /* pc_version_corner_draw: the version in the title screen's bottom-right corner */
+#include "pc_touch.h"
 #include "main.h"
 #include <stdio.h>
 #include <string.h>
@@ -499,6 +500,19 @@ static void aAL_pc_game_start_wait(ANIMAL_LOGO_ACTOR* actor, GAME* game) {
       if (actor->pc_menu_sel < aAL_pc_menu_count() - 1) {
         actor->pc_menu_sel++;
         actor->pc_cursor_cooldown = 10.0f;
+      }
+    }
+  }
+
+  /* A tap on a row selects it and confirms it. Done after the stick nudge so the tap wins. */
+  {
+    float tap_y = 0.0f;
+    if (pc_touch_take_title_tap(&tap_y)) {
+      int i = (int)((tap_y - 135.0f) / 18.0f);
+      int n = aAL_pc_menu_count();
+      if (i >= 0 && i < n) {
+        actor->pc_menu_sel = i;
+        on_btn = (u16)(on_btn | BUTTON_A);
       }
     }
   }

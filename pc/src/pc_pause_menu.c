@@ -203,6 +203,27 @@ static MenuAction translate_pad_axis(int axis, int value) {
     return ACT_NONE;
 }
 
+int pc_pause_menu_pointer(float font_x, float font_y) {
+    int i;
+    if (!g_pc_paused) return 0;
+    if (cur_page == PAGE_SETTINGS) {
+        if (!pc_settings_menu_pointer(font_x, font_y)) return 0;
+        if (!pc_settings_menu_active()) cur_page = PAGE_MAIN;
+        return 1;
+    }
+    if (cur_page == PAGE_CONFIRM_QUIT) {
+        if (font_y < 140.0f || font_y > 175.0f) return 0;
+        confirm_sel = (font_x < 160.0f) ? 0 : 1;
+        confirm_activate();
+        return 1;
+    }
+    i = (int)((font_y - 110.0f) / 18.0f);
+    if (i < 0 || i >= MAIN_ITEM_COUNT) return 0;
+    main_sel = i;
+    main_activate();
+    return 1;
+}
+
 int pc_pause_menu_handle_event(const SDL_Event* e) {
     if (!g_pc_paused) return 0;
 

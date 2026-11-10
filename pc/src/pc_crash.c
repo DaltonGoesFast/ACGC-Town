@@ -250,6 +250,8 @@ static pthread_mutex_t s_hb_mu = PTHREAD_MUTEX_INITIALIZER;
 static char s_step[160] = "startup";
 static char s_dvd[64] = "-";
 static char s_gx[48] = "-";
+static char s_view[48] = "-";
+static char s_pad[96] = "-";
 static void* s_scene = NULL;
 static int s_doing = -1;
 static unsigned s_frames = 0;
@@ -292,7 +294,7 @@ static void* pc_hb_thread(void* arg) {
     int dumped = 0;
     (void)arg;
     for (;;) {
-        char step[160], dvd[64], gx[48], line[420], sym[80];
+        char step[160], dvd[64], gx[48], view[48], pad[96], line[560], sym[80];
         void* scene;
         int doing;
         unsigned frames, retrace;
@@ -303,6 +305,8 @@ static void* pc_hb_thread(void* arg) {
         memcpy(step, s_step, sizeof(step));
         memcpy(dvd, s_dvd, sizeof(dvd));
         memcpy(gx, s_gx, sizeof(gx));
+        memcpy(view, s_view, sizeof(view));
+        memcpy(pad, s_pad, sizeof(pad));
         scene = s_scene;
         doing = s_doing;
         frames = s_frames;
@@ -316,8 +320,8 @@ static void* pc_hb_thread(void* arg) {
             snprintf(sym, sizeof(sym), "%s", inf.dli_sname);
         }
         snprintf(line, sizeof(line),
-                 "hb frame=%u scene=%s doing=%d step=%s retrace=%u dvd=%s gx=%s idle=%llums",
-                 frames, sym, doing, step, retrace, dvd, gx,
+                 "hb frame=%u scene=%s doing=%d step=%s retrace=%u dvd=%s gx=%s view=%s pad=%s idle=%llums",
+                 frames, sym, doing, step, retrace, dvd, gx, view, pad,
                  (unsigned long long)(last == 0 ? 0 : mono_ms() - last));
         pc_diag_milestone(line);
         if (s_game_thread_set && last != 0 && mono_ms() - last >= 5000ull && frames == seen && !dumped) {
@@ -363,6 +367,19 @@ void pc_hb_note_dvd(unsigned off, unsigned len) {
 void pc_hb_note_gx(int w, int h) {
     pthread_mutex_lock(&s_hb_mu);
     snprintf(s_gx, sizeof(s_gx), "%dx%d", w, h);
+    pthread_mutex_unlock(&s_hb_mu);
+}
+
+void pc_hb_note_view(int x, int y, int w, int h) {
+    pthread_mutex_lock(&s_hb_mu);
+    snprintf(s_view, sizeof(s_view), "%d,%d %dx%d", x, y, w, h);
+    pthread_mutex_unlock(&s_hb_mu);
+}
+
+void pc_hb_note_input(unsigned buttons, int stick_x, int stick_y, int fingers, int hud) {
+    pthread_mutex_lock(&s_hb_mu);
+    snprintf(s_pad, sizeof(s_pad), "btn=%04x stick=%d,%d touch=%d hud=%d",
+             buttons & 0xffffu, stick_x, stick_y, fingers, hud);
     pthread_mutex_unlock(&s_hb_mu);
 }
 
@@ -477,6 +494,10 @@ void pc_hb_set_step(const char* step) { (void)step; }
 void pc_hb_set_scene(void* exec, int doing) { (void)exec; (void)doing; }
 void pc_hb_note_dvd(unsigned off, unsigned len) { (void)off; (void)len; }
 void pc_hb_note_gx(int w, int h) { (void)w; (void)h; }
+void pc_hb_note_view(int x, int y, int w, int h) { (void)x; (void)y; (void)w; (void)h; }
+void pc_hb_note_input(unsigned buttons, int stick_x, int stick_y, int fingers, int hud) {
+    (void)buttons; (void)stick_x; (void)stick_y; (void)fingers; (void)hud;
+}
 void pc_hb_frame_done(unsigned frame, unsigned retrace) { (void)frame; (void)retrace; }
 void pc_hb_boot_test_arm(void) {}
 int pc_hb_boot_should_stop(void) { return 0; }

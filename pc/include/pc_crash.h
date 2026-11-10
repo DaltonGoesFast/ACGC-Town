@@ -17,6 +17,8 @@ void pc_hb_set_step(const char* step);
 void pc_hb_set_scene(void* exec, int doing);
 void pc_hb_note_dvd(unsigned off, unsigned len);
 void pc_hb_note_gx(int w, int h);
+void pc_hb_note_view(int x, int y, int w, int h);
+void pc_hb_note_input(unsigned buttons, int stick_x, int stick_y, int fingers, int hud);
 void pc_hb_frame_done(unsigned frame, unsigned retrace);
 void pc_hb_boot_test_arm(void);
 int pc_hb_boot_should_stop(void);

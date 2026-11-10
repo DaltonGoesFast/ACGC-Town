@@ -77,17 +77,13 @@ static float g_aspect_offset = 0.0f;
 static int   g_aspect_active = 0;
 
 static void pc_gx_update_aspect(void) {
-    float gc_aspect = (float)PC_GC_WIDTH / (float)PC_GC_HEIGHT;
-    float win_aspect = (float)g_pc_window_w / (float)g_pc_window_h;
-    if (win_aspect > gc_aspect + 0.01f) {
-        g_aspect_factor = gc_aspect / win_aspect;
-        g_aspect_offset = (1.0f - g_aspect_factor) / 2.0f * (float)PC_GC_WIDTH;
-        g_aspect_active = 1;
-    } else {
-        g_aspect_factor = 1.0f;
-        g_aspect_offset = 0.0f;
-        g_aspect_active = 0;
-    }
+    /* The picture is letterboxed in the viewport (pc_layout_box). Squeezing the
+     * projection as well would pillarbox a second time. */
+    (void)g_pc_window_w;
+    (void)g_pc_window_h;
+    g_aspect_factor = 1.0f;
+    g_aspect_offset = 0.0f;
+    g_aspect_active = 0;
 }
 
 /* EFB capture: keep full-res GL textures from GXCopyTex instead of downsampling to 640x480 */
@@ -418,9 +414,20 @@ void pc_gx_begin_frame(void) {
     /* Masks were changed behind the dirty system; reapply at first flush */
     DIRTY(PC_GX_DIRTY_DEPTH | PC_GX_DIRTY_COLOR_MASK);
 #ifdef PC_ENHANCEMENTS
+    pc_layout_refresh();
     pc_gx_update_aspect();
     glDisable(GL_SCISSOR_TEST);
     glViewport(0, 0, g_pc_window_w, g_pc_window_h);
+    /* Bars stay this color. The picture is cleared again inside its own rect. */
+    glClearColor(0.08f, 0.09f, 0.08f, 1.0f);
+    glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+    {
+        int bx, by, bw, bh, gy;
+        pc_layout_box(0, &bx, &by, &bw, &bh);
+        gy = g_pc_window_h - by - bh;
+        if (gy < 0) gy = 0;
+        glViewport(bx, gy, bw, bh);
+    }
     pc_gx_viewport_state_invalidate();
 #endif
     glClearDepth(g_gx.clear_depth);
@@ -1365,6 +1372,29 @@ void pc_gx_viewport_state_invalidate(void) {
     s_gl_scissor.valid = 0;
 }
 
+void pc_gx_external_gl_done(void) {
+    g_gx.dirty = PC_GX_DIRTY_ALL;
+    pc_gx_viewport_state_invalidate();
+}
+
+/* GC pixels into the letterboxed picture. stretch==1 is the 16:9 hack. */
+static void gc_to_gl(float left, float top, float wd, float ht, int* gl_x, int* gl_y, int* gl_w, int* gl_h) {
+    int cx, cy, cw, ch, top_px;
+    float sx, sy;
+    pc_layout_box(g_pc_widescreen_stretch, &cx, &cy, &cw, &ch);
+    if (cw < 1) cw = 1;
+    if (ch < 1) ch = 1;
+    sx = (float)cw / (float)PC_GC_WIDTH;
+    sy = (float)ch / (float)PC_GC_HEIGHT;
+    *gl_w = (int)(wd * sx);
+    *gl_h = (int)(ht * sy);
+    if (*gl_w < 1) *gl_w = 1;
+    if (*gl_h < 1) *gl_h = 1;
+    *gl_x = cx + (int)(left * sx);
+    top_px = cy + (int)(top * sy);
+    *gl_y = g_pc_window_h - top_px - *gl_h;
+}
+
 void GXSetViewport(f32 left, f32 top, f32 wd, f32 ht, f32 nearz, f32 farz) {
     int gl_x, gl_y, gl_w, gl_h;
 
@@ -1375,28 +1405,7 @@ void GXSetViewport(f32 left, f32 top, f32 wd, f32 ht, f32 nearz, f32 farz) {
     g_gx.viewport[4] = nearz;
     g_gx.viewport[5] = farz;
 #ifdef PC_ENHANCEMENTS
-    {
-        float sx = (float)g_pc_window_w / (float)PC_GC_WIDTH;
-        float sy = (float)g_pc_window_h / (float)PC_GC_HEIGHT;
-        float adj_left = left;
-        float adj_wd = wd;
-
-        /* UI mode: remap sub-viewports to match aspect-corrected content */
-        if (g_pc_widescreen_stretch == 2 && g_aspect_active) {
-            int is_full = (left < 1.0f && top < 1.0f &&
-                           wd > (float)(PC_GC_WIDTH - 1) &&
-                           ht > (float)(PC_GC_HEIGHT - 1));
-            if (!is_full) {
-                adj_left = g_aspect_offset + left * g_aspect_factor;
-                adj_wd = wd * g_aspect_factor;
-            }
-        }
-
-        gl_x = (int)(adj_left * sx);
-        gl_w = (int)(adj_wd * sx);
-        gl_h = (int)(ht * sy);
-        gl_y = g_pc_window_h - (int)(top * sy) - gl_h;
-    }
+    gc_to_gl(left, top, wd, ht, &gl_x, &gl_y, &gl_w, &gl_h);
 #else
     /* GX is Y-down, GL is Y-up */
     gl_x = (int)left;
@@ -1434,14 +1443,7 @@ void GXSetScissor(u32 left, u32 top, u32 wd, u32 ht) {
     g_gx.scissor[2] = wd;
     g_gx.scissor[3] = ht;
 #ifdef PC_ENHANCEMENTS
-    {
-        float sx = (float)g_pc_window_w / (float)PC_GC_WIDTH;
-        float sy = (float)g_pc_window_h / (float)PC_GC_HEIGHT;
-        gl_x = (int)(left * sx);
-        gl_w = (int)(wd * sx);
-        gl_h = (int)(ht * sy);
-        gl_y = g_pc_window_h - (int)(top * sy) - gl_h;
-    }
+    gc_to_gl((float)left, (float)top, (float)wd, (float)ht, &gl_x, &gl_y, &gl_w, &gl_h);
 #else
     /* GX is Y-down, GL is Y-up */
     gl_x = (int)left;
@@ -2106,13 +2108,10 @@ static void pc_gx_copy_tex_execute_impl(void* dest, GXBool clear) {
     if (out_wd > 4096 || out_ht > 4096) return;
 
 #ifdef PC_ENHANCEMENTS
-    /* Scale readback coordinates from GC coords to window resolution */
-    float sx = (float)g_pc_window_w / (float)PC_GC_WIDTH;
-    float sy = (float)g_pc_window_h / (float)PC_GC_HEIGHT;
-    int read_left = (int)(g_gx.tex_copy_src[0] * sx);
-    int read_top  = (int)(g_gx.tex_copy_src[1] * sy);
-    int read_wd   = (int)(out_wd * sx);
-    int read_ht   = (int)(out_ht * sy);
+    int read_left, read_top, read_wd, read_ht, read_gl_y;
+    gc_to_gl((float)g_gx.tex_copy_src[0], (float)g_gx.tex_copy_src[1],
+             (float)out_wd, (float)out_ht, &read_left, &read_gl_y, &read_wd, &read_ht);
+    read_top = g_pc_window_h - read_gl_y - read_ht;
 #else
     int read_left = g_gx.tex_copy_src[0];
     int read_top  = g_gx.tex_copy_src[1];

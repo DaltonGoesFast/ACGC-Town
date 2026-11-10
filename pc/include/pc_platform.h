@@ -455,6 +455,16 @@ extern int g_pc_window_w;
 extern int g_pc_window_h;
 void pc_platform_update_window_size(void);
 
+/* Letterboxed picture. Portrait (tall cover) pins it to the top; landscape and the
+ * near-square inner screen center it. stretch==1 is the 16:9 widescreen hack. */
+extern int g_pc_content_x, g_pc_content_y, g_pc_content_w, g_pc_content_h;
+extern int g_pc_layout_portrait;
+void pc_layout_refresh(void);
+void pc_layout_box(int stretch, int* x, int* y, int* w, int* h);
+void pc_gx_external_gl_done(void);
+void pc_pad_device_added(int which);
+void pc_pad_device_removed(int which);
+
 /* --- Widescreen mode (3-state) ---
  * 0 = hor+ (default): full-window viewport, FOV-corrected projection. Resets each frame.
  * 1 = stretch: full-window, no correction. For transitions/inventory BG.

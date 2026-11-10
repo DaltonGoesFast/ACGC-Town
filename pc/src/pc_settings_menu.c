@@ -692,6 +692,58 @@ int pc_settings_menu_confirm(void) {
     return 1;
 }
 
+int pc_settings_menu_pointer(float font_x, float font_y) {
+    int i, n, max_items, t;
+    float y0, line_h, apy;
+    if (!s_active || s_capture) return 0;
+    if (s_sub == SUB_CONFIRM_RES) {
+        if (font_y < 110.0f || font_y > 150.0f) return 0;
+        s_res_sel = (font_x < 160.0f) ? 0 : 1;
+        pc_settings_menu_confirm();
+        return 1;
+    }
+    if (s_sub == SUB_CONFIRM_BACK) {
+        if (font_y < 110.0f || font_y > 160.0f) return 0;
+        s_back_sel = (font_x < 160.0f) ? 0 : 1;
+        pc_settings_menu_confirm();
+        return 1;
+    }
+    if (s_sub != SUB_SETTINGS) return 0;
+    if (font_y >= 44.0f && font_y < 70.0f) {
+        t = (int)((font_x - 20.0f) / 70.0f);
+        if (t < 0) t = 0;
+        if (t >= TAB_COUNT) t = TAB_COUNT - 1;
+        s_tab = t;
+        s_sel = -1;
+        return 1;
+    }
+    y0 = 78.0f;
+    line_h = 15.0f;
+    n = cur_item_count();
+    i = (int)((font_y - y0) / line_h);
+    if (i >= 0 && i < n) {
+        s_sel = i;
+        pc_settings_menu_confirm();
+        return 1;
+    }
+    max_items = 0;
+    for (t = 0; t < TAB_COUNT; t++) {
+        if (s_tabs[t].count > max_items) max_items = s_tabs[t].count;
+    }
+    apy = y0 + (float)max_items * line_h + 10.0f;
+    if (font_y >= apy - 4.0f && font_y < apy + line_h) {
+        s_sel = idx_apply();
+        pc_settings_menu_confirm();
+        return 1;
+    }
+    if (font_y >= apy + line_h - 2.0f && font_y < apy + line_h * 2.0f + 4.0f) {
+        s_sel = idx_back();
+        pc_settings_menu_confirm();
+        return 1;
+    }
+    return 0;
+}
+
 int pc_settings_menu_cancel(void) {
     if (!s_active) return 0;
     if (s_sub == SUB_BINDINGS) {
