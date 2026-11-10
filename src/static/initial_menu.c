@@ -236,11 +236,12 @@ static OSMessage commandMsgBuf[2];
 static OSMessage statusMsgBuf[1];
 
 extern void proc(void* arg) {
-  u32 msg;
+  /* OSReceiveMessage stores a pointer. A u32 here is 4 bytes and the store smashes the stack canary. */
+  OSMessage msg;
   int proc_done;
   OSTimer timer;
 
-  osRecvMesg(&commandQ, (OSMessage*)&msg, OS_MESSAGE_BLOCK);
+  osRecvMesg(&commandQ, &msg, OS_MESSAGE_BLOCK);
   progressive_mode = FALSE;
   fadeout_step = 0;
   menu_step = 0;
@@ -261,12 +262,12 @@ extern void proc(void* arg) {
       }
     }
 
-    if (!osRecvMesg(&commandQ, (OSMessage*)&msg, OS_MESSAGE_NOBLOCK)) {
-      if (msg == INITIAL_MENU_OSMESG_FADEOUT_STEP) {
+    if (!osRecvMesg(&commandQ, &msg, OS_MESSAGE_NOBLOCK)) {
+      if ((uintptr_t)msg == INITIAL_MENU_OSMESG_FADEOUT_STEP) {
         fadeout_step = 2;
       }
 
-      if (msg == INITIAL_MENU_OSMESG_LOAD_GAME_DONE) {
+      if ((uintptr_t)msg == INITIAL_MENU_OSMESG_LOAD_GAME_DONE) {
         load_game_done = TRUE;
       }
     }
@@ -324,12 +325,13 @@ extern void initial_menu_init() {
 }
 
 extern void initial_menu_cleanup() {
-  int msg;
+  /* Same slot as proc(): the logo thread's message is a pointer-sized OSMessage, not an int. */
+  OSMessage msg;
 
   if (Thread_p != NULL) {
-    if (!osRecvMesg(&commandQ, (OSMessage*)&msg, OS_MESSAGE_NOBLOCK)) {
-      osSendMesg(&commandQ, (OSMessage)INITIAL_MENU_OSMESG_LOAD_GAME_DONE, OS_MESSAGE_NOBLOCK);
-      osRecvMesg(&statusQ, (OSMessage*)&msg, OS_MESSAGE_BLOCK);
+    if (!osRecvMesg(&commandQ, &msg, OS_MESSAGE_NOBLOCK)) {
+      osSendMesg(&commandQ, (OSMessage)(uintptr_t)INITIAL_MENU_OSMESG_LOAD_GAME_DONE, OS_MESSAGE_NOBLOCK);
+      osRecvMesg(&statusQ, &msg, OS_MESSAGE_BLOCK);
     }
 
     osDestroyThread(Thread_p);

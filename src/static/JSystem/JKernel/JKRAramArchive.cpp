@@ -160,6 +160,13 @@ bool JKRAramArchive::open(s32 entryNum) {
         OSReport("[PC] RARC header: sig=%08x len=%u hdrlen=%u dataoff=%u datalen=%u\n",
                  mem->signature, mem->file_length, mem->header_length,
                  mem->file_data_offset, mem->file_data_length);
+        /* A missing or stub disc leaves this buffer empty. Walking it as a RARC
+         * uses garbage offsets and faults. A real archive starts with 'RARC'. */
+        if (mem->signature != 0x52415243u || mem->file_length < 0x40u || mem->file_length > 0x4000000u ||
+            mem->file_data_offset < 0x20u || mem->file_data_offset > 0x1000000u) {
+            mMountMode = 0;
+            goto cleanup;
+        }
 #endif
 
         int alignment = mMountDirection == MOUNT_DIRECTION_HEAD ? 32 : -32;
@@ -182,6 +189,12 @@ bool JKRAramArchive::open(s32 entryNum) {
             mArcInfoBlock->nextFreeFileID = bswap16(mArcInfoBlock->nextFreeFileID);
             OSReport("[PC] RARC info: nodes=%u files=%u\n",
                      mArcInfoBlock->num_nodes, mArcInfoBlock->num_file_entries);
+            if (mArcInfoBlock->num_nodes > 100000u || mArcInfoBlock->num_file_entries > 100000u ||
+                mArcInfoBlock->node_offset >= alignedSize || mArcInfoBlock->file_entry_offset >= alignedSize ||
+                mArcInfoBlock->string_table_offset >= alignedSize) {
+                mMountMode = 0;
+                goto cleanup;
+            }
 #endif
 
             mDirectories = (SDIDirEntry*)((u8*)mArcInfoBlock + mArcInfoBlock->node_offset);

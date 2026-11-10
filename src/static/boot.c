@@ -33,6 +33,15 @@
 #include "m_field_make.h"
 #include "m_map_ovl.h"
 #include "pc_bswap.h"
+#include "pc_crash.h"
+#ifdef __ANDROID__
+#include <unistd.h>
+#endif
+
+static void boot_stage(const char* name) {
+  OSReport("[PC] boot: %s\n", name);
+  pc_diag_milestone(name);
+}
 
 /* Raw binary display lists (u8[] with BE data from ROM .inc files).
    On LE these need u32 byte-swap so emu64 reads correct commands. */
@@ -684,6 +693,9 @@ int main(int argc, const char** argv) {
   OSReport("どうぶつの森ブートローダ起動\n"); /* Animal Crossing bootloader startup */
   adjustOSArena();
   JW_Init();
+#ifdef TARGET_PC
+  boot_stage("boot: JW_Init returned");
+#endif
 
   /* Check enable debug process bars */
   if (APPNMI_DEBUGMODE_GET()) {
@@ -716,21 +728,25 @@ int main(int argc, const char** argv) {
 
   OSReport("InitialStartTime=%u us\n", (u32)OSTicksToMicroseconds((u64)InitialStartTime));
 #ifdef TARGET_PC
-  OSReport("[PC] boot: calling sound_initial...\n");
+  boot_stage("boot: sound_initial");
 #endif
   sound_initial();
 #ifdef TARGET_PC
-  OSReport("[PC] boot: calling initial_menu_init...\n");
+  boot_stage("boot: sound_initial returned");
+  boot_stage("boot: initial_menu_init");
 #endif
   initial_menu_init();
 #ifdef TARGET_PC
-  OSReport("[PC] boot: calling dvderr_init...\n");
+  boot_stage("boot: dvderr_init");
 #endif
   dvderr_init();
 #ifdef TARGET_PC
-  OSReport("[PC] boot: calling sound_initial2...\n");
+  boot_stage("boot: sound_initial2");
 #endif
   sound_initial2();
+#ifdef TARGET_PC
+  boot_stage("boot: sound_initial2 returned");
+#endif
 
   if ((OSGetConsoleType() & OS_CONSOLE_DEVELOPMENT) == 0) {
     OSReport("以降OSReportを無効\n"); /* OSReport disabled from now on. */
@@ -740,7 +756,7 @@ int main(int argc, const char** argv) {
   }
 
 #ifdef TARGET_PC
-  OSReport("[PC] boot: loading COPYDATE...\n");
+  boot_stage("boot: COPYDATE");
 #endif
   OSReport("Loging COPYDATE\n");
   boot_copyDate = JC__JKRDvdToMainRam_byName("/COPYDATE", nullptr, EXPAND_SWITCH_DECOMPRESS);
@@ -753,7 +769,7 @@ int main(int argc, const char** argv) {
   }
 
 #ifdef TARGET_PC
-  OSReport("[PC] boot: loading string table...\n");
+  boot_stage("boot: string table");
 #endif
   LoadStringTable("/static.str");
 
@@ -767,8 +783,17 @@ int main(int argc, const char** argv) {
     moduleA = LoadLink("/foresta.rel.szs");
   }
 #endif
+#ifdef TARGET_PC
+  boot_stage("boot: JW_Init2");
+#endif
   JW_Init2();
+#ifdef TARGET_PC
+  boot_stage("boot: initial_menu_cleanup");
+#endif
   initial_menu_cleanup();
+#ifdef TARGET_PC
+  boot_stage("boot: initial_menu_cleanup returned");
+#endif
 
   JC_JKRExpHeap_changeGroupID(JC_JFWSystem_getSystemHeap(), 5);
 
@@ -777,7 +802,20 @@ int main(int argc, const char** argv) {
   mFM_InitActableEndian();
   pc_bswap_u8_tlut_palettes();
   pc_bswap_house_pos_list();
+  {
+    char stage[80];
+    snprintf(stage, sizeof(stage), "boot: HotStartEntry %p", HotStartEntry);
+    boot_stage(stage);
+  }
   OSReport("[PC] boot: entering HotStartEntry loop (entry=%08x)...\n", (u32)HotStartEntry);
+#ifdef __ANDROID__
+  /* The emulator plants this file to run boot without a disc. Stop before the
+   * game loop, which needs the real archive. */
+  if (access("audio_init_test", F_OK) == 0) {
+    boot_stage("boot: test stop before game loop");
+    return 0;
+  }
+#endif
 #endif
   while (HotStartEntry != nullptr) {
     OSReport("ホットスタート(%08x)\n", HotStartEntry);

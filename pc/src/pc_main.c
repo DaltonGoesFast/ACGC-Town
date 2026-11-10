@@ -9,6 +9,7 @@
 #include "pc_crash.h"
 #include "pc_lowaddr.h"
 static int pc_game_main(int argc, char** argv);
+static int s_boot_test = 0;
 #endif
 #include "pc_guest_admit.h" /* --max-guests range */
 #include "pc_nook_house.h" /* guest Nook dialogue (M4): the rejoin hold */
@@ -1813,21 +1814,9 @@ static int pc_game_main(int argc, char* argv[]) {
     }
     if (access("/data/user/0/com.acgc.town/files/audio_init_test", F_OK) == 0 ||
         access("/data/data/com.acgc.town/files/audio_init_test", F_OK) == 0) {
-        extern void sound_initial(void);
-        pc_diag_milestone("audio init test: sound_initial");
-        if (SDL_Init(SDL_INIT_TIMER | SDL_INIT_AUDIO) != 0) {
-            pc_diag_milestone(SDL_GetError());
-            return 2;
-        }
-        pc_lowaddr_init();
-        sound_initial();
-        pc_diag_milestone("audio init test: sound_initial returned");
-        if (pc_lowaddr_game_violation_count() != 0) {
-            pc_diag_fail_box("ACGC Town", "A game pointer is still above 4 GB. See the lowaddr AUDIT log.");
-            return 2;
-        }
-        pc_diag_milestone("audio init test: lowaddr clean");
-        return 0;
+        /* Run the real boot_main, including the logo cleanup after sound_initial. */
+        s_boot_test = 1;
+        pc_diag_milestone("boot test: armed");
     }
 #else
 int main(int argc, char* argv[]) {
@@ -2977,6 +2966,23 @@ int main(int argc, char* argv[]) {
     }
 
     pc_platform_init();
+#ifdef __ANDROID__
+    if (s_boot_test) {
+        extern int boot_main(int argc, const char** argv);
+        int rc;
+        pc_diag_milestone("boot test: boot_main");
+        rc = boot_main(argc, (const char**)argv);
+        pc_diag_milestone("boot test: boot_main returned");
+        if (pc_lowaddr_game_violation_count() != 0) {
+            pc_diag_fail_box("ACGC Town", "A game pointer is still above 4 GB. See the lowaddr AUDIT log.");
+            pc_platform_shutdown();
+            return 2;
+        }
+        pc_diag_milestone("boot test: lowaddr clean");
+        pc_platform_shutdown();
+        return rc;
+    }
+#endif
 #ifdef PC_LOW_ADDRESS_64
     if (g_pc_lowaddr_selftest) {
         int failures = pc_lowaddr_selftest();
