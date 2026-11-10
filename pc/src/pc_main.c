@@ -5,20 +5,9 @@
 #include "pc_platform.h"
 #ifdef __ANDROID__
 #include <unistd.h>
-#include <pthread.h>
 #include "pc_lowheap.h"
 #include "pc_crash.h"
-struct pc_android_boot {
-    int argc;
-    char** argv;
-    int rc;
-};
-int main(int argc, char** argv);
-static void* pc_android_low_stack_main(void* arg) {
-    struct pc_android_boot* boot = (struct pc_android_boot*)arg;
-    boot->rc = main(boot->argc, boot->argv);
-    return NULL;
-}
+static int pc_game_main(int argc, char** argv);
 #endif
 #include "pc_guest_admit.h" /* --max-guests range */
 #include "pc_nook_house.h" /* guest Nook dialogue (M4): the rejoin hold */
@@ -1766,55 +1755,46 @@ void pc_main_play_online_poll(void) {
     }
 }
 
-int main(int argc, char* argv[]) {
 #ifdef __ANDROID__
-    /* The decomp stores some stack addresses in u32. Run the game on a stack taken from the below-4GB heap. */
-    static int s_on_low_stack;
+int main(int argc, char* argv[]) {
+    /* Stay on SDL's thread. A second pthread is not attached to the JVM the way SDL expects,
+     * and SDL.setupJNI() has not run yet when the library constructor maps the heap. */
+    long page = sysconf(_SC_PAGESIZE);
+    size_t stack_bytes = 8u * 1024u * 1024u;
+    void* raw;
+    uintptr_t lo, hi;
+    char msg[192];
     pc_diag_init();
-    if (!s_on_low_stack) {
-        struct pc_android_boot boot;
-        pthread_t thread;
-        pthread_attr_t attr;
-        long page = sysconf(_SC_PAGESIZE);
-        size_t stack_bytes = 8u * 1024u * 1024u;
-        void* raw;
-        uintptr_t aligned;
-        if (page < 4096) page = 4096;
-        if (!pc_lowheap_ok()) {
-            pc_diag_fail_box("ACGC Town", pc_lowheap_error());
-            return 1;
-        }
-        raw = pc_lowheap_reserve(stack_bytes + (size_t)page);
-        if (raw == NULL) {
-            pc_diag_fail_box("ACGC Town", "The low heap is reserved, but an 8MB thread stack would not fit in it.");
-            return 1;
-        }
-        aligned = ((uintptr_t)raw + (uintptr_t)page - 1u) & ~((uintptr_t)page - 1u);
-        if (aligned + stack_bytes > (uintptr_t)raw + stack_bytes + (size_t)page) {
-            pc_diag_fail_box("ACGC Town", "The thread stack could not be aligned to the device page size.");
-            return 1;
-        }
-        s_on_low_stack = 1;
-        boot.argc = argc;
-        boot.argv = argv;
-        boot.rc = 1;
-        pthread_attr_init(&attr);
-        if (pthread_attr_setstack(&attr, (void*)aligned, stack_bytes) != 0 ||
-            pthread_create(&thread, &attr, pc_android_low_stack_main, &boot) != 0) {
-            s_on_low_stack = 0;
-            pthread_attr_destroy(&attr);
-            pc_diag_fail_box("ACGC Town", "Could not start the game thread on the low stack.");
-            return 1;
-        }
-        pthread_attr_destroy(&attr);
-        pthread_join(thread, NULL);
-        return boot.rc;
+    pc_diag_milestone("entered SDL_main");
+    if (page < 4096) page = 4096;
+    if (!pc_lowheap_ok()) {
+        pc_diag_fail_box("ACGC Town", pc_lowheap_error());
+        return 1;
     }
-    /* SDLActivity calls this as SDL_main. The disc picker stored the image in internal storage; shaders are copied there too. */
+    snprintf(msg, sizeof(msg), "heap reserve ok page %ld", page);
+    pc_diag_milestone(msg);
+    raw = pc_lowheap_reserve(stack_bytes + (size_t)page);
+    if (raw == NULL) {
+        pc_diag_fail_box("ACGC Town", "The low heap is reserved, but an 8MB stack would not fit in it.");
+        return 1;
+    }
+    lo = ((uintptr_t)raw + (uintptr_t)page - 1u) & ~((uintptr_t)page - 1u);
+    hi = (lo + stack_bytes) & ~(uintptr_t)15u;
+    if (hi <= lo || hi > (uintptr_t)raw + stack_bytes + (size_t)page) {
+        pc_diag_fail_box("ACGC Town", "The game stack could not be aligned to the device page size.");
+        return 1;
+    }
+    pc_diag_milestone("stack switch ok");
+    return pc_run_on_stack((void*)hi, pc_game_main, argc, argv);
+}
+
+static int pc_game_main(int argc, char* argv[]) {
     {
         const char* storage = SDL_AndroidGetInternalStoragePath();
         if (storage != NULL && storage[0] != '\0') chdir(storage);
     }
+#else
+int main(int argc, char* argv[]) {
 #endif
     pc_relaunch_forward_capture(argc, argv); /* M-C: the whitelisted display / diagnostic options are forwarded by a Play Online relaunch */
     for (int i = 1; i < argc; i++) {

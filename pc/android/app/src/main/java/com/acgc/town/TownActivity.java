@@ -1,6 +1,7 @@
 package com.acgc.town;
 
 import android.os.Bundle;
+import android.util.Log;
 
 import org.libsdl.app.SDLActivity;
 
@@ -26,6 +27,7 @@ public class TownActivity extends SDLActivity {
         File shaders = new File(getFilesDir(), "shaders");
         copyAsset("default.vert", new File(shaders, "default.vert"));
         copyAsset("default.frag", new File(shaders, "default.frag"));
+        Log.i("ACGC", "TownActivity start, rom=" + new File(getFilesDir(), "gafe01.iso").getAbsolutePath());
         super.onCreate(savedInstanceState);
         SafeInsets.install(this);
     }

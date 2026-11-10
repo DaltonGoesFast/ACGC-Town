@@ -2,8 +2,6 @@
  * Display-list symbols that live in the high .so go through the GBI token table instead. */
 #include "pc_lowheap.h"
 
-#include "pc_crash.h"
-
 #include <errno.h>
 #include <pthread.h>
 #include <stdint.h>
@@ -57,7 +55,7 @@ static void lowheap_init(void) {
     unsigned d, b;
     if (s_tried) return;
     s_tried = 1;
-    pc_diag_init();
+    /* Do not call into SDL here. This runs from a library constructor, before SDL.setupJNI(). */
     for (d = 0; d < sizeof(divs) / sizeof(divs[0]); d++) {
         size_t bytes = align_up(PC_LOWHEAP_SIZE / divs[d], page);
         if (bytes < 32u * 1024u * 1024u) break;
@@ -76,12 +74,8 @@ static void lowheap_init(void) {
             s_free->size = bytes | 1u;
             s_free->next = NULL;
             s_error[0] = '\0';
-            {
-                char msg[160];
-                snprintf(msg, sizeof(msg), "heap reserve ok %uMB at 0x%lx page %u",
-                         (unsigned)(bytes / (1024u * 1024u)), (unsigned long)bases[b], (unsigned)page);
-                pc_diag_milestone(msg);
-            }
+            fprintf(stderr, "[PC] heap reserve ok %uMB at %p page %u\n",
+                    (unsigned)(bytes / (1024u * 1024u)), p, (unsigned)page);
             return;
         }
     }
@@ -89,7 +83,7 @@ static void lowheap_init(void) {
              "Could not reserve a heap below 4GB (page size %u). mmap at the low addresses was refused (%s). "
              "The game stores some pointers in 32 bits, so it stops here instead of crashing later.",
              (unsigned)page, errno != 0 ? strerror(errno) : "no free low range");
-    pc_diag_milestone(s_error);
+    fprintf(stderr, "[PC] %s\n", s_error);
 }
 
 __attribute__((constructor(101))) static void lowheap_ctor(void) { lowheap_init(); }
@@ -212,3 +206,26 @@ void* __wrap_realloc(void* p, size_t n) {
     __wrap_free(p);
     return fresh;
 }
+
+#if defined(__aarch64__)
+/* Naked so the compiler cannot put a prologue on the SDL stack or clobber x0-x3
+ * before the switch. x0 is the new stack top, x1 the function, x2 argc, x3 argv. */
+__attribute__((naked)) int pc_run_on_stack(void* stack_top, int (*fn)(int, char**), int argc, char** argv) {
+    __asm__ __volatile__(
+        "stp x19, x30, [sp, #-16]!\n"
+        "mov x19, sp\n"
+        "mov x9, x1\n"
+        "mov sp, x0\n"
+        "mov x0, x2\n"
+        "mov x1, x3\n"
+        "blr x9\n"
+        "mov sp, x19\n"
+        "ldp x19, x30, [sp], #16\n"
+        "ret\n");
+}
+#else
+int pc_run_on_stack(void* stack_top, int (*fn)(int, char**), int argc, char** argv) {
+    (void)stack_top;
+    return fn(argc, argv);
+}
+#endif
