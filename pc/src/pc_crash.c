@@ -360,6 +360,16 @@ void pc_hb_set_scene(void* exec, int doing) {
     pthread_mutex_unlock(&s_hb_mu);
 }
 
+void pc_diag_proc_name(void* fn, char* buf, unsigned n) {
+    Dl_info inf;
+    if (buf == NULL || n == 0) return;
+    buf[0] = '?';
+    if (n > 1) buf[1] = '\0';
+    if (fn == NULL) return;
+    memset(&inf, 0, sizeof(inf));
+    if (dladdr(fn, &inf) && inf.dli_sname != NULL) snprintf(buf, n, "%s", inf.dli_sname);
+}
+
 void pc_hb_note_dvd(unsigned off, unsigned len) {
     pthread_mutex_lock(&s_hb_mu);
     snprintf(s_dvd, sizeof(s_dvd), "off=%u len=%u", off, len);
@@ -496,6 +506,13 @@ void pc_diag_init(void) {}
 void pc_diag_milestone(const char* msg) { (void)msg; }
 void pc_hb_set_step(const char* step) { (void)step; }
 void pc_hb_set_scene(void* exec, int doing) { (void)exec; (void)doing; }
+void pc_diag_proc_name(void* fn, char* buf, unsigned n) {
+    (void)fn;
+    if (buf != NULL && n > 0) {
+        buf[0] = '?';
+        if (n > 1) buf[1] = '\0';
+    }
+}
 void pc_hb_note_dvd(unsigned off, unsigned len) { (void)off; (void)len; }
 void pc_hb_note_gx(int w, int h) { (void)w; (void)h; }
 void pc_hb_note_view(int x, int y, int w, int h) { (void)x; (void)y; (void)w; (void)h; }

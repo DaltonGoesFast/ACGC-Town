@@ -71,6 +71,7 @@ static int s_drag_logged = 0;
 static int s_tap_logged = 0;
 static Uint32 s_last_tap_ms = 0;
 static int s_swipe = 0;
+static int s_choice_confirm = 0;
 static char s_tap_kind[16] = "-";
 
 enum { FINGERS = 4 };
@@ -720,6 +721,8 @@ static void latch_consume(unsigned short* buttons) {
 }
 
 static int choice_count_now(void);
+static int choice_is_up(void);
+static void note_tap(const char* kind);
 
 static void on_picture_release(float x, float y) {
     float fx, fy;
@@ -741,6 +744,7 @@ static void on_picture_release(float x, float y) {
             latch_button(PAD_BUTTON_A, "A");
             snprintf(line, sizeof(line), "touch title row %d", i);
             pc_diag_milestone(line);
+            note_tap("title");
         } else {
             char line[64];
             snprintf(line, sizeof(line), "touch picture fy=%.0f fx=%.0f", fy, fx);
@@ -748,8 +752,11 @@ static void on_picture_release(float x, float y) {
         }
         return;
     }
-    if (choice_count_now() > 0) return;
-    if (message_open() || submenu_open()) s_pulse_a = 1;
+    if (choice_is_up()) return;
+    if (message_open() || submenu_open()) {
+        s_pulse_a = 1;
+        note_tap("text");
+    }
 }
 
 static int choice_count_now(void) {
@@ -759,12 +766,27 @@ static int choice_count_now(void) {
     return c->data.choice_num;
 }
 
+/* True from the moment a choice window is on screen, including the appear
+ * animation. A text-advance tap must not confirm the highlighted row. */
+static int choice_is_up(void) {
+    mChoice_c* c = mChoice_Get_base_window_p();
+    if (c == NULL || c->data.choice_num < 1) return 0;
+    return c->main_index != mChoice_MAIN_HIDE;
+}
+
+static void note_tap(const char* kind) {
+    if (kind == NULL) return;
+    snprintf(s_tap_kind, sizeof(s_tap_kind), "%s", kind);
+}
+
 static void pick_choice(int i) {
     mChoice_c* c = mChoice_Get_base_window_p();
     char line[32];
     if (c == NULL || i < 0 || i >= c->data.choice_num) return;
     c->selected_choice_idx = i;
+    s_choice_confirm = 1;
     s_pulse_a = 1;
+    note_tap("choice");
     snprintf(line, sizeof(line), "tap choice %d", i + 1);
     pc_diag_milestone(line);
 }
@@ -844,11 +866,13 @@ void pc_touch_apply(unsigned short* buttons, signed char* stick_x, signed char* 
                 latch_button(PAD_BUTTON_B, "B");
                 pc_touch_buzz();
                 pc_diag_milestone(th == HIT_CLOSE ? "touch close" : "touch back");
+                note_tap(th == HIT_CLOSE ? "close" : "back");
                 if (g_pc_paused) pause_key(SDLK_ESCAPE);
             } else if (th == HIT_CONTEXT) {
                 latch_button(PAD_BUTTON_A, "A");
                 pc_touch_buzz();
                 pc_diag_milestone("touch context");
+                note_tap("context");
             } else if (th == HIT_CHOICE) {
                 pick_choice(tk);
                 pc_touch_buzz();
@@ -989,6 +1013,12 @@ void pc_touch_apply(unsigned short* buttons, signed char* stick_x, signed char* 
         (void)steer_toward(s_target_x, s_target_z, stick_x, stick_y);
     if (s_running && s_have_target && can_steer() && buttons != NULL) *buttons |= PAD_BUTTON_B;
     if (!s_have_target) s_running = 0;
+    /* A choice is only confirmed by its bubble. A leftover text-advance latch must not select a row. */
+    if (choice_is_up() && !s_choice_confirm && buttons != NULL) {
+        *buttons = (unsigned short)(*buttons & ~PAD_BUTTON_A);
+        s_latch &= ~PAD_BUTTON_A;
+    }
+    s_choice_confirm = 0;
     (void)key;
 }
 

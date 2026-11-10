@@ -2535,12 +2535,17 @@ int pc_offline_solo_begin(void) {
     }
     s_offline_solo = 1;
     pc_save_ready = 0;
-    pc_save_loaded = pc_save_check_and_load();
-    if (!pc_save_loaded) {
-        /* First visit: there is no file yet. The new town is written only under save/offline. */
+    if (pc_save_check_and_load()) {
         pc_save_loaded = 1;
+        pc_diag_milestone("offline solo loaded save/offline");
+        return 1;
     }
-    pc_diag_milestone("offline solo save/offline");
+    /* No file in save/offline. Do not pretend the town from save/card_a is loaded.
+     * Clearing the save check makes the first-game path run: player select, the
+     * train, Rover, then a new town written only under save/offline. */
+    pc_save_loaded = 0;
+    mFRm_ClearSaveCheckData(Save_GetPointer(save_check));
+    pc_diag_milestone("offline solo new save/offline");
     return 1;
 }
 

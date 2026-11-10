@@ -15,6 +15,7 @@ void pc_diag_fail_box(const char* title, const char* msg);
  * second and, if no frame finishes for 5s, asks the game thread to unwind. */
 void pc_hb_set_step(const char* step);
 void pc_hb_set_scene(void* exec, int doing);
+void pc_diag_proc_name(void* fn, char* buf, unsigned n);
 void pc_hb_note_dvd(unsigned off, unsigned len);
 void pc_hb_note_gx(int w, int h);
 void pc_hb_note_view(int x, int y, int w, int h);

@@ -26,6 +26,8 @@
 #include "sys_ucode.h"
 #include "zurumode.h"
 #ifdef TARGET_PC
+#include "m_msg.h"
+#include "m_demo.h"
 #include "pc_model_viewer.h"
 #include "pc_diag.h"
 #include "pc_crash.h"
@@ -378,6 +380,44 @@ static void graph_main(GRAPH* this, GAME* game) {
     }
 }
 #else
+#ifdef TARGET_PC
+static void pc_trace_frame(GAME* game) {
+    static const void* last_exec;
+    static int last_scene = -9999;
+    static int last_msg = -9999;
+    static int last_demo = -9999;
+    char line[96];
+    if ((const void*)game->exec != last_exec) {
+        char name[64];
+        pc_diag_proc_name((void*)game->exec, name, sizeof(name));
+        snprintf(line, sizeof(line), "scene -> %s", name);
+        pc_diag_milestone(line);
+        last_exec = (const void*)game->exec;
+    }
+    if (game->exec == play_main) {
+        GAME_PLAY* play = (GAME_PLAY*)game;
+        mMsg_Window_c* msg;
+        int demo;
+        if ((int)play->scene_id != last_scene) {
+            snprintf(line, sizeof(line), "scene id -> %d", (int)play->scene_id);
+            pc_diag_milestone(line);
+            last_scene = (int)play->scene_id;
+        }
+        msg = mMsg_Get_base_window_p();
+        if (msg != NULL && msg->msg_no != last_msg) {
+            snprintf(line, sizeof(line), "talk -> %d", msg->msg_no);
+            pc_diag_milestone(line);
+            last_msg = msg->msg_no;
+        }
+        demo = mDemo_CheckDemoType();
+        if (demo != last_demo) {
+            snprintf(line, sizeof(line), "demo -> %d", demo);
+            pc_diag_milestone(line);
+            last_demo = demo;
+        }
+    }
+}
+#endif
 static void graph_main(GRAPH* this, GAME* game) {
     game->disable_prenmi = FALSE;
     PC_DIAG(10, "graph_main: enter, frame_counter=%d game=%p exec=%p cleanup=%p doing=%d\n",
@@ -391,6 +431,7 @@ static void graph_main(GRAPH* this, GAME* game) {
     {
         Uint64 pc_prof_t;
         pc_hb_set_scene((void*)game->exec, (int)this->doing_point);
+        pc_trace_frame(game);
         pc_hb_set_step("graph_main game");
         pc_profiler_begin_frame();
         pc_prof_t = pc_profiler_begin_timer();

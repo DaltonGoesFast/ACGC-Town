@@ -13,10 +13,14 @@ extern "C" {
 #ifdef TARGET_PC
 #ifdef PC_GBI_INTERN
 unsigned int pc_gbi_intern(uintptr_t addr);
+/* Intern any address that does not fit in 32 bits, even when the expression is an array
+ * or an integer-typed slot. A stack pointer on Android lives above 4 GB. Truncating it
+ * and later reading it faults at the low 32 bits (the Fold crash at 0xc78663b7). */
+unsigned int pc_gbi_pack_auto(uintptr_t addr, int is_ptr);
+unsigned int pc_gbi_pack_word(uintptr_t addr);
 #define _GBI_STATIC_PTR(s) pc_gbi_intern((uintptr_t)(s))
 #define _GBI_IS_RUNTIME_PTR_EXPR(s) (__builtin_classify_type(s) == 5 || __builtin_classify_type(s) == 14)
-#define _GBI_RUNTIME_PTR(s) \
-    (_GBI_IS_RUNTIME_PTR_EXPR(s) ? pc_gbi_intern((uintptr_t)(s)) : (unsigned int)(uintptr_t)(s))
+#define _GBI_RUNTIME_PTR(s) pc_gbi_pack_auto((uintptr_t)(s), _GBI_IS_RUNTIME_PTR_EXPR(s))
 #else
 #ifndef _GBI_STATIC_ASSERT
 #ifdef __cplusplus
@@ -1055,11 +1059,16 @@ typedef struct {
 } combiner_tev_alpha;
 
 /* New Command Macros */
+#ifdef PC_GBI_INTERN
+#define _GBI_PACK_WORD(extra) pc_gbi_pack_word((uintptr_t)(extra))
+#else
+#define _GBI_PACK_WORD(extra) ((u32)(extra))
+#endif
 #define gDPParam2(cmd, tag, param, extra) \
 do { \
   Gfx* _g = (Gfx*)(pkt); \
   _g->words.w0 = (u32)(_SHIFTL(cmd, 24, 8) | _SHIFTL(tag, 16, 8) | _SHIFTL(param, 0, 16)); \
-  _g->words.w1 = (u32)(extra); \
+  _g->words.w1 = _GBI_PACK_WORD(extra); \
 } while(0)
 
 #define gsDPParam2(cmd, tag, param, extra) \
