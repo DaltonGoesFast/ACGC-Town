@@ -50,7 +50,7 @@ void* JKRDecomp::run() {
                 break;
             }
 
-            cmd->mCallback((u32)cmd);
+            cmd->mCallback((u32)(uintptr_t)cmd);
         }
 
         if (cmd->pMesgQueue1C != nullptr) {
@@ -179,14 +179,14 @@ void JKRDecomp::decodeSZP(u8* src, u8* dst, u32 srcLength, u32 skipCount) {
             offset = dstOffset - (linkInfo & 0xFFF);
             count = (linkInfo >> 12);
             if (count == 0) {
-                count = (u32)src[srcDataOffset++] + 0x12;
+                count = (u32)(uintptr_t)src[srcDataOffset++] + 0x12;
             } else
                 count += 2;
 
-            if ((int)count > decodedSize - dstOffset)
+            if ((int)(intptr_t)count > decodedSize - dstOffset)
                 count = decodedSize - dstOffset;
 
-            for (i = 0; i < (int)count; i++, dstOffset++, offset++) {
+            for (i = 0; i < (int)(intptr_t)count; i++, dstOffset++, offset++) {
                 if (skipCount == 0) {
                     dst[dstOffset] = dst[offset - 1];
                     length--;

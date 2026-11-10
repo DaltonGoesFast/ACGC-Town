@@ -29,6 +29,33 @@
 #endif
 
 #ifdef TARGET_PC
+#ifdef PC_GBI_INTERN
+/* arm64 loads the game above 4 GB, so a display-list word cannot hold the pointer.
+ * Static initializers store a token; seg2k0 turns it back into the real address. */
+#ifndef _GBI_RUNTIME_PTR_HELPERS
+#define _GBI_RUNTIME_PTR_HELPERS
+#ifdef __cplusplus
+extern "C" {
+#endif
+unsigned int pc_gbi_intern(uintptr_t addr);
+uintptr_t pc_gbi_resolve(unsigned int packed);
+int pc_gbi_is_token(unsigned int packed);
+unsigned int pc_gbi_pack_u32(uintptr_t addr);
+unsigned int pc_gbi_pack_runtime_ptr(uintptr_t addr, int is_ptr, const char* expr, const char* file, int line);
+uintptr_t pc_gbi_unpack_runtime_ptr(unsigned int packed);
+#ifdef __cplusplus
+}
+#endif
+#endif
+#ifndef _GBI_STATIC_PTR
+#define _GBI_STATIC_PTR(s) pc_gbi_intern((uintptr_t)(s))
+#endif
+#ifndef _GBI_RUNTIME_PTR
+#define _GBI_IS_RUNTIME_PTR_EXPR(s) (__builtin_classify_type(s) == 5 || __builtin_classify_type(s) == 14)
+#define _GBI_RUNTIME_PTR(s) \
+    (_GBI_IS_RUNTIME_PTR_EXPR(s) ? pc_gbi_intern((uintptr_t)(s)) : (unsigned int)(uintptr_t)(s))
+#endif
+#else
 #ifndef _GBI_RUNTIME_PTR_HELPERS
 #define _GBI_RUNTIME_PTR_HELPERS
 #ifndef PC_LOW_ADDRESS_64
@@ -57,6 +84,7 @@ uintptr_t pc_gbi_unpack_runtime_ptr(unsigned int packed);
 #define _GBI_RUNTIME_PTR(s) \
     pc_gbi_pack_runtime_ptr((uintptr_t)(s), _GBI_IS_RUNTIME_PTR_EXPR(s), #s, __FILE__, __LINE__)
 #endif
+#endif /* PC_GBI_INTERN */
 #else
 #ifndef _GBI_STATIC_PTR
 #define _GBI_STATIC_PTR(s) (unsigned int)(s)
@@ -1176,7 +1204,12 @@ typedef struct {
  * First 8 words are integer portion of the 4x4 matrix
  * Last 8 words are the fraction portion of the 4x4 matrix
  */
-typedef long	Mtx_t[4][4];
+/* GameCube long is 32 bits. LP64 long would double the matrix and hide every building. */
+#if defined(TARGET_PC) && defined(__LP64__)
+typedef int Mtx_t[4][4];
+#else
+typedef long Mtx_t[4][4];
+#endif
 
 typedef union {
     Mtx_t		m;
@@ -1464,7 +1497,7 @@ typedef struct {
 
 typedef union {
     Hilite_t	h;
-    long int	force_structure_alignment[4];
+    int force_structure_alignment[4];
 } Hilite;
 
 #define gdSPDefLights0(ar,ag,ab)					\
@@ -1729,7 +1762,7 @@ typedef struct {
 		unsigned int	prim_min_level:8;
 		unsigned int	pad:8;
 		int		cmd:8;
-		unsigned long	color;
+		unsigned int	color;
 } Gsetcolor;
 #else
 typedef struct {
@@ -1737,7 +1770,7 @@ typedef struct {
 		unsigned char	pad;
 		unsigned char	prim_min_level;
 		unsigned char	prim_level;
-		unsigned long	color;
+		unsigned int	color;
 } Gsetcolor;
 #endif
 
@@ -1876,10 +1909,10 @@ typedef struct {
  * Textured rectangles are 128 bits not 64 bits
  */	
 typedef struct {
-    unsigned long w0;
-    unsigned long w1;
-    unsigned long w2;
-    unsigned long w3;
+    unsigned int w0;
+    unsigned int w1;
+    unsigned int w2;
+    unsigned int w3;
 } TexRect;
 
 /*
@@ -3226,7 +3259,7 @@ typedef union {
 {{									\
 	_SHIFTL(cmd, 24, 8) | _SHIFTL(fmt, 21, 3) |			\
 	_SHIFTL(siz, 19, 2) | _SHIFTL((width)-1, 0, 12),		\
-	(unsigned int)(i)						\
+	_GBI_STATIC_PTR(i)						\
 }}
 
 #define	gDPSetColorImage(pkt, f, s, w, i)	gSetImage(pkt, G_SETCIMG, f, s, w, i)

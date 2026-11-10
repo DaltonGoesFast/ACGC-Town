@@ -11,6 +11,9 @@ extern "C" {
 /* Initialize disc image reader. Searches for .ciso/.iso/.gcm in
  * current dir, orig/, rom/. Parses GCM filesystem into lookup table.
  * Returns 1 on success, 0 if no disc image found. */
+/* Use this file instead of searching the working directory. Empty clears the override. */
+void pc_disc_set_image_path(const char* path);
+
 int pc_disc_init(void);
 
 /* Check if a disc image is open. */

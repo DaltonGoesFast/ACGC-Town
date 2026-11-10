@@ -20,7 +20,12 @@ extern int ScreenHeight;
 extern OSThread graphThread;
 extern u8 SegmentBaseAddress[0x40];
 
+/* SDL renames main to SDL_main. Keep this declaration as the GameCube entry
+ * (compiled as ac_entry) so it does not collide with int SDL_main(int, char**). */
+#pragma push_macro("main")
+#undef main
 void main(void);
+#pragma pop_macro("main")
 extern void mainproc(void* val);
 
 #ifdef __cplusplus

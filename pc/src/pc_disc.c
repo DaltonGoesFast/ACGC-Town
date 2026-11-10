@@ -286,8 +286,22 @@ static int str_ends_ci(const char* s, const char* suffix) {
     return 1;
 }
 
+static char s_forced_image[512];
+
+void pc_disc_set_image_path(const char* path) {
+    if (path == NULL || path[0] == '\0') {
+        s_forced_image[0] = '\0';
+        return;
+    }
+    snprintf(s_forced_image, sizeof(s_forced_image), "%s", path);
+}
+
 static int find_disc_image(char* out_path, int out_sz) {
     static const char* dirs[] = { ".", "orig", "rom", NULL };
+    if (s_forced_image[0] != '\0') {
+        snprintf(out_path, out_sz, "%s", s_forced_image);
+        return 1;
+    }
     int d;
 
     for (d = 0; dirs[d]; d++) {

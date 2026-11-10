@@ -5,6 +5,19 @@
 #include "pc_platform.h"
 #ifdef __ANDROID__
 #include <unistd.h>
+#include <pthread.h>
+#include "pc_lowheap.h"
+struct pc_android_boot {
+    int argc;
+    char** argv;
+    int rc;
+};
+int main(int argc, char** argv);
+static void* pc_android_low_stack_main(void* arg) {
+    struct pc_android_boot* boot = (struct pc_android_boot*)arg;
+    boot->rc = main(boot->argc, boot->argv);
+    return NULL;
+}
 #endif
 #include "pc_guest_admit.h" /* --max-guests range */
 #include "pc_nook_house.h" /* guest Nook dialogue (M4): the rejoin hold */
@@ -1743,6 +1756,30 @@ void pc_main_play_online_poll(void) {
 
 int main(int argc, char* argv[]) {
 #ifdef __ANDROID__
+    /* The decomp stores some stack addresses in u32. Run the game on a stack taken from the below-4GB heap. */
+    static int s_on_low_stack;
+    if (!s_on_low_stack) {
+        struct pc_android_boot boot;
+        pthread_t thread;
+        pthread_attr_t attr;
+        void* raw = pc_lowheap_reserve(8u * 1024u * 1024u + 4096u);
+        uintptr_t aligned = ((uintptr_t)raw + 4095u) & ~(uintptr_t)4095u;
+        s_on_low_stack = 1;
+        boot.argc = argc;
+        boot.argv = argv;
+        boot.rc = 1;
+        pthread_attr_init(&attr);
+        pthread_attr_setstack(&attr, (void*)aligned, 8u * 1024u * 1024u);
+        if (pthread_create(&thread, &attr, pc_android_low_stack_main, &boot) != 0) {
+            s_on_low_stack = 0;
+            pthread_attr_destroy(&attr);
+            fprintf(stderr, "[PC] arm64: could not start the low stack; staying on the system stack\n");
+        } else {
+            pthread_attr_destroy(&attr);
+            pthread_join(thread, NULL);
+            return boot.rc;
+        }
+    }
     /* SDLActivity calls this as SDL_main. The disc picker stored the image in internal storage; shaders are copied there too. */
     {
         const char* storage = SDL_AndroidGetInternalStoragePath();
@@ -2343,6 +2380,11 @@ int main(int argc, char* argv[]) {
                 if (p > 0 && p <= 65535) g_pc_net_port = (uint16_t)p;
                 i++;
             }
+        } else if (strcmp(argv[i], "--rom") == 0 && i + 1 < argc) {
+            pc_disc_set_image_path(argv[i + 1]);
+            i++;
+        } else if (strcmp(argv[i], "--no-rom") == 0) {
+            /* The launcher starts with no disc selected. The finder then reports that. */
         } else if (strcmp(argv[i], "--connect") == 0 && i + 1 < argc) {
             char* colon;
             g_pc_net_role = 2;
@@ -2524,6 +2566,17 @@ int main(int argc, char* argv[]) {
     if (g_pc_guest_creation_test != NULL && pc_guest_profile_selected() == NULL && g_pc_character_spec == NULL) {
         fprintf(stderr, "[PC] --guest-creation-test: REFUSED: the TEST-ONLY hook needs --guest-profile NAME\n");
         return 2;
+    }
+
+    /* --connect used to arrive on its own when the guest profile already had a name.
+     * A profile that is not on disk yet stays on the title so the player can type one. */
+    if (g_pc_net_role == 2 && !g_pc_guest && g_pc_character_spec == NULL &&
+        g_pc_bootstrap_resident < 0 && g_pc_bootstrap_guest == NULL) {
+        extern int pc_guest_title_saved_name(void);
+        if (pc_guest_title_saved_name()) {
+            g_pc_guest = 1;
+            printf("[PC] --connect: saved guest name found; arriving automatically (same path as --guest).\n");
+        }
     }
 
     /* Guests G2.3: --guest = CLIENT only (needs --connect), exclusive with --host / --dedicated / --host-observer / --bootstrap-resident / --bootstrap-guest.

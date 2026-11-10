@@ -122,7 +122,7 @@ static void Nap_AudioSysProcess(AudioPort* port) {
                 AG.main_group.subtracks[0]->port[0] = port->command.arg2;
             }
             break;
-        case AUDIOCMD_MAIN_GROUP_SET_FREQ_SCALE:
+        case AUDIOCMD_MAIN_GROUP_SET_FREQ_SCALE: {
             s32 idx = 128 + port->param.asS32;
 
             AG.main_group.subtracks[0]->frequency_scale = PCENTTABLE2[idx];
@@ -130,6 +130,7 @@ static void Nap_AudioSysProcess(AudioPort* port) {
             AG.main_group.subtracks[0]->vibrato_params.depth_target = port->command.arg2 * 4;
             AG.main_group.subtracks[0]->vibrato_params.depth_change_delay = 32;
             break;
+        }
         case AUDIOCMD_MAIN_GROUP_SET_VOL_SCALE:
             AG.main_group.subtracks[0]->volume_scale = port->param.asF32;
             AG.main_group.subtracks[0]->changes.flags.volume = TRUE;
@@ -152,7 +153,7 @@ static void Nap_AudioSysProcess(AudioPort* port) {
             OverwriteBank(port->command.opcode - AUDIOCMD_SET_PERC_BANK, port->command.arg1, port->command.arg2,
                           port->param.asS32);
             break;
-        case AUDIOCMD_FORCE_STOP_ALL_GROUPS:
+        case AUDIOCMD_FORCE_STOP_ALL_GROUPS: {
             s32 flags = port->param.asS32;
 
             if (flags == AUDIO_NOTE_RELEASE) {
@@ -165,6 +166,7 @@ static void Nap_AudioSysProcess(AudioPort* port) {
 
             Nap_SilenceCheck_Inner(flags);
             break;
+        }
         case AUDIOCMD_CLEAR_STAY_CACHE:
             Nas_SzStayDelete(port->param.asS32);
             break;

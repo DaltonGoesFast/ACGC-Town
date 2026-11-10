@@ -5,13 +5,13 @@ s16 VIB_TABLE[] = { 0, 0, 0, 0, 20, 0x7fff, 0, 20, 0, 0, 0x14, 0xc000, 0, 20, 0,
 s16 TRE_TABLE[] = { 0, 0, 0x7fff, 0, 20, 0, 0, 20, 0x8001, 0, 0x14, 0, 0, 0x14, 0x7fff, 13, 0, 1 };
 s16 REL_TABLE[] = { 0, 10, 0, 15, 1, 0 };
 
-Osc_ VIBRATO_DEF  = { 1, 0.8f, VIB_TABLE, VIB_TABLE, 0.0f, 1.0f };
-Osc_ TREMOLO_DEF  = { 0, 1.0f, TRE_TABLE, TRE_TABLE, 0.0f, 1.0f };
-Osc_ ENVELOPE_DEF = { 0, 1.0f, NULL, REL_TABLE, 1.0f, 0.0f };
+Osc_ VIBRATO_DEF  = { 1, 0.8f, (u32)(uintptr_t)VIB_TABLE, (u32)(uintptr_t)VIB_TABLE, 0.0f, 1.0f };
+Osc_ TREMOLO_DEF  = { 0, 1.0f, (u32)(uintptr_t)TRE_TABLE, (u32)(uintptr_t)TRE_TABLE, 0.0f, 1.0f };
+Osc_ ENVELOPE_DEF = { 0, 1.0f, 0, (u32)(uintptr_t)REL_TABLE, 1.0f, 0.0f };
 
 s16 ADS_TABLE[] = { 0, 0, 0x7fff, 0, 0, 0x7fff, 0, 0, 0, 14, 0, 0 };
 Osc_ ADSR_DEF   = { 0, 1.0f, NULL, NULL, 1.0f, 0.0f };
-Osc_ OSC_DEF    = { 0, 1.0f, NULL, REL_TABLE, 1.0f, 0.0f };
+Osc_ OSC_DEF    = { 0, 1.0f, 0, (u32)(uintptr_t)REL_TABLE, 1.0f, 0.0f };
 
 /*
  * --INFO--

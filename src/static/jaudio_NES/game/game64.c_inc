@@ -1308,7 +1308,7 @@ void Sou_Ongen_Lev_Cont() {
                 for (j = 0; j < ARRAY_COUNT(sou_lev_ongen_data); j++) {
                     if (sou_lev_ongen_data[j]._04 == sou_ongen_entry[i]._00) {
 
-                        Sou_LevStop((int)j, sou_lev_ongen_data[j]._08);
+                        Sou_LevStop((int)(intptr_t)j, sou_lev_ongen_data[j]._08);
 
                         old09 = sou_lev_ongen_data[j]._09;
                         sou_lev_ongen_data[j]._09 = 0;
@@ -1404,12 +1404,12 @@ void Sou_Ongen_Lev_Prog(u8 index) {
         }
 
         if ((sou_lev_ongen_data[index]._02 == 1) && (sou_lev_ongen_data[index]._03 == 1)) {
-            Sou_LevStart((int)index, sou_lev_ongen_data[index]._08);
+            Sou_LevStart((int)(intptr_t)index, sou_lev_ongen_data[index]._08);
             sou_lev_ongen_data[index]._02 = 2;
         }
 
         if (sou_lev_ongen_data[index]._02 == 7 || sou_lev_ongen_data[index]._02 == 0xff) {
-            Sou_LevStop((int)index, sou_lev_ongen_data[index]._08);
+            Sou_LevStop((int)(intptr_t)index, sou_lev_ongen_data[index]._08);
             t = sou_lev_ongen_data[index]._09;
             sou_lev_ongen_data[index]._09 = 0;
             sou_lev_ongen_data[index]._00 = 0;
@@ -1483,10 +1483,10 @@ void Sou_BGMVolMove() {
                             sou_bgm_vol_move_counter = 1;
                         } else {
                             sou_bgm_vol_move_delta =
-                                (sou_bgm_vol_move_target - sou_bgm1_vol_now) / (int)sou_bgm_vol_move_time;
+                                (sou_bgm_vol_move_target - sou_bgm1_vol_now) / (int)(intptr_t)sou_bgm_vol_move_time;
                         }
                     }
-                    volume = sou_bgm_vol_move_target + (-(sou_bgm_vol_move_delta * (int)sou_bgm_vol_move_counter));
+                    volume = sou_bgm_vol_move_target + (-(sou_bgm_vol_move_delta * (int)(intptr_t)sou_bgm_vol_move_counter));
                     sou_bgm_vol_move_counter--;
                     if (volume > 1.f) {
                         volume = 1.f;
@@ -1512,10 +1512,10 @@ void Sou_BGMVolMove() {
                             sou_bgm_vol_move_counter = 1;
                         } else {
                             sou_bgm_vol_move_delta =
-                                (sou_bgm_vol_move_target - sou_bgm2_vol_now) / (int)sou_bgm_vol_move_time;
+                                (sou_bgm_vol_move_target - sou_bgm2_vol_now) / (int)(intptr_t)sou_bgm_vol_move_time;
                         }
                     }
-                    volume = sou_bgm_vol_move_target + (-(sou_bgm_vol_move_delta * (int)sou_bgm_vol_move_counter));
+                    volume = sou_bgm_vol_move_target + (-(sou_bgm_vol_move_delta * (int)(intptr_t)sou_bgm_vol_move_counter));
                     sou_bgm_vol_move_counter--;
                     if (volume > 1.f) {
                         volume = 1.f;
@@ -1804,7 +1804,7 @@ void Na_InitAudio(void (*fatal_callback)(), u8* load_addr, size_t load_size, u8*
     u32 unused = SetPreCopy_NeosRom(load_addr, load_size, cut_flag);
     Jac_RegisterDVDErrorCallback(Sou_DVD_Error);
     Jac_Start(audiomemory, sizeof(audiomemory), v);
-    BootSound((u32)bootsound, bootsound_size);
+    BootSound((u32)(uintptr_t)bootsound, bootsound_size);
     sou_NeosBootCheck_ok = 1;
 }
 

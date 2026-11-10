@@ -266,8 +266,8 @@ void Nas_HeapInit(ALHeap* heap, u8* p2, s32 p3) {
         heap->current = NULL;
         heap->last = NULL;
     } else {
-        length = p3 - ((u32)p2 & 0x1F);
-        heap->base = (u8*)ALIGN_NEXT((u32)p2, 32);
+        length = p3 - ((u32)(uintptr_t)p2 & 0x1F);
+        heap->base = (u8*)ALIGN_NEXT((u32)(uintptr_t)p2, 32);
         heap->current = heap->base;
         heap->length = length;
         heap->last = NULL;
@@ -990,7 +990,7 @@ void __Nas_MemoryReconfig() {
     */
     /*0x287C*/ AG.audio_params.num_samples_per_update_max = AG.audio_params.num_samples_per_update + 8;
     /*0x287E*/ AG.audio_params.num_samples_per_update_min = AG.audio_params.num_samples_per_update - 8;
-    /*0x2884*/ AG.audio_params.resample_rate = 33476.156f / (s32)AG.audio_params.sampling_frequency;
+    /*0x2884*/ AG.audio_params.resample_rate = 33476.156f / (s32)(intptr_t)AG.audio_params.sampling_frequency;
     /*0x288C*/ AG.audio_params.updates_per_frame_inverse_scaled = (1.f / 256.f) / AG.audio_params.updates_per_frame;
     /*0x2890*/ AG.audio_params.updates_per_frame_scaled = AG.audio_params.updates_per_frame / 4.0f;
     /*0x2888*/ AG.audio_params.updates_per_frame_inverse = 1.f / AG.audio_params.updates_per_frame;
@@ -1373,7 +1373,7 @@ void __RestoreAddr(Wavelookuptable* a, smzwavetable* b) {
         u8* o = a_sample + a->_08;
         if (b_sample >= a_sample && b_sample < o) {
             // fakematch?
-            b->sample = (u8*)((u32)a->_04 + (b->sample - (u32)a->sample));
+            b->sample = (u8*)((u32)(uintptr_t)a->_04 + (b->sample - (u32)(uintptr_t)a->sample));
             if (EXGTYPE == 0) {
                 b->medium = a->medium;
             } else {
@@ -1420,7 +1420,7 @@ void __ExchangeWave(s32 a, s32 b) {
     u8* alloc = (u8*)Nas_SzCacheCheck(2, 2, b);
     pWaveTable->sample = alloc;
     if (pWaveTable->sample) {
-        pWaveTable->_08 = (s32)wave_header[b].entries[0].size;
+        pWaveTable->_08 = (s32)(intptr_t)wave_header[b].entries[0].size;
         pWaveTable->medium = wave_header[b].entries[0].medium;
         pWaveTable->_04 = (u8*)wave_header[b].entries[0].addr;
         switch (a) {

@@ -610,8 +610,8 @@ void JUTException::createFB() {
     u32 pixel_count = width * height;
     u32 size = pixel_count * 2;
 
-    void* begin = (void*)ALIGN_PREV((u32)end - size, 32);
-    void* object = (void*)ALIGN_PREV((s32)begin - sizeof(JUTExternalFB), 32);
+    void* begin = (void*)ALIGN_PREV((u32)(uintptr_t)end - size, 32);
+    void* object = (void*)ALIGN_PREV((s32)(intptr_t)begin - sizeof(JUTExternalFB), 32);
     JUTExternalFB* fb = new (object) JUTExternalFB(renderMode, GX_GM_1_7, begin, size);
 
     mDirectPrint->changeFrameBuffer(object);
@@ -770,9 +770,9 @@ bool JUTException::queryMapAddress_single(char* mapPath, u32 address, s32 sectio
                         u32 i = 0;
 
                         for (i = 0; i < line_length - 1; ++src) {
-                            if ((u32)(*src) < ' ' && (u32)*src != '\t')
+                            if ((u32)(uintptr_t)(*src) < ' ' && (u32)(uintptr_t)*src != '\t')
                                 break;
-                            if ((*src == ' ' || (u32)*src == '\t') && (i != 0)) {
+                            if ((*src == ' ' || (u32)(uintptr_t)*src == '\t') && (i != 0)) {
                                 if (dst[-1] != ' ') {
                                     *dst = ' ';
                                     dst++;

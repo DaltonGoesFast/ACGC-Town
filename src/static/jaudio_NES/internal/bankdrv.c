@@ -100,7 +100,7 @@ int Bank_GetInstVmap(Inst_* inst, u8 param_2, u8 param_3)
 		for (u32 i = 0; i < key->mVelocityCount; i++) {
 			Vmap_* vmap = key->mVelocities[i];
 			if (param_3 <= vmap->mBaseVelocity) {
-				return (int)vmap;
+				return (int)(intptr_t)vmap;
 			}
 		}
 

@@ -48,7 +48,7 @@ void* JKRDvdRipper::loadToMainRAM(JKRDvdFile* file, u8* buf, JKRExpandSwitch exp
 
     if (expandSwitch == EXPAND_SWITCH_DECOMPRESS) {
         u8 buffer[64];
-        u8* aligned_buf = (u8*)ALIGN_NEXT((u32)buffer, 32);
+        u8* aligned_buf = (u8*)ALIGN_NEXT((u32)(uintptr_t)buffer, 32);
         while (true) {
             if (DVDReadPrio(file->getFileInfo(), aligned_buf, 32, 0, 2) >= 0) {
                 break;
@@ -105,7 +105,7 @@ void* JKRDvdRipper::loadToMainRAM(JKRDvdFile* file, u8* buf, JKRExpandSwitch exp
 
         if (offset != 0) {
             u8 buffer[64];
-            u8* aligned_buf = (u8*)ALIGN_NEXT((u32)buffer, 32);
+            u8* aligned_buf = (u8*)ALIGN_NEXT((u32)(uintptr_t)buffer, 32);
             while (true) {
                 if (DVDReadPrio(file->getFileInfo(), aligned_buf, 32, offset, 2) >= 0) {
                     break;
@@ -253,7 +253,7 @@ static int decompSZS_subroutine(u8* src, u8* dest) {
     s32 currCodeByte = 0;
     u32 ts = 0;
 
-    if ((s32)src[0] != 'Y' || (s32)src[1] != 'a' || (s32)src[2] != 'z' || (s32)src[3] != '0') {
+    if ((s32)(intptr_t)src[0] != 'Y' || (s32)(intptr_t)src[1] != 'a' || (s32)(intptr_t)src[2] != 'z' || (s32)(intptr_t)src[3] != '0') {
         return -1;
     }
 
@@ -404,7 +404,7 @@ static u8* nextSrcData(u8* nowData) {
         }
         // Oopsies, forgot to call the function
 #ifndef FIXES
-        if (JKRDvdRipper::isErrorRetry == false) {
+        if (JKRDvdRipper::isErrorRetry() == false) {
             return nullptr;
         }
 #else

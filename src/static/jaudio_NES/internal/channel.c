@@ -112,8 +112,8 @@ static void Nas_smzSetParam(channel* chan, drvparam* param) {
         velocity = 1.0f;
     }
     
-    chan->common_ch.target_volume_left = (s32)((velocity * volL) * (0x1000 - 0.001f));
-    chan->common_ch.target_volume_right = (s32)((velocity * volR) * (0x1000 - 0.001f));
+    chan->common_ch.target_volume_left = (s32)(intptr_t)((velocity * volL) * (0x1000 - 0.001f));
+    chan->common_ch.target_volume_right = (s32)(intptr_t)((velocity * volR) * (0x1000 - 0.001f));
 
     chan->common_ch.gain = param->playback.gain;
     chan->common_ch.filter = param->playback.filter_buf;
@@ -142,7 +142,7 @@ static void Nas_smzSetPitch(channel* chan, f32 pitch) {
         }
     }
 
-    chan->common_ch.frequency_fixed_point = (s32)(rate * 32768.0f);
+    chan->common_ch.frequency_fixed_point = (s32)(intptr_t)(rate * 32768.0f);
 }
 
 extern void Nas_StartVoice(channel* chan) {
@@ -190,7 +190,7 @@ extern void Nas_UpdateChannel(void) {
 
         if (playback_chan->current_parent_note != NA_NO_NOTE) {
 #ifndef TARGET_PC
-            if ((u32)playback_chan->current_parent_note < 0x7FFFFFFF) {
+            if ((u32)(uintptr_t)playback_chan->current_parent_note < 0x7FFFFFFF) {
                 continue;
             }
 #endif
@@ -445,7 +445,7 @@ extern perctable* PercToPp(s32 prog, s32 drum) {
     }
 
 #ifndef TARGET_PC
-    if ((u32)AG.voice_info[prog].percussion < OS_BASE_CACHED) {
+    if ((u32)(uintptr_t)AG.voice_info[prog].percussion < OS_BASE_CACHED) {
         return NULL;
     }
 #endif
@@ -480,7 +480,7 @@ extern percvoicetable* VpercToVep(s32 prog, s32 sfx) {
     }
 
 #ifndef TARGET_PC
-    if ((u32)AG.voice_info[prog].effects < OS_BASE_CACHED) {
+    if ((u32)(uintptr_t)AG.voice_info[prog].effects < OS_BASE_CACHED) {
         return NULL;
     }
 #endif
@@ -636,7 +636,7 @@ static void __Nas_Release_Channel_Main(note* n, int target) {
                 chan->playback_ch.adsr_envp.fadeout_velocity = AG.adsr_decay_table[n->adsr_env.decay_idx];
             }
 
-            chan->playback_ch.adsr_envp.sustain = (f32)(s32)n->sub_track->adsr_env.sustain * chan->playback_ch.adsr_envp.current / 256.0f;
+            chan->playback_ch.adsr_envp.sustain = (f32)(s32)(intptr_t)n->sub_track->adsr_env.sustain * chan->playback_ch.adsr_envp.current / 256.0f;
         }
     }
 
@@ -711,7 +711,7 @@ extern void Nas_DeAllocAllVoices(chnode* node) {
 
         while (TRUE) {
             cur = src->next;
-            if ((s32)cur == (s32)src || cur == NULL) {
+            if ((s32)(intptr_t)cur == (s32)(intptr_t)src || cur == NULL) {
                 break;
             }
 
@@ -848,7 +848,7 @@ extern void Nas_EntryTrack(channel* chan, note* n) {
         }
     }
 
-    playback->vel_conv_table_idx = (int)(n->velocity_square2 * 11.5f);
+    playback->vel_conv_table_idx = (int)(intptr_t)(n->velocity_square2 * 11.5f);
     if (playback->vel_conv_table_idx > 15) {
         playback->vel_conv_table_idx = 15;
     }

@@ -86,8 +86,8 @@ enum famicom_games {
 #define TCS_TAG()  'T', 'C', 'S', 2
 #define ICS_TAG()  'I', 'C', 'S', 2
 
-#define OFS_U16(ofs) (u8)((u32)(ofs) >> 8), (u8)(ofs)
-#define OFS_U24(ofs) (u8)((u32)(ofs) >> 16), (u8)((u32)(ofs) >> 8), (u8)(ofs)
+#define OFS_U16(ofs) (u8)((u32)(uintptr_t)(ofs) >> 8), (u8)(ofs)
+#define OFS_U24(ofs) (u8)((u32)(uintptr_t)(ofs) >> 16), (u8)((u32)(uintptr_t)(ofs) >> 8), (u8)(ofs)
 
 static u8 tags_table_default[] = { END_TAG() };
 
@@ -505,16 +505,16 @@ static void update_highscore_raw(unsigned int ofs, unsigned int size, u8* initia
 }
 
 static u16 nesinfo_get_u16(u8* data) {
-    return (u16)(((u32)data[0] << 8) + (u32)data[1]);
+    return (u16)(((u32)(uintptr_t)data[0] << 8) + (u32)(uintptr_t)data[1]);
 }
 
 static u8 nesinfo_get_u8(u8* data) {
-    return (u8)(u32)data[0];
+    return (u8)(u32)(uintptr_t)data[0];
 }
 
 static void nesinfo_set_u16(u8* data, u16 value) {
-    data[0] = (u8)(((u32)value >> 8) & 0xFF);
-    data[1] = (u8)((u32)value & 0xFF);
+    data[0] = (u8)(((u32)(uintptr_t)value >> 8) & 0xFF);
+    data[1] = (u8)((u32)(uintptr_t)value & 0xFF);
 }
 
 static u8* nesinfo_next_tag_raw(u8* data) {
@@ -550,7 +550,7 @@ static u8* nesinfo_next_tag(u8* data) {
 }
 
 static u16 calc_check_sum2(void* data, size_t size) {
-    if (((u32)data & 1) == 0) {
+    if (((u32)(uintptr_t)data & 1) == 0) {
         u16 sum;
         size_t i;
         u16* data2;
@@ -625,7 +625,7 @@ extern void nesinfo_tags_set(int rom_no) {
 
     nesinfo_tags_start = tags_table_table[rom].tags_table;
     nesinfo_tags_end = nesinfo_tags_start + tags_table_table[rom].tags_size;
-    nesinfo_tags_size = (u32)(nesinfo_tags_end - nesinfo_tags_start);
+    nesinfo_tags_size = (u32)(uintptr_t)(nesinfo_tags_end - nesinfo_tags_start);
     nesinfo_tags_gameName = tags_table_table[rom].gameName;
     nesinfo_tags_kanjiName = tags_table_table[rom].kanjiName;
 

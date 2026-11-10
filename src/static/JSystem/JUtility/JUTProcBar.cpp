@@ -232,7 +232,7 @@ void JUTProcBar::drawProcessBar() {
 }
 
 int addrToXPos(void* param_0, int param_1) {
-    return param_1 * (((u32)param_0 - 0x80000000) / (float)JKRHeap::getMemorySize());
+    return param_1 * (((u32)(uintptr_t)param_0 - 0x80000000) / (float)JKRHeap::getMemorySize());
 }
 
 int byteToXLen(int param_0, int param_1) {

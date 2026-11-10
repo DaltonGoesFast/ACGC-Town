@@ -59,6 +59,10 @@ add_compile_definitions(
 if(PC_LOW_ADDRESS_64)
     add_compile_definitions(PC_LOW_ADDRESS_64)
 endif()
+if(ANDROID AND CMAKE_SIZEOF_VOID_P EQUAL 8)
+    # The .so is loaded above 4 GB. Display-list pointers are tokens; the game heap is reserved below 4 GB.
+    add_compile_definitions(PC_GBI_INTERN)
+endif()
 
 # Common compiler flags (applied to all sources). GCC is required:
 # the decomp depends on -fno-strict-aliasing/-fwrapv semantics and the
@@ -330,6 +334,7 @@ set(PC_SOURCES
     ${CMAKE_CURRENT_SOURCE_DIR}/src/pc_mtx.c
     ${CMAKE_CURRENT_SOURCE_DIR}/src/pc_m_card.c
     ${CMAKE_CURRENT_SOURCE_DIR}/src/pc_save_bswap.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/pc_save_wire.c
     ${CMAKE_CURRENT_SOURCE_DIR}/src/pc_mp_records.c
     ${CMAKE_CURRENT_SOURCE_DIR}/src/pc_mp_guests.c
     ${CMAKE_CURRENT_SOURCE_DIR}/src/pc_town_cache.c
@@ -480,7 +485,7 @@ add_compile_options($<$<COMPILE_LANGUAGE:C>:-Dnullptr=NULL>)
 # Per-source warning settings
 # =============================================================================
 # Decomp code: suppress all warnings (fires heavily on decompiled code)
-set(DECOMP_WARN_FLAGS "-w;-fpermissive")
+set(DECOMP_WARN_FLAGS "-w;-fpermissive;-Wno-c++11-narrowing;-Wno-register;-Wno-implicit-function-declaration;-Wno-implicit-int;-Wno-int-conversion;-Wno-return-type")
 set_source_files_properties(${GAME_C_SOURCES} ${GAME_CXX_SOURCES}
     PROPERTIES COMPILE_OPTIONS "${DECOMP_WARN_FLAGS}"
 )
@@ -528,7 +533,10 @@ extern \"C\" {
     # (JA_FPTR -> PcLowPtr<T>, a C++ type). The translation units that dereference those fields must therefore be C++;
     # their functions are declared extern "C" in the jaudio headers, so linkage to the C callers is unchanged.
     foreach(ja_name bankread waveread bankdrv connect oneshot noteon driverinterface jamosc heapctrl
-                    channel driver memory system track)
+                    channel driver memory system track rspsim streamctrl sub_sys)
+    set_source_files_properties("${DECOMP_ROOT}/src/game/m_rcp.c" PROPERTIES
+        LANGUAGE CXX
+        COMPILE_DEFINITIONS "this=this_arg")
         set_source_files_properties("${DECOMP_ROOT}/src/static/jaudio_NES/internal/${ja_name}.c" PROPERTIES
             LANGUAGE CXX
             COMPILE_DEFINITIONS "this=this_arg")
@@ -591,6 +599,9 @@ if(PC_DRESSER_STORAGE_DEFAULT_ON)
 endif()
 
 if(ANDROID)
+    list(REMOVE_ITEM PC_SOURCES "${CMAKE_CURRENT_SOURCE_DIR}/src/pc_lowaddr_selftest.cpp")
+endif()
+if(ANDROID)
 add_library(ac_pc SHARED
     ${PC_SOURCES}
     ${FIXNES_SOURCES}
@@ -618,10 +629,14 @@ else()
 endif()
 
 if(ANDROID)
-    # SDLActivity loads libmain.so
-    set_target_properties(ac_pc PROPERTIES OUTPUT_NAME "main")
+    # SDLActivity loads libmain.so. The later OUTPUT_NAME must not rename it.
     add_library(abi SHARED ${CMAKE_CURRENT_SOURCE_DIR}/android/app/src/main/cpp/abi.c)
     target_link_libraries(abi log)
+    if(CMAKE_SIZEOF_VOID_P EQUAL 8)
+        target_sources(ac_pc PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src/pc_lowheap.c)
+        target_link_options(ac_pc PRIVATE
+            -Wl,--wrap=malloc,--wrap=calloc,--wrap=realloc,--wrap=free)
+    endif()
 elseif(WIN32)
     target_link_libraries(ac_pc opengl32 winmm imm32 version setupapi ws2_32)
 else()
@@ -629,15 +644,20 @@ else()
     target_link_libraries(ac_pc OpenGL::GL dl pthread m)
 endif()
 
+if(ANDROID)
+set_target_properties(ac_pc PROPERTIES
+    OUTPUT_NAME "main"
+)
+else()
 set_target_properties(ac_pc PROPERTIES
     OUTPUT_NAME "AnimalCrossing"
     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
 )
+endif()
 
-# Low-address 64-bit: keep the image, heaps and stacks below 4 GB (verified with a test program):
-# a low --image-base is required, plus EITHER --disable-dynamicbase (also fixes the image address)
-# OR --disable-high-entropy-va; with ASLR off the HEVA flag is redundant but harmless. ac_pc only, not glad/SDL2.
-if(PC_LOW_ADDRESS_64)
+# Low-address 64-bit desktop: keep the image, heaps and stacks below 4 GB.
+# Android loads a shared library at a high address, so those flags do not apply there.
+if(PC_LOW_ADDRESS_64 AND NOT ANDROID)
     target_link_options(ac_pc PRIVATE
         -Wl,--image-base=0x400000
         -Wl,--disable-dynamicbase

@@ -198,3 +198,9 @@ void pc_lowaddr_init(void) {
 }
 
 #endif /* PC_LOW_ADDRESS_64 */
+
+#ifdef __ANDROID__
+int pc_lowaddr_selftest(void) {
+    return 0;
+}
+#endif

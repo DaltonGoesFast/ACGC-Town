@@ -816,7 +816,7 @@ static void SetupInternalCommentImage(u8* data) {
         famicomCommon.memcard_game_header.icon_flags = 0;
     }
 
-    famicomCommon.memcard_game_header.comment_img_size = (u32)data - (u32)data_p;
+    famicomCommon.memcard_game_header.comment_img_size = (u32)(uintptr_t)data - (u32)(uintptr_t)data_p;
 }
 
 static s32 memcard_data_save(
@@ -1199,7 +1199,7 @@ static s32 memcard_data_load(
 
         // Reading successful!
         OSReport("読み込み成功！！\n");
-        FamicomSaveDataHeader* read_save_header = (FamicomSaveDataHeader*)((u32)buf + status.offsetData);
+        FamicomSaveDataHeader* read_save_header = (FamicomSaveDataHeader*)((u32)(uintptr_t)buf + status.offsetData);
         
         if (famicom_save_data_check(read_save_header, -1, comment_img) == 0) {
             // The data is normal!
@@ -1313,7 +1313,7 @@ static s32 memcard_game_load(
     }
     fclose(f);
 
-    nesinfo_data_size = (u32)fsize;
+    nesinfo_data_size = (u32)(uintptr_t)fsize;
 
     /* nesinfo_tag_process1 unconditionally dereferences nesinfo_tags_start
      * before checking for a terminator, so hand it a minimal END tag. The
@@ -1480,7 +1480,7 @@ static s32 memcard_game_load(
                                     }
                                     else {
                                         JC_JKRDecomp_decode(datap, nesromp, CHR_TO_I8_BUF_SIZE, 0);
-                                        nesinfo_data_size = (u32)((datap[4] << 24) | (datap[5] << 16) | (datap[6]<< 8) | datap[7]);
+                                        nesinfo_data_size = (u32)(uintptr_t)((datap[4] << 24) | (datap[5] << 16) | (datap[6]<< 8) | datap[7]);
                                     }
                                 }
     
@@ -2044,7 +2044,7 @@ static int SetupResBanner(const ResTIMG* img, u8* dst, size_t max_size, size_t* 
     }
 
     if (size != nullptr) {
-        *size = (u32)data_p - (u32)dst;
+        *size = (u32)(uintptr_t)data_p - (u32)(uintptr_t)dst;
     }
 
     if (type != nullptr) {
@@ -2104,7 +2104,7 @@ static int SetupResIcon(const ResTIMG* img, u8* dst, size_t max_size, size_t* si
     }
 
     if (size_p != nullptr) {
-        *size_p = (u32)data_p - (u32)dst;
+        *size_p = (u32)(uintptr_t)data_p - (u32)(uintptr_t)dst;
     }
 
     if (icon_fmt_p != nullptr) {
@@ -2593,7 +2593,7 @@ static void nogbaInput() {
         InputValid[port] = false;
 
         // switch (GetPortStatus(port)) {
-        switch ((int)JUTGamePad::getPortStatus((JUTGamePad::EPadPort)port)) {
+        switch ((int)(intptr_t)JUTGamePad::getPortStatus((JUTGamePad::EPadPort)port)) {
             case PAD_ERR_NONE:
             {
                 InputValid[port] = true;
