@@ -24,12 +24,41 @@ public class TownActivity extends SDLActivity {
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
+        LaunchTrace.mark(this);
         File shaders = new File(getFilesDir(), "shaders");
         copyAsset("default.vert", new File(shaders, "default.vert"));
         copyAsset("default.frag", new File(shaders, "default.frag"));
         Log.i("ACGC", "TownActivity start, rom=" + new File(getFilesDir(), "gafe01.iso").getAbsolutePath());
         super.onCreate(savedInstanceState);
         SafeInsets.install(this);
+    }
+
+    @Override
+    public void loadLibraries() {
+        LaunchTrace.mark(this);
+        Log.i("ACGC", "loading native libraries");
+        try {
+            super.loadLibraries();
+            Log.i("ACGC", "native libraries loaded");
+        } catch (UnsatisfiedLinkError e) {
+            LaunchTrace.note(this, "UnsatisfiedLinkError\n" + Log.getStackTraceString(e));
+            throw e;
+        } catch (RuntimeException e) {
+            LaunchTrace.note(this, "loadLibrary failed\n" + Log.getStackTraceString(e));
+            throw e;
+        }
+    }
+
+    @Override
+    protected void onPause() {
+        LaunchTrace.clear(this);
+        super.onPause();
+    }
+
+    @Override
+    protected void onDestroy() {
+        if (isFinishing()) LaunchTrace.clear(this);
+        super.onDestroy();
     }
 
     @Override

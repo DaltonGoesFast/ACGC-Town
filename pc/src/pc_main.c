@@ -273,9 +273,12 @@ void pc_platform_init(void) {
 #endif
     if (SDL_Init(g_pc_headless ? (SDL_INIT_TIMER | SDL_INIT_EVENTS)
                                : (SDL_INIT_VIDEO | SDL_INIT_GAMECONTROLLER | SDL_INIT_AUDIO | SDL_INIT_TIMER)) < 0) {
-        fprintf(stderr, "SDL_Init failed: %s\n", SDL_GetError());
+        char msg[256];
+        snprintf(msg, sizeof(msg), "SDL_Init failed: %s", SDL_GetError());
+        pc_diag_fail_box("ACGC Town", msg);
         exit(1);
     }
+    pc_diag_milestone("SDL_Init ok");
     if (g_pc_headless) {
         g_pc_gl_live = 0;
         g_pc_window_w = PC_SCREEN_WIDTH;
@@ -294,13 +297,26 @@ void pc_platform_init(void) {
     SDL_GL_SetAttribute(SDL_GL_CONTEXT_PROFILE_MASK, SDL_GL_CONTEXT_PROFILE_ES);
     SDL_GL_SetAttribute(SDL_GL_CONTEXT_MAJOR_VERSION, 3);
     SDL_GL_SetAttribute(SDL_GL_CONTEXT_MINOR_VERSION, 0);
+#ifdef __ANDROID__
+    /* Default settings ask for 4x MSAA and the desktop path asks for 24-bit depth.
+     * Many Android EGL configs, including the emulator, match neither and CreateWindow fails. */
+    g_pc_settings.msaa = 0;
+    SDL_GL_SetAttribute(SDL_GL_RED_SIZE, 8);
+    SDL_GL_SetAttribute(SDL_GL_GREEN_SIZE, 8);
+    SDL_GL_SetAttribute(SDL_GL_BLUE_SIZE, 8);
+    SDL_GL_SetAttribute(SDL_GL_ALPHA_SIZE, 0);
+    SDL_GL_SetAttribute(SDL_GL_DEPTH_SIZE, 16);
+    SDL_GL_SetAttribute(SDL_GL_STENCIL_SIZE, 0);
+#endif
 #else
     SDL_GL_SetAttribute(SDL_GL_CONTEXT_MAJOR_VERSION, 3);
     SDL_GL_SetAttribute(SDL_GL_CONTEXT_MINOR_VERSION, 3);
     SDL_GL_SetAttribute(SDL_GL_CONTEXT_PROFILE_MASK, SDL_GL_CONTEXT_PROFILE_CORE);
 #endif
     SDL_GL_SetAttribute(SDL_GL_DOUBLEBUFFER, 1);
+#ifndef __ANDROID__
     SDL_GL_SetAttribute(SDL_GL_DEPTH_SIZE, 24);
+#endif
 #ifdef PC_ENHANCEMENTS
     if (g_pc_settings.msaa > 0) {
         SDL_GL_SetAttribute(SDL_GL_MULTISAMPLEBUFFERS, 1);
@@ -327,6 +343,20 @@ void pc_platform_init(void) {
             win_pos, win_pos,
             win_w, win_h, flags
         );
+#ifdef __ANDROID__
+        if (!g_pc_window) {
+            pc_diag_milestone(SDL_GetError());
+            SDL_GL_SetAttribute(SDL_GL_RED_SIZE, 5);
+            SDL_GL_SetAttribute(SDL_GL_GREEN_SIZE, 6);
+            SDL_GL_SetAttribute(SDL_GL_BLUE_SIZE, 5);
+            SDL_GL_SetAttribute(SDL_GL_DEPTH_SIZE, 0);
+            g_pc_window = SDL_CreateWindow(
+                PC_WINDOW_TITLE,
+                win_pos, win_pos,
+                win_w, win_h, flags
+            );
+        }
+#endif
     }
     if (!g_pc_window) {
         char msg[256];
@@ -1757,13 +1787,10 @@ void pc_main_play_online_poll(void) {
 
 #ifdef __ANDROID__
 int main(int argc, char* argv[]) {
-    /* Stay on SDL's thread. A second pthread is not attached to the JVM the way SDL expects,
-     * and SDL.setupJNI() has not run yet when the library constructor maps the heap. */
-    long page = sysconf(_SC_PAGESIZE);
-    size_t stack_bytes = 8u * 1024u * 1024u;
-    void* raw;
-    uintptr_t lo, hi;
+    /* Stay on SDL's thread and on the stack ART gave that thread. Moving SP onto the low heap
+     * makes the next JNI call abort with StackOverflowError (the Java stack is about 1MB). */
     char msg[192];
+    long page = sysconf(_SC_PAGESIZE);
     pc_diag_init();
     pc_diag_milestone("entered SDL_main");
     if (page < 4096) page = 4096;
@@ -1773,22 +1800,12 @@ int main(int argc, char* argv[]) {
     }
     snprintf(msg, sizeof(msg), "heap reserve ok page %ld", page);
     pc_diag_milestone(msg);
-    raw = pc_lowheap_reserve(stack_bytes + (size_t)page);
-    if (raw == NULL) {
-        pc_diag_fail_box("ACGC Town", "The low heap is reserved, but an 8MB stack would not fit in it.");
-        return 1;
-    }
-    lo = ((uintptr_t)raw + (uintptr_t)page - 1u) & ~((uintptr_t)page - 1u);
-    hi = (lo + stack_bytes) & ~(uintptr_t)15u;
-    if (hi <= lo || hi > (uintptr_t)raw + stack_bytes + (size_t)page) {
-        pc_diag_fail_box("ACGC Town", "The game stack could not be aligned to the device page size.");
-        return 1;
-    }
-    pc_diag_milestone("stack switch ok");
-    return pc_run_on_stack((void*)hi, pc_game_main, argc, argv);
+    pc_diag_milestone("sdl thread stack kept");
+    return pc_game_main(argc, argv);
 }
 
 static int pc_game_main(int argc, char* argv[]) {
+    pc_diag_milestone("game main");
     {
         const char* storage = SDL_AndroidGetInternalStoragePath();
         if (storage != NULL && storage[0] != '\0') chdir(storage);

@@ -16,7 +16,7 @@ public final class SafeInsets {
 
     public static void install(Activity activity) {
         WindowManager.LayoutParams lp = activity.getWindow().getAttributes();
-        if (Build.VERSION.SDK_INT >= 27) {
+        if (Build.VERSION.SDK_INT >= 28) {
             lp.layoutInDisplayCutoutMode = WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_SHORT_EDGES;
             activity.getWindow().setAttributes(lp);
         }

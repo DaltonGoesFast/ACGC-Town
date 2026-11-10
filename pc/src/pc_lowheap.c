@@ -3,6 +3,9 @@
 #include "pc_lowheap.h"
 
 #include <errno.h>
+#ifdef __ANDROID__
+#include <android/log.h>
+#endif
 #include <pthread.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -15,8 +18,15 @@
 #define MAP_FIXED_NOREPLACE 0x100000
 #endif
 
+void* __real_malloc(size_t n);
 void* __real_realloc(void* p, size_t n);
 void __real_free(void* p);
+
+#ifdef __ANDROID__
+#define PC_ALOGI(...) __android_log_print(ANDROID_LOG_INFO, "ACGC", __VA_ARGS__)
+#else
+#define PC_ALOGI(...) fprintf(stderr, __VA_ARGS__)
+#endif
 
 #define PC_LOWHEAP_BASE ((uintptr_t)0x10000000u)
 #define PC_LOWHEAP_SIZE (256u * 1024u * 1024u)
@@ -53,8 +63,10 @@ static void lowheap_init(void) {
     static const unsigned divs[] = { 1u, 2u, 4u, 8u };
     size_t page = page_size();
     unsigned d, b;
+    int last_errno = 0;
     if (s_tried) return;
     s_tried = 1;
+    PC_ALOGI("lowheap init page %u", (unsigned)page);
     /* Do not call into SDL here. This runs from a library constructor, before SDL.setupJNI(). */
     for (d = 0; d < sizeof(divs) / sizeof(divs[0]); d++) {
         size_t bytes = align_up(PC_LOWHEAP_SIZE / divs[d], page);
@@ -65,7 +77,8 @@ static void lowheap_init(void) {
             p = mmap((void*)bases[b], bytes, PROT_READ | PROT_WRITE,
                      MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED_NOREPLACE, -1, 0);
             if (p == MAP_FAILED || (uintptr_t)p != bases[b]) {
-                if (p != MAP_FAILED) munmap(p, bytes);
+                if (p == MAP_FAILED) last_errno = errno;
+                else munmap(p, bytes);
                 continue;
             }
             s_base = (char*)p;
@@ -74,15 +87,19 @@ static void lowheap_init(void) {
             s_free->size = bytes | 1u;
             s_free->next = NULL;
             s_error[0] = '\0';
+            PC_ALOGI("heap reserve ok %uMB at %p page %u",
+                     (unsigned)(bytes / (1024u * 1024u)), p, (unsigned)page);
             fprintf(stderr, "[PC] heap reserve ok %uMB at %p page %u\n",
                     (unsigned)(bytes / (1024u * 1024u)), p, (unsigned)page);
             return;
         }
     }
+    if (last_errno == 0) last_errno = errno;
     snprintf(s_error, sizeof(s_error),
              "Could not reserve a heap below 4GB (page size %u). mmap at the low addresses was refused (%s). "
              "The game stores some pointers in 32 bits, so it stops here instead of crashing later.",
-             (unsigned)page, errno != 0 ? strerror(errno) : "no free low range");
+             (unsigned)page, last_errno != 0 ? strerror(last_errno) : "no free low range");
+    PC_ALOGI("%s", s_error);
     fprintf(stderr, "[PC] %s\n", s_error);
 }
 
@@ -130,6 +147,7 @@ void* pc_lowheap_reserve(size_t bytes) {
     p = take(sizeof(Block) + bytes);
     pthread_mutex_unlock(&s_lock);
     if (p == NULL) {
+        PC_ALOGI("arm64 heap: reserve of %zu bytes failed", bytes);
         fprintf(stderr, "[PC] arm64 heap: reserve of %zu bytes failed\n", bytes);
     }
     return p;
@@ -145,10 +163,12 @@ void* __wrap_malloc(size_t n) {
     lowheap_init();
     if (s_base == NULL) {
         pthread_mutex_unlock(&s_lock);
-        return NULL;
+        /* A refused low mapping must not turn every allocation into a null pointer during dlopen. */
+        return __real_malloc(n ? n : 1);
     }
     p = take(sizeof(Block) + (n ? n : 1));
     pthread_mutex_unlock(&s_lock);
+    if (p == NULL) return __real_malloc(n ? n : 1);
     return p;
 }
 

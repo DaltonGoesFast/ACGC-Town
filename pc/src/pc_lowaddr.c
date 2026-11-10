@@ -7,6 +7,9 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#ifdef __ANDROID__
+#include <android/log.h>
+#endif
 
 #ifdef _WIN32
 #define WIN32_LEAN_AND_MEAN
@@ -83,12 +86,20 @@ void pc_lowaddr_violation(const char* category, uint64_t addr, size_t size, cons
     s_violations++;
     la_log("[LOWADDR] VIOLATION category=\"%s\" addr=0x%016llx size=0x%llx (>= 4 GB) at %s:%d\n", category,
            (unsigned long long)addr, (unsigned long long)size, file, line);
+#ifdef __ANDROID__
+    /* The .so and ART's thread stack are above 4GB. The game heap is the low mapping.
+     * Aborting here closes the app before the missing-ROM dialog. */
+    __android_log_print(ANDROID_LOG_WARN, "ACGC",
+                        "lowaddr %s addr=0x%llx (not fatal on Android)", category, (unsigned long long)addr);
+    return;
+#else
     const char* nf = getenv("PC_LOWADDR_NONFATAL");
     if (!nf || nf[0] != '1') {
         la_log("[LOWADDR] aborting: a game pointer above 4 GB would be truncated by (u32) casts. "
                "Set PC_LOWADDR_NONFATAL=1 to keep going (survey mode).\n");
         abort();
     }
+#endif
 }
 
 void pc_lowaddr_check(const char* category, const void* ptr, size_t size, const char* file, int line) {

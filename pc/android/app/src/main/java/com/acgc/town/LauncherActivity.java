@@ -25,6 +25,10 @@ public class LauncherActivity extends Activity {
     @Override
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
+        LaunchTrace.installHandler(this);
+        if (LaunchTrace.wasInterrupted(this)) {
+            LaunchTrace.captureInterrupted(this);
+        }
         File crash = CrashLog.find(this);
         if (crash != null) {
             showCrash(crash);
@@ -39,7 +43,7 @@ public class LauncherActivity extends Activity {
         root.setOrientation(LinearLayout.VERTICAL);
         root.setPadding(48, 48, 48, 48);
         TextView title = new TextView(this);
-        title.setText("The last run crashed. Share the log, then start again.");
+        title.setText("The last run did not finish. Share the log, then start again.");
         TextView body = new TextView(this);
         body.setText(text);
         ScrollView scroll = new ScrollView(this);
@@ -83,6 +87,9 @@ public class LauncherActivity extends Activity {
             intent.setType("*/*");
             startActivityForResult(intent, PICK);
         });
+        Button debug = new Button(this);
+        debug.setText("Copy debug info");
+        debug.setOnClickListener(v -> startActivity(CrashLog.share(LaunchTrace.debugText(this))));
         Button play = new Button(this);
         play.setText("Start");
         play.setOnClickListener(v -> {
@@ -97,6 +104,7 @@ public class LauncherActivity extends Activity {
         root.addView(text);
         root.addView(pick);
         root.addView(play);
+        root.addView(debug);
         setContentView(root);
         SafeInsets.install(this);
     }

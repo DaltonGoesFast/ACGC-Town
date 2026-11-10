@@ -48,7 +48,7 @@ public final class CrashLog {
     public static Intent share(String text) {
         Intent send = new Intent(Intent.ACTION_SEND);
         send.setType("text/plain");
-        send.putExtra(Intent.EXTRA_SUBJECT, "ACGC Town crash log");
+        send.putExtra(Intent.EXTRA_SUBJECT, "ACGC Town log");
         send.putExtra(Intent.EXTRA_TEXT, text);
         return Intent.createChooser(send, "Share log");
     }

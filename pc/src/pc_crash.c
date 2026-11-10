@@ -93,9 +93,59 @@ static void pc_diag_write_crash(int fd, int sig, siginfo_t* info) {
     }
 }
 
+static int read_file_line(const char* path, char* dst, size_t dst_n) {
+    int fd;
+    int n;
+    int i;
+    if (dst_n < 2) return 0;
+    fd = open(path, O_RDONLY);
+    if (fd < 0) return 0;
+    n = (int)read(fd, dst, dst_n - 1);
+    close(fd);
+    if (n <= 0) return 0;
+    dst[n] = '\0';
+    for (i = 0; i < n; i++) {
+        if (dst[i] == '\n' || dst[i] == '\r') {
+            dst[i] = '\0';
+            break;
+        }
+    }
+    return dst[0] != '\0';
+}
+
+/* Java writes files/acgc-logdir.txt before System.loadLibrary, so a constructor crash still has a path. */
+static void pc_diag_paths_from_logdir(void) {
+    char cmd[256];
+    char file[512];
+    char dir[512];
+    const char* roots[2];
+    int fd;
+    int n;
+    int r;
+    if (s_crash_path[0] != '\0') return;
+    fd = open("/proc/self/cmdline", O_RDONLY);
+    if (fd < 0) return;
+    n = (int)read(fd, cmd, sizeof(cmd) - 1);
+    close(fd);
+    if (n <= 0) return;
+    cmd[n] = '\0';
+    roots[0] = "/data/user/0/";
+    roots[1] = "/data/data/";
+    for (r = 0; r < 2; r++) {
+        snprintf(file, sizeof(file), "%s%s/files/acgc-logdir.txt", roots[r], cmd);
+        if (!read_file_line(file, dir, sizeof(dir))) continue;
+        snprintf(s_crash_path, sizeof(s_crash_path), "%s/acgc-crash.log", dir);
+        snprintf(s_session_path, sizeof(s_session_path), "%s/acgc-session.log", dir);
+        return;
+    }
+}
+
 static void pc_diag_on_signal(int sig, siginfo_t* info, void* uctx) {
     int crash_fd;
     (void)uctx;
+    __android_log_print(ANDROID_LOG_FATAL, "ACGC", "fatal signal %d fault %p", sig,
+                        info != NULL ? info->si_addr : NULL);
+    if (s_crash_path[0] == '\0') pc_diag_paths_from_logdir();
     pc_diag_write_crash(s_session_fd, sig, info);
     crash_fd = open(s_crash_path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
     if (crash_fd >= 0) {
@@ -130,11 +180,14 @@ static void pc_diag_on_signal(int sig, siginfo_t* info, void* uctx) {
 static void pc_diag_open_logs(void) {
     const char* base;
     if (s_session_fd >= 0) return;
-    base = SDL_AndroidGetExternalStoragePath();
-    if (base == NULL || base[0] == '\0') base = SDL_AndroidGetInternalStoragePath();
-    if (base == NULL || base[0] == '\0') base = ".";
-    snprintf(s_crash_path, sizeof(s_crash_path), "%s/acgc-crash.log", base);
-    snprintf(s_session_path, sizeof(s_session_path), "%s/acgc-session.log", base);
+    pc_diag_paths_from_logdir();
+    if (s_crash_path[0] == '\0') {
+        base = SDL_AndroidGetExternalStoragePath();
+        if (base == NULL || base[0] == '\0') base = SDL_AndroidGetInternalStoragePath();
+        if (base == NULL || base[0] == '\0') base = ".";
+        snprintf(s_crash_path, sizeof(s_crash_path), "%s/acgc-crash.log", base);
+        snprintf(s_session_path, sizeof(s_session_path), "%s/acgc-session.log", base);
+    }
     s_session_fd = open(s_session_path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
     if (s_session_fd >= 0) {
         dup2(s_session_fd, STDOUT_FILENO);
@@ -147,7 +200,7 @@ static void pc_diag_sdl_log(void* userdata, int category, SDL_LogPriority pri, c
     (void)category;
     (void)pri;
     if (message == NULL) return;
-    __android_log_write(ANDROID_LOG_INFO, "ACGC", message);
+    __android_log_print(ANDROID_LOG_INFO, "ACGC", "%s", message);
     if (s_session_fd >= 0) {
         wr_fd(s_session_fd, message);
         wr_fd(s_session_fd, "\n");
@@ -168,7 +221,9 @@ static void pc_diag_install_signals(void) {
 }
 
 __attribute__((constructor(50))) static void pc_diag_ctor(void) {
+    pc_diag_paths_from_logdir();
     pc_diag_install_signals();
+    __android_log_print(ANDROID_LOG_INFO, "ACGC", "diag ctor crash=%s", s_crash_path[0] ? s_crash_path : "(no path yet)");
 }
 
 void pc_diag_init(void) {
@@ -180,7 +235,7 @@ void pc_diag_init(void) {
 
 void pc_diag_milestone(const char* msg) {
     if (msg == NULL) return;
-    __android_log_write(ANDROID_LOG_INFO, "ACGC", msg);
+    __android_log_print(ANDROID_LOG_INFO, "ACGC", "%s", msg);
     fprintf(stderr, "[PC] %s\n", msg);
     if (s_session_fd >= 0) fsync(s_session_fd);
 }

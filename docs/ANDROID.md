@@ -1,6 +1,6 @@
 # Android
 
-The phone build is `pc/android/`. It is a Gradle project whose activity is SDL2's `SDLActivity` (zlib, SDL 2.30.10, vendored under `pc/android/app/src/main/java/org/libsdl/app/`). The native libraries are CMake and OpenGL ES 3. This APK is **arm64-v8a** (versionCode 6), which is the only ABI a Galaxy Z Fold 6 can load. minSdk is 24, targetSdk is 34, and the debug APK is signed with the standard Android debug key (`androiddebugkey` / `android`).
+The phone build is `pc/android/`. It is a Gradle project whose activity is SDL2's `SDLActivity` (zlib, SDL 2.30.10, vendored under `pc/android/app/src/main/java/org/libsdl/app/`). The native libraries are CMake and OpenGL ES 3. This APK is **arm64-v8a** (versionCode 7), which is the only ABI a Galaxy Z Fold 6 can load. minSdk is 24, targetSdk is 34, and the debug APK is signed with the standard Android debug key (`androiddebugkey` / `android`).
 
 [zwaetschge/ACGC-Android-Port](https://github.com/zwaetschge/ACGC-Android-Port) was read for the shape of the problem: an SDL2 Android activity, a GLES 3 context instead of desktop GL, a Storage Access Framework picker so the disc is not in the APK, and NDK CMake. Its licence is the same MIT text as the PC port. None of its Java, Python, texture tools, or game patches were copied. The Java activity here is SDL's own, not that port's launcher.
 
@@ -24,7 +24,7 @@ The Galaxy Z Fold 6 cover screen is a tall narrow strip. The inner screen is clo
 
 ## What the APK runs
 
-`libmain.so` is the game, built for arm64-v8a with `PC_GLES` (OpenGL ES 3). `SDL_main` is the game's `main`. The activity `chdir`s to internal storage and passes `--rom` with the image the picker saved, so Play Online is the same screen as the desktop client. versionCode 6.
+`libmain.so` is the game, built for arm64-v8a with `PC_GLES` (OpenGL ES 3). `SDL_main` is the game's `main`. The activity `chdir`s to internal storage and passes `--rom` with the image the picker saved, so Play Online is the same screen as the desktop client. versionCode 7.
 
 The phone's `Save_t` is the same 148128 bytes as the 32-bit server (every top-level member is checked). `pc_save_wire_store` / `pc_save_wire_load` copy it field by field for the memory card, the town fetch GCI, and the GCI validation path. The event packet's special and weekly blocks are asserted at 84 and 100 bytes. A host built from an older commit does not need a protocol change for this.
 
@@ -52,13 +52,15 @@ The numbers that matched on this machine (linux i386 `-malign-double` and armeab
 
 ## Crash log
 
-A fatal signal (`SIGSEGV`, `SIGBUS`, `SIGABRT`, `SIGILL`) writes `acgc-crash.log` in the app's external files directory:
+Tapping Start commits a `launch-in-progress` flag (and the process id) before `System.loadLibrary`. The flag is cleared on pause or when the activity finishes. If the process dies first, the next launch runs `logcat -d -v threadtime --pid=<previous pid>`, or a filtered `logcat -d` (`ACGC`, `DEBUG`, `libc`, `AndroidRuntime`, `linker`) if that is empty. The text is saved as `acgc-crash.log` and the Share log screen is shown. A Java uncaught-exception handler writes the same file. **Copy debug info** on the launcher shares the last session log and a fresh logcat slice at any time.
+
+Native milestones also go to logcat with `__android_log_print` under the tag `ACGC`, including the library constructors (`diag ctor`, `lowheap init`, `heap reserve ok`). A fatal signal (`SIGSEGV`, `SIGBUS`, `SIGABRT`, `SIGILL`) still writes:
 
 `/storage/emulated/0/Android/data/com.acgc.town/files/acgc-crash.log`
 
-The same directory has `acgc-session.log` (startup milestones and the SDL/game log). If external storage is unavailable, both files are under the app's internal files directory instead. The next launch shows the crash log with a Share log button before the game starts. Share sends the text with the Android share sheet.
+The same directory has `acgc-session.log`. If external storage is unavailable, both files are under the app's internal files directory. Java writes `files/acgc-logdir.txt` before the libraries load so the signal handler has that path even if it runs during `dlopen`.
 
-Tapping Start loads `libmain.so` on SDL's thread and then enters `SDL_main`. The library constructor only maps the below-4GB heap; it does not call into SDL, because SDL's Java activity is not set up yet. The game then switches to an 8MB stack inside that heap on the same thread. A failed heap or stack reservation shows a dialog and returns, instead of aborting the process. `acgc-session.log` records `entered SDL_main`, `heap reserve ok`, `stack switch ok`, `rom opened`, `GL context ok`, and `first frame`.
+If the low mapping is refused, `malloc` falls back to the system allocator so C++ startup does not crash on a null pointer, and `SDL_main` shows the refusal instead. The game stays on the stack ART created for SDL's thread. Moving that stack into the low heap makes the next JNI call abort with `StackOverflowError`. The low-address survey logs a high stack address and does not abort on Android. The EGL config does not request 4x MSAA or a 24-bit depth buffer, which Android configs often do not have. `acgc-session.log` records `entered SDL_main`, `heap reserve ok`, `sdl thread stack kept`, `game main`, `SDL_Init ok`, `GL context ok`, and `rom opened`.
 
 ## What is still open
 
