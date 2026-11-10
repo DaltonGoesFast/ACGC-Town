@@ -30,6 +30,7 @@ build32/
 build64/
 pc/build-mingw/
 pc/build-mingw32/
+pc/android/local.properties
 pc/android/.gradle/
 pc/android/build/
 pc/android/app/build/
