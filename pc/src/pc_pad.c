@@ -287,7 +287,11 @@ u32 PADRead(PADStatus* status) {
     status[0].substickY = cstickY;
     status[0].err = 0; /* PAD_ERR_NONE */
 
-    pc_hb_note_input(buttons, (int)stickX, (int)stickY, pc_touch_finger_count(), pc_touch_hud_mode());
+    {
+        char hud_state[80];
+        pc_touch_hud_state(hud_state, sizeof(hud_state));
+        pc_hb_note_input(buttons, (int)stickX, (int)stickY, pc_touch_finger_count(), pc_touch_hud_mode(), hud_state);
+    }
     return PAD_CHAN0_BIT; /* Controller 1 connected */
 }
 

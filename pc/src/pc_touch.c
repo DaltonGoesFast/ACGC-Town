@@ -32,7 +32,7 @@
 #define HUD_DIALOG 3
 #define HUD_KEYS 4
 
-enum { HIT_NONE = 0, HIT_PICTURE, HIT_STICK, HIT_NUB, HIT_ACTION, HIT_BACK, HIT_MENU, HIT_KEY };
+enum { HIT_NONE = 0, HIT_PICTURE, HIT_STICK, HIT_NUB, HIT_ACTION, HIT_BACK, HIT_MENU, HIT_KEY, HIT_BAG, HIT_MAP };
 
 static int s_pointer_was = 0;
 static float s_down_x = 0.0f, s_down_y = 0.0f, s_last_x = 0.0f, s_last_y = 0.0f;
@@ -42,7 +42,6 @@ static int s_pulse_b = 0;
 static int s_have_target = 0;
 static int s_interact = 0;
 static float s_target_x = 0.0f, s_target_z = 0.0f;
-static int s_stick_on = 0;
 static float s_knob_x = 0.0f, s_knob_y = 0.0f;
 static int s_title_valid = 0;
 static float s_title_y = 0.0f;
@@ -50,14 +49,22 @@ static int s_hud = HUD_OFF;
 static int s_logged = 0;
 static int s_overlay_logged = 0;
 static char s_action[16] = "A";
+static float s_mark_x = 0, s_mark_y = 0, s_mark_t = 0;
+static float s_best_dist = -1;
+static int s_stall = 0;
+static int s_slide = 0;
+static int s_lay_w = 0, s_lay_h = 0;
+static SDL_Haptic* s_haptic = NULL;
+static int s_haptic_tried = 0;
 
 enum { FINGERS = 4 };
 typedef struct { SDL_FingerID id; float x, y; int down; } Finger;
 static Finger s_fin[FINGERS];
 
 typedef struct {
-    int show_stick, show_nub, show_action, show_back, show_menu, show_keys;
+    int show_stick, show_nub, show_action, show_back, show_menu, show_keys, show_quick;
     float sx, sy, sr, nx, ny, nr, ax, ay, ar, bx, by, br, mx, my, mr;
+    float bag_x, bag_y, map_x, map_y, qr;
     int key_n;
     float kx[40], ky[40], kr;
     char kc[40];
@@ -77,6 +84,14 @@ int pc_touch_finger_count(void) {
 }
 
 int pc_touch_hud_mode(void) { return pc_touch_enabled() ? s_hud : HUD_OFF; }
+
+void pc_touch_hud_state(char* buf, size_t n) {
+    if (buf == NULL || n == 0) return;
+    snprintf(buf, n, "sc=%d op=%d hand=%c stk=%d move=%d hap=%d",
+             g_pc_settings.touch_hud_scale, g_pc_settings.touch_hud_opacity,
+             g_pc_settings.touch_left_hand ? 'L' : 'R',
+             g_pc_settings.touch_stick, g_pc_settings.touch_move, g_pc_settings.touch_haptics);
+}
 
 void pc_touch_pulse_b(void) { s_pulse_b = 1; }
 
@@ -222,10 +237,16 @@ static void hud_build(Hud* h) {
     rad = 0.085f * (W < H ? W : H);
     if (rad < 42.0f) rad = 42.0f;
     if (rad > 78.0f) rad = 78.0f;
+    {
+        int sc = g_pc_settings.touch_hud_scale;
+        if (sc < 70) sc = 70;
+        if (sc > 140) sc = 140;
+        rad *= (float)sc / 100.0f;
+    }
     gap = rad * 2.25f;
     h->show_keys = keys_up();
     h->show_nub = !h->show_keys;
-    h->show_stick = s_stick_on && !h->show_keys && !(town && s_have_target);
+    h->show_stick = g_pc_settings.touch_stick && !h->show_keys && !(town && s_have_target);
     h->show_action = dialog || (town && strcmp(s_action, "A") != 0);
     h->show_back = dialog || h->show_keys || g_pc_paused || pc_settings_menu_active() || pc_play_online_menu_active();
     h->show_menu = !g_pc_title_main_menu_visible || pc_settings_menu_active() || pc_play_online_menu_active();
@@ -273,11 +294,32 @@ static void hud_build(Hud* h) {
             place_keys(h, H - ib - rad * 3.4f, H - ib - 6.0f, W * 0.22f, W * 0.78f);
         }
     }
+    /* Inventory (Y) and map (X) sit with the leaf. They use the game's own buttons. */
+    h->show_quick = town && !h->show_keys;
+    h->qr = rad * 0.5f;
+    if (g_pc_layout_portrait) {
+        float mid = (h->sy + h->ny) * 0.5f;
+        h->bag_x = W * 0.40f;
+        h->map_x = W * 0.56f;
+        h->bag_y = h->map_y = mid;
+    } else {
+        h->bag_x = h->mx - h->mr * 2.3f;
+        h->bag_y = h->my;
+        h->map_x = h->mx;
+        h->map_y = h->my - h->mr * 2.3f;
+    }
+    if (g_pc_settings.touch_left_hand) {
+        h->sx = W - h->sx; h->nx = W - h->nx; h->ax = W - h->ax;
+        h->bx = W - h->bx; h->mx = W - h->mx;
+        h->bag_x = W - h->bag_x; h->map_x = W - h->map_x;
+        for (int i = 0; i < h->key_n; i++) h->kx[i] = W - h->kx[i];
+    }
     if (!h->show_stick) { h->sx = -1000.0f; }
 }
 
 static int hit_disc(float x, float y, float cx, float cy, float r) {
     float dx = x - cx, dy = y - cy;
+    r *= 1.15f; /* a little slop so a fold does not miss the disc */
     return dx * dx + dy * dy <= r * r;
 }
 
@@ -290,6 +332,8 @@ static int classify(float x, float y, Hud* h, int* key) {
             if (hit_disc(x, y, h->kx[i], h->ky[i], r)) { *key = i; return HIT_KEY; }
         }
     }
+    if (h->show_quick && hit_disc(x, y, h->bag_x, h->bag_y, h->qr)) return HIT_BAG;
+    if (h->show_quick && hit_disc(x, y, h->map_x, h->map_y, h->qr)) return HIT_MAP;
     if (h->show_stick && hit_disc(x, y, h->sx, h->sy, h->sr)) return HIT_STICK;
     if (h->show_nub && hit_disc(x, y, h->nx, h->ny, h->nr)) return HIT_NUB;
     if (h->show_action && hit_disc(x, y, h->ax, h->ay, h->ar)) return HIT_ACTION;
@@ -321,8 +365,27 @@ static int steer_toward(float tx, float tz, signed char* stick_x, signed char* s
     dx = tx - px;
     dz = tz - pz;
     dist = sqrtf(dx * dx + dz * dz);
+    if (s_best_dist < 0.0f || dist < s_best_dist - 1.5f) {
+        s_best_dist = dist;
+        s_stall = 0;
+        if (s_slide != 0) s_slide = 0; /* moving again: straight at the tap */
+    } else if (++s_stall == 20 || s_stall == 45) {
+        s_slide = (s_stall == 20) ? 1 : -1; /* slide off the obstacle */
+    } else if (s_stall == 70) {
+        s_slide = 0; /* give up the slide and walk straight */
+    } else if (s_stall > 95) {
+        s_have_target = 0;
+        s_interact = 0;
+        s_stall = 0;
+        s_slide = 0;
+        s_best_dist = -1.0f;
+        return 0;
+    }
     if (dist < TOUCH_ARRIVE) {
         s_have_target = 0;
+        s_stall = 0;
+        s_slide = 0;
+        s_best_dist = -1.0f;
         if (s_interact) { s_pulse_a = 1; s_interact = 0; }
         return 0;
     }
@@ -339,6 +402,11 @@ static int steer_toward(float tx, float tz, signed char* stick_x, signed char* s
     if (mag < 0.05f) return 0;
     sx = sx / mag * (float)TOUCH_STICK;
     sy = sy / mag * (float)TOUCH_STICK;
+    if (s_slide != 0) {
+        float ox = sx, oy = sy;
+        sx = ox * 0.55f - oy * 0.45f * (float)s_slide;
+        sy = oy * 0.55f + ox * 0.45f * (float)s_slide;
+    }
     if (sx > 127.0f) sx = 127.0f;
     if (sx < -128.0f) sx = -128.0f;
     if (sy > 127.0f) sy = 127.0f;
@@ -414,14 +482,36 @@ static int point_is_interesting(float wx, float wz) {
     return 0;
 }
 
+static void pc_touch_buzz(void) {
+    if (!g_pc_settings.touch_haptics) return;
+    if (!s_haptic_tried) {
+        s_haptic_tried = 1;
+        if (SDL_NumHaptics() > 0) {
+            s_haptic = SDL_HapticOpen(0);
+            if (s_haptic != NULL && SDL_HapticRumbleInit(s_haptic) != 0) {
+                SDL_HapticClose(s_haptic);
+                s_haptic = NULL;
+            }
+        }
+    }
+    if (s_haptic != NULL) SDL_HapticRumblePlay(s_haptic, 0.45f, 28);
+}
+
 static void begin_move(float x, float y) {
     float wx, wz;
-    if (!can_steer()) return;
+    if (!g_pc_settings.touch_move || !can_steer()) return;
     if (!tap_to_world(x, y, &wx, &wz)) return;
     s_target_x = wx;
     s_target_z = wz;
     s_have_target = 1;
+    s_stall = 0;
+    s_slide = 0;
+    s_best_dist = -1.0f;
+    s_mark_x = x;
+    s_mark_y = y;
+    s_mark_t = 1.0f;
     s_interact = point_is_interesting(wx, wz);
+    pc_touch_buzz();
 }
 
 static void refresh_action_label(void) {
@@ -560,8 +650,8 @@ void pc_touch_apply(unsigned short* buttons, signed char* stick_x, signed char* 
     refresh_action_label();
     if (!pc_touch_enabled() || buttons == NULL || g_pc_window_w < 2) return;
     hud_build(&hud);
-    if (s_pulse_a) { *buttons |= PAD_BUTTON_A; s_pulse_a = 0; }
-    if (s_pulse_b) { *buttons |= PAD_BUTTON_B; s_pulse_b = 0; }
+    if (s_pulse_a) { *buttons |= PAD_BUTTON_A; s_pulse_a = 0; pc_touch_buzz(); }
+    if (s_pulse_b) { *buttons |= PAD_BUTTON_B; s_pulse_b = 0; pc_touch_buzz(); }
     down = read_point(&x, &y, &x2, &y2, &n);
     rising = down && !s_pointer_was;
     if (n >= 2 && g_pc_settings.touch_camera && cstick_x && cstick_y) {
@@ -581,9 +671,12 @@ void pc_touch_apply(unsigned short* buttons, signed char* stick_x, signed char* 
         if (s_pointer_was && hypotf(s_last_x - s_down_x, s_last_y - s_down_y) < 36.0f) {
             if (s_down_hit == HIT_PICTURE) on_picture_release(s_down_x, s_down_y);
             else if (s_down_hit == HIT_NUB) {
-                s_stick_on = !s_stick_on;
-                pc_diag_milestone(s_stick_on ? "touch stick shown" : "touch stick hidden");
+                g_pc_settings.touch_stick = !g_pc_settings.touch_stick;
+                pc_settings_save();
+                pc_touch_buzz();
+                pc_diag_milestone(g_pc_settings.touch_stick ? "touch stick shown" : "touch stick hidden");
             } else if (s_down_hit == HIT_MENU) {
+                pc_touch_buzz();
                 pc_diag_milestone("touch menu");
                 if (message_open() || submenu_open() || pc_settings_menu_active() || pc_play_online_menu_active())
                     s_pulse_b = 1;
@@ -611,12 +704,20 @@ void pc_touch_apply(unsigned short* buttons, signed char* stick_x, signed char* 
         s_knob_x = s_knob_y = 0.0f;
     } else {
         hit = classify(x, y, &hud, &key);
+        if (g_pc_window_w != s_lay_w || g_pc_window_h != s_lay_h) {
+            s_lay_w = g_pc_window_w;
+            s_lay_h = g_pc_window_h;
+            if (!rising) s_down_hit = hit; /* fold or unfold: the finger keeps whatever disc is under it now */
+        }
         if (rising) {
             s_down_x = x; s_down_y = y; s_down_hit = hit;
             if (hit == HIT_PICTURE && can_steer()) begin_move(x, y);
-            else if (hit != HIT_NONE) s_have_target = 0;
-            if (hit == HIT_ACTION) pc_diag_milestone("touch action");
+            else if (hit != HIT_NONE && hit != HIT_PICTURE) s_have_target = 0;
+            if (hit == HIT_BAG) { *buttons |= PAD_BUTTON_Y; pc_touch_buzz(); pc_diag_milestone("touch inventory"); }
+            if (hit == HIT_MAP) { *buttons |= PAD_BUTTON_X; pc_touch_buzz(); pc_diag_milestone("touch map"); }
+            if (hit == HIT_ACTION) { pc_touch_buzz(); pc_diag_milestone("touch action"); }
             if (hit == HIT_BACK) {
+                pc_touch_buzz();
                 pc_diag_milestone("touch back");
                 if (g_pc_paused) pause_key(SDLK_ESCAPE);
                 else *buttons |= PAD_BUTTON_B;
@@ -702,8 +803,11 @@ static void vert(float x, float y, float u, float v, float r, float g, float b, 
     s_nvert++;
 }
 
+static float s_fade = 1.0f;
+
 static void disc(float cx, float cy, float rad, float r, float g, float b, float a) {
     float W = (float)g_pc_window_w, H = (float)g_pc_window_h;
+    a *= s_fade;
     float x0 = (cx - rad) / W * 2.0f - 1.0f;
     float x1 = (cx + rad) / W * 2.0f - 1.0f;
     float y0 = 1.0f - (cy + rad) / H * 2.0f;
@@ -758,6 +862,28 @@ static void glyph(char ch, float cx, float cy, float s) {
     }
 }
 
+static void draw_word(const char* s, float cx, float cy, float pix) {
+    int n = 0, i;
+    float w;
+    if (s == NULL) return;
+    while (s[n] != 0 && n < 12) n++;
+    w = (float)n * 5.0f * pix;
+    for (i = 0; i < n; i++) {
+        if (s[i] == ' ') continue;
+        glyph(s[i], cx - w * 0.5f + ((float)i + 0.5f) * 5.0f * pix, cy, pix);
+    }
+}
+
+static const char* action_word(void) {
+    if (strcmp(s_action, "Pick up") == 0) return "Pick";
+    if (strcmp(s_action, "Shake") == 0) return "Shake";
+    if (strcmp(s_action, "Open") == 0) return "Open";
+    if (strcmp(s_action, "Talk") == 0) return "Talk";
+    if (strcmp(s_action, "Next") == 0) return "Next";
+    if (strcmp(s_action, "OK") == 0) return "OK";
+    return NULL;
+}
+
 void pc_touch_present(void) {
     Hud h;
     int i;
@@ -774,13 +900,38 @@ void pc_touch_present(void) {
     gl_init();
     if (!s_gl_ready) return;
     s_nvert = 0;
+    {
+        int op = g_pc_settings.touch_hud_opacity;
+        if (op < 40) op = 40;
+        if (op > 100) op = 100;
+        s_fade = (float)op / 100.0f;
+    }
+    if (s_mark_t > 0.0f) {
+        float rad = (1.15f - s_mark_t) * 36.0f;
+        disc(s_mark_x, s_mark_y, rad, 0.93f, 0.78f, 0.35f, 0.55f * s_mark_t);
+        disc(s_mark_x, s_mark_y, rad * 0.28f, 0.95f, 0.90f, 0.75f, 0.9f * s_mark_t);
+        s_mark_t -= 0.04f;
+    }
     if (h.show_stick) {
         button(h.sx, h.sy, h.sr, 0.93f, 0.90f, 0.84f);
         disc(h.sx + s_knob_x * h.sr * 0.45f, h.sy + s_knob_y * h.sr * 0.45f, h.sr * 0.42f, 0.36f, 0.52f, 0.40f, 0.95f);
     }
-    if (h.show_nub) button(h.nx, h.ny, h.nr, s_stick_on ? 0.36f : 0.75f, s_stick_on ? 0.52f : 0.72f, s_stick_on ? 0.40f : 0.66f);
+    if (h.show_nub) button(h.nx, h.ny, h.nr, g_pc_settings.touch_stick ? 0.36f : 0.75f, g_pc_settings.touch_stick ? 0.52f : 0.72f, g_pc_settings.touch_stick ? 0.40f : 0.66f);
+    if (h.show_quick) {
+        button(h.bag_x, h.bag_y, h.qr, 0.93f, 0.90f, 0.84f);
+        button(h.map_x, h.map_y, h.qr, 0.93f, 0.90f, 0.84f);
+        glyph('I', h.bag_x, h.bag_y, h.qr * 0.22f);
+        glyph('M', h.map_x, h.map_y, h.qr * 0.22f);
+    }
     if (h.show_back) button(h.bx, h.by, h.br, 0.76f, 0.45f, 0.36f);
-    if (h.show_action) button(h.ax, h.ay, h.ar, 0.36f, 0.52f, 0.40f);
+    if (h.show_action) {
+        const char* word = action_word();
+        button(h.ax, h.ay, h.ar, 0.36f, 0.52f, 0.40f);
+        if (word != NULL) {
+            float lx = g_pc_settings.touch_left_hand ? h.ax + h.ar + 28.0f : h.ax - h.ar - 28.0f;
+            draw_word(word, lx, h.ay, h.ar * 0.09f);
+        }
+    }
     if (h.show_menu) {
         button(h.mx, h.my, h.mr, 0.93f, 0.90f, 0.84f);
         disc(h.mx - h.mr * 0.22f, h.my + h.mr * 0.05f, h.mr * 0.28f, 0.36f, 0.52f, 0.40f, 0.95f);

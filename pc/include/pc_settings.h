@@ -24,6 +24,12 @@ typedef struct {
     int touch_camera;     /* 1 = two fingers drag the C-stick (camera). Pinch is the same drag. */
     int touch_menus;      /* 1 = a short tap advances dialogue and confirms the highlighted menu row */
     int touch_keyboard;   /* 1 = the Chat button opens the line and SDL's on-screen keyboard */
+    int touch_hud_scale; /* On-screen control size, percent 70-140 (default 100). Local only. */
+    int touch_hud_opacity; /* On-screen control opacity, percent 40-100 (default 85). */
+    int touch_left_hand; /* 1 = mirror the HUD for a left-handed grip. */
+    int touch_stick;     /* 1 = show the fallback stick. The nub toggles this and saves it. */
+    int touch_move;      /* 1 = tap the ground to walk. 0 = taps no longer steer. */
+    int touch_haptics;   /* 1 = a short buzz on a button or a reached tap. */
     int nes_aspect;       /* NES emulator aspect: 0=fullscreen stretch, 1=4:3 pillarbox (default) */
     int master_volume;    /* Applied at the PC audio output, 0-100 (default 100) */
     int audio;            /* 1 = start the audio device and producer thread (default on PC). 0 = silent. Android defaults to 0 so a bad audio thread does not close the game. */

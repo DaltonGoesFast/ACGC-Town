@@ -27,6 +27,7 @@ int pc_touch_take_title_tap(float* font_y);
 
 int pc_touch_finger_count(void);
 int pc_touch_hud_mode(void);
+void pc_touch_hud_state(char* buf, size_t n);
 
 void pc_touch_apply(unsigned short* buttons, signed char* stick_x, signed char* stick_y,
                     signed char* cstick_x, signed char* cstick_y,
