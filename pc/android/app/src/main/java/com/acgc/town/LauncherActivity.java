@@ -45,6 +45,7 @@ public class LauncherActivity extends Activity {
         root.addView(pick);
         root.addView(play);
         setContentView(root);
+        SafeInsets.install(this);
     }
 
     @Override

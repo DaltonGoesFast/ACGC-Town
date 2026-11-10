@@ -54,16 +54,36 @@ int pc_touch_enabled(void) {
     return SDL_GetNumTouchDevices() > 0;
 }
 
+static void read_safe_insets(float* left, float* top, float* right, float* bottom) {
+    FILE* f = fopen("safe_insets.txt", "r");
+    int l = 0, t = 0, r = 0, b = 0;
+    *left = *top = *right = *bottom = 0.0f;
+    if (f == NULL) return;
+    if (fscanf(f, "%d %d %d %d", &l, &t, &r, &b) == 4) {
+        *left = (float)l;
+        *top = (float)t;
+        *right = (float)r;
+        *bottom = (float)b;
+    }
+    fclose(f);
+}
+
 static void button_layout(float* ax, float* ay, float* bx, float* by, float* tx, float* ty,
                           float* ex, float* ey, float* cx, float* cy, float* rad) {
     float short_side = (float)(g_pc_window_w < g_pc_window_h ? g_pc_window_w : g_pc_window_h);
-    float margin = 0.06f * short_side; /* safe-area stand-in: keep thumbs off the curved edge */
-    float gap;
+    float long_side = (float)(g_pc_window_w > g_pc_window_h ? g_pc_window_w : g_pc_window_h);
+    float aspect = long_side / (short_side > 1.0f ? short_side : 1.0f);
+    float margin = 0.06f * short_side;
+    float inset_l, inset_t, inset_r, inset_b, gap;
+    read_safe_insets(&inset_l, &inset_t, &inset_r, &inset_b);
     *rad = 0.075f * short_side;
+    /* Cover screen of a fold is a narrow strip. The inner screen is close to square. */
+    if (aspect > 1.7f) *rad *= 0.72f;
+    else if (aspect < 1.25f) *rad *= 0.85f;
     if (*rad < 44.0f) *rad = 44.0f;
     gap = *rad * 2.35f;
-    *ax = (float)g_pc_window_w - margin - *rad;
-    *ay = (float)g_pc_window_h - margin - *rad;
+    *ax = (float)g_pc_window_w - margin - inset_r - *rad;
+    *ay = (float)g_pc_window_h - margin - inset_b - *rad;
     *bx = *ax - gap;
     *by = *ay;
     *tx = *ax;
@@ -72,6 +92,15 @@ static void button_layout(float* ax, float* ay, float* bx, float* by, float* tx,
     *ey = *ty;
     *cx = *ax;
     *cy = *ty - gap;
+    /* Keep the cluster inside the cutout. Window Y grows downward. */
+    if (*bx - *rad < margin + inset_l) {
+        float shift = (margin + inset_l) - (*bx - *rad);
+        *ax += shift; *bx += shift; *tx += shift; *ex += shift; *cx += shift;
+    }
+    if (*cy - *rad < margin + inset_t) {
+        float shift = (margin + inset_t) - (*cy - *rad);
+        *ay += shift; *by += shift; *ty += shift; *ey += shift; *cy += shift;
+    }
 }
 
 static int hit_button(float x, float y, float cx, float cy, float rad) {

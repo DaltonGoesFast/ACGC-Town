@@ -20,5 +20,6 @@ target_link_libraries(abi log)
 add_library(main SHARED android_main.c)
 target_link_libraries(main SDL2 GLESv3 log)
 
-# The full game (pc/CMakeLists.txt) is not part of this target. See docs/ANDROID.md.
-# When it is linked, build it as armeabi-v7a with TARGET_PC and without PC_ALLOW_64BIT.
+# Both ABIs. arm64-v8a is required for 64-bit-only phones (Galaxy Z Fold 6).
+# The decomp is not linked: an arm64 Save_t does not match the 32-bit server yet.
+# See docs/ANDROID.md.

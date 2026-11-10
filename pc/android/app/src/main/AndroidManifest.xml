@@ -6,11 +6,13 @@
     <application
         android:allowBackup="false"
         android:label="ACGC Town"
-        android:hasCode="true">
+        android:hasCode="true"
+        android:resizeableActivity="true">
         <activity
             android:name=".LauncherActivity"
             android:exported="true"
-            android:screenOrientation="landscape">
+            android:resizeableActivity="true"
+            android:configChanges="orientation|screenSize|smallestScreenSize|screenLayout|keyboard|keyboardHidden|uiMode|density">
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />
                 <category android:name="android.intent.category.LAUNCHER" />
@@ -19,8 +21,8 @@
         <activity
             android:name=".TownActivity"
             android:exported="false"
-            android:configChanges="layoutDirection|locale|orientation|uiMode|screenLayout|screenSize|smallestScreenSize|keyboard|keyboardHidden|navigation"
-            android:screenOrientation="landscape"
+            android:resizeableActivity="true"
+            android:configChanges="layoutDirection|locale|orientation|uiMode|screenLayout|screenSize|smallestScreenSize|density|keyboard|keyboardHidden|navigation"
             android:theme="@android:style/Theme.NoTitleBar.Fullscreen" />
     </application>
 </manifest>

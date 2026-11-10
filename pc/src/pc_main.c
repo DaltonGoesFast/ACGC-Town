@@ -357,7 +357,9 @@ void pc_platform_init(void) {
 
 #ifdef PC_ENHANCEMENTS
     if (g_pc_settings.msaa > 0) {
+#ifndef PC_GLES
         glEnable(GL_MULTISAMPLE);
+#endif
     }
 #endif
 

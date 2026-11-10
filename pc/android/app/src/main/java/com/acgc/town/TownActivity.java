@@ -27,6 +27,7 @@ public class TownActivity extends SDLActivity {
         copyAsset("default.vert", new File(shaders, "default.vert"));
         copyAsset("default.frag", new File(shaders, "default.frag"));
         super.onCreate(savedInstanceState);
+        SafeInsets.install(this);
     }
 
     @Override

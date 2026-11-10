@@ -2,11 +2,6 @@ plugins {
     id "com.android.application"
 }
 
-task checkAbi(type: Exec) {
-    environment "ANDROID_NDK_HOME", android.ndkDirectory
-    commandLine "sh", "${rootDir}/../tools/check_abi_layout.sh"
-}
-
 android {
     namespace "com.acgc.town"
     compileSdk 34
@@ -14,12 +9,12 @@ android {
 
     defaultConfig {
         applicationId "com.acgc.town"
-        minSdk 26
+        minSdk 24
         targetSdk 34
-        versionCode 1
-        versionName "0.1.0"
+        versionCode 3
+        versionName "0.3.0"
         ndk {
-            abiFilters "armeabi-v7a"
+            abiFilters "arm64-v8a", "armeabi-v7a"
         }
         externalNativeBuild {
             cmake {
@@ -28,7 +23,19 @@ android {
         }
     }
 
+    signingConfigs {
+        debug {
+            storeFile file("${System.properties['user.home']}/.android/debug.keystore")
+            storePassword "android"
+            keyAlias "androiddebugkey"
+            keyPassword "android"
+        }
+    }
+
     buildTypes {
+        debug {
+            signingConfig signingConfigs.debug
+        }
         release {
             minifyEnabled false
         }
@@ -42,15 +49,21 @@ android {
 
     externalNativeBuild {
         cmake {
-            path "../../CMakeLists.txt"
+            path "src/main/cpp/CMakeLists.txt"
             version "3.22.1"
         }
     }
-
-    preBuild.dependsOn checkAbi
 
     compileOptions {
         sourceCompatibility JavaVersion.VERSION_17
         targetCompatibility JavaVersion.VERSION_17
     }
 }
+
+task checkAbi(type: Exec) {
+    commandLine "sh", "${rootDir}/../tools/check_abi_layout.sh"
+}
+afterEvaluate {
+    checkAbi.environment "ANDROID_NDK_HOME", android.ndkDirectory.absolutePath
+}
+preBuild.dependsOn checkAbi
