@@ -17,6 +17,8 @@ typedef struct {
     int disable_resetti;  /* 0=normal (Resetti appears on reset), 1=disable reset penalty */
     int disable_shop_visitor_req; /* 0=normal (Nookington's needs a foreign-town shopper), 1=skip requirement */
     int borderless_acres; /* 0=original acre transitions (faster, draws less), 1=continuous camera/movement */
+    int fast_text;        /* 0=normal (B latches the fast reveal for the rest of the message), 1=dialogue is always on the fast reveal. Local presentation only */
+    int show_acre;        /* 0=off, 1=draw the outdoor acre (A1, Grass, ...) under the clock. Local HUD only */
     int nes_aspect;       /* NES emulator aspect: 0=fullscreen stretch, 1=4:3 pillarbox (default) */
     int master_volume;    /* Applied at the PC audio output, 0-100 (default 100) */
     int stick_deadzone;   /* Gamepad main stick deadzone, percent 0-40 (default 12) */

@@ -19,6 +19,10 @@
 #include "m_rcp.h"
 #include "graph.h"
 #include "main.h"       /* SCREEN_WIDTH_F */
+#include "m_field_info.h" /* outdoor acre label */
+#include "m_field_make.h"
+#include "m_player_lib.h"
+#include "m_submenu.h"
 
 #include <stdio.h>
 #include <string.h>
@@ -300,6 +304,72 @@ static void pc_net_join_message_draw(struct game_s* game, const char* msg, int i
     }
 }
 
+/* A short name for the acre the player is standing on. Coordinates (A1) are always shown; this is the extra word. */
+static const char* pc_acre_kind_name(u8 type) {
+    switch (type) {
+    case mFM_BLOCK_TYPE_FLAT: return "Grass";
+    case mFM_BLOCK_TYPE_PLAYER_HOUSE: return "House";
+    case mFM_BLOCK_TYPE_BEACH:
+    case mFM_BLOCK_TYPE_BEACH_RIVER:
+    case mFM_BLOCK_TYPE_BEACH_RIVER_BRIDGE: return "Beach";
+    case mFM_BLOCK_TYPE_SHRINE: return "Wishing Well";
+    case mFM_BLOCK_TYPE_POLICE_BOX: return "Police";
+    case mFM_BLOCK_TYPE_MUSEUM: return "Museum";
+    case mFM_BLOCK_TYPE_NEEDLEWORK: return "Tailor";
+    case mFM_BLOCK_TYPE_PORT: return "Dock";
+    case mFM_BLOCK_TYPE_TRACKS_STATION: return "Station";
+    case mFM_BLOCK_TYPE_TRACKS_DUMP: return "Dump";
+    case mFM_BLOCK_TYPE_TRACKS_SHOP: return "Nook";
+    case mFM_BLOCK_TYPE_TRACKS_POST_OFFICE: return "Post Office";
+    case mFM_BLOCK_TYPE_ISLAND_LEFT:
+    case mFM_BLOCK_TYPE_ISLAND_RIGHT: return "Island";
+    case mFM_BLOCK_TYPE_OCEAN:
+    case mFM_BLOCK_TYPE_OCEAN_2:
+    case mFM_BLOCK_TYPE_OCEAN_3:
+    case mFM_BLOCK_TYPE_OCEAN_4:
+    case mFM_BLOCK_TYPE_OCEAN_5:
+    case mFM_BLOCK_TYPE_OCEAN_6:
+    case mFM_BLOCK_TYPE_OCEAN_7:
+    case mFM_BLOCK_TYPE_OCEAN_8:
+    case mFM_BLOCK_TYPE_SEA_EXCEPTIONAL: return "Ocean";
+    default: break;
+    }
+    if (type >= mFM_BLOCK_TYPE_RIVER_SOUTH && type <= mFM_BLOCK_TYPE_RIVER_WEST_SOUTH_BRIDGE) return "River";
+    if (type >= mFM_BLOCK_TYPE_POOL_SOUTH && type <= mFM_BLOCK_TYPE_POOL_WEST_SOUTH) return "Pond";
+    if (type >= mFM_BLOCK_TYPE_CLIFF_HORIZONTAL && type <= mFM_BLOCK_TYPE_CLIFF_BOTTOM_LEFT_CORNER) return "Cliff";
+    if (type >= mFM_BLOCK_TYPE_SLOPE_HORIZONTAL && type <= mFM_BLOCK_TYPE_SLOPE_BOTTOM_LEFT_CORNER) return "Slope";
+    if (type == mFM_BLOCK_TYPE_TRACKS || type == mFM_BLOCK_TYPE_TRACKS_RIVER ||
+        (type >= mFM_BLOCK_TYPE_TRACKS6 && type <= mFM_BLOCK_TYPE_TRACKS9) ||
+        type == mFM_BLOCK_TYPE_TRACKS_RIVER_BRIDGE) return "Tracks";
+    return NULL;
+}
+
+/* settings.ini show_acre: the outdoor acre under the clock (the same A–F / 1–5 letters the bulletin board uses). Local HUD. */
+static void pc_acre_label_draw(struct game_s* game) {
+    static const char choume[] = "QABCDEF";
+    PLAYER_ACTOR* player;
+    int bx, bz;
+    u8 type;
+    char line[40];
+    const char* kind;
+    char row, col;
+    if (!g_pc_settings.show_acre || g_pc_dedicated || g_pc_paused || g_pc_title_main_menu_visible || g_pc_nes_active) return;
+    if (game == NULL || game->graph == NULL || !SubmenuArea_IsPlayer()) return;
+    if (mFI_CheckFieldData() == FALSE || mFI_GET_TYPE(mFI_GetFieldId()) != mFI_FIELD_FG) return;
+    player = get_player_actor_withoutCheck((GAME_PLAY*)game);
+    if (player == NULL) return;
+    if (mFI_Wpos2BlockNum(&bx, &bz, player->actor_class.world.position) == FALSE) return;
+    row = (bz >= 0 && bz < (int)sizeof(choume) - 1) ? choume[bz] : '?';
+    col = (bx >= 0 && bx <= 9) ? (char)('0' + bx) : '?';
+    type = mFI_BkNum2BlockType(bx, bz);
+    kind = pc_acre_kind_name(type);
+    if (kind != NULL) snprintf(line, sizeof(line), "%c%c %s", row, col, kind);
+    else snprintf(line, sizeof(line), "%c%c", row, col);
+    mFont_SetMatrix(game->graph, mFont_MODE_FONT);
+    pc_menu_draw_left(game, line, 8.0f, 36.0f, 255, 255, 255, 220, 0.75f);
+    mFont_UnSetMatrix(game->graph, mFont_MODE_FONT);
+}
+
 /* Optional client ping counter (settings.ini show_ping / F4): a read-only view of the reliable layer's own DATA->ACK RTT, refreshed once a second; only while
  * connected as a client. Draws nothing on the title / single player and never touches heartbeat, timeout or reconnect state. */
 static void pc_net_ping_draw(struct game_s* game) {
@@ -364,6 +434,7 @@ void pc_net_notice_draw(struct game_s* game) {
     int join_warning = 0;
     const char* join_msg;
 
+    pc_acre_label_draw(game);
     pc_net_ping_draw(game);
 
     if (g_pc_paused || game == NULL || game->graph == NULL) return;
