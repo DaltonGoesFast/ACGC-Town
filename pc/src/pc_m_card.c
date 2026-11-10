@@ -2507,6 +2507,14 @@ int pc_guest_title_item_visible(void) {
     return pc_net_game_role() == PC_NETGAME_ROLE_CLIENT;
 }
 
+/* 1 when --connect already has a guest profile with a name (save/mp/guest.ini or the selected profile). A missing file is a new player. */
+int pc_guest_title_saved_name(void) {
+    PCGuestProfile gp;
+    char perr[256];
+    if (pc_guest_profile_read_selected(&gp, perr, sizeof(perr)) != PC_GUEST_PROFILE_LOADED) return 0;
+    return gp.name[0] != '\0';
+}
+
 const char* pc_guest_title_label(void) {
     if (!s_pc_guest_title_label_done) {
         PCGuestProfile gp;

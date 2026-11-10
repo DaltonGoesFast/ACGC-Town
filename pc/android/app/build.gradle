@@ -2,6 +2,11 @@ plugins {
     id "com.android.application"
 }
 
+task checkAbi(type: Exec) {
+    environment "ANDROID_NDK_HOME", android.ndkDirectory
+    commandLine "sh", "${rootDir}/../tools/check_abi_layout.sh"
+}
+
 android {
     namespace "com.acgc.town"
     compileSdk 34
@@ -29,12 +34,20 @@ android {
         }
     }
 
+    sourceSets {
+        main {
+            assets.srcDir "../../shaders"
+        }
+    }
+
     externalNativeBuild {
         cmake {
-            path "src/main/cpp/CMakeLists.txt"
+            path "../../CMakeLists.txt"
             version "3.22.1"
         }
     }
+
+    preBuild.dependsOn checkAbi
 
     compileOptions {
         sourceCompatibility JavaVersion.VERSION_17

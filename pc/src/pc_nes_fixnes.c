@@ -115,13 +115,21 @@ static GLuint fixnes_compile_shader(GLenum type, const char *src) {
 
 static void fixnes_init_gl(void) {
     const char *vs =
+#ifdef PC_GLES
+        "#version 300 es\nprecision highp float;\n"
+#else
         "#version 330 core\n"
+#endif
         "layout(location=0) in vec2 pos;\n"
         "layout(location=1) in vec2 uv;\n"
         "out vec2 v_uv;\n"
         "void main() { gl_Position = vec4(pos, 0, 1); v_uv = uv; }\n";
     const char *fs =
+#ifdef PC_GLES
+        "#version 300 es\nprecision highp float;\n"
+#else
         "#version 330 core\n"
+#endif
         "in vec2 v_uv;\n"
         "out vec4 fragColor;\n"
         "uniform sampler2D tex;\n"

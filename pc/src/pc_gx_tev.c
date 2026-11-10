@@ -28,10 +28,32 @@ static char* load_text_file(const char* path) {
     return buf;
 }
 
+/* GLES 3 has no "#version 330 core". The same source is used; only the header changes. */
+static void pc_gles_shader_header(char** src) {
+#ifdef PC_GLES
+    const char* old = "#version 330 core\n";
+    const char* neu = "#version 300 es\nprecision highp float;\nprecision highp int;\n";
+    char* s = *src;
+    size_t ol = strlen(old), nl = strlen(neu), rest;
+    char* out;
+    if (s == NULL || strncmp(s, old, ol) != 0) return;
+    rest = strlen(s + ol);
+    out = (char*)malloc(nl + rest + 1);
+    if (out == NULL) return;
+    memcpy(out, neu, nl);
+    memcpy(out + nl, s + ol, rest + 1);
+    free(s);
+    *src = out;
+#else
+    (void)src;
+#endif
+}
+
 static char* load_shader(const char* filename) {
     char path[512];
     snprintf(path, sizeof(path), "shaders/%s", filename);
     char* src = load_text_file(path);
+    pc_gles_shader_header(&src);
     if (src) {
         printf("[PC/TEV] Loaded shader: %s\n", path);
     } else {
@@ -362,7 +384,15 @@ static char* build_specialized_source(const PCGXShaderKey* k) {
     if (!out) return NULL;
 
     size_t pos = 0;
+#ifdef PC_GLES
+    {
+        const char* ver = "#version 300 es\nprecision highp float;\nprecision highp int;\n";
+        size_t vl = strlen(ver);
+        memcpy(out + pos, ver, vl); pos += vl;
+    }
+#else
     memcpy(out + pos, "#version 330 core\n", 18); pos += 18;
+#endif
     memcpy(out + pos, consts, (size_t)clen); pos += (size_t)clen;
 
     const char* p = s_frag_base;

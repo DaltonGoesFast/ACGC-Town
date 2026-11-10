@@ -31,6 +31,25 @@ typedef struct { u8 r, g, b, a; } GXColor;
 #undef glUniformMatrix3fv
 #undef glUniformMatrix4fv
 
+#ifdef PC_GLES
+#define glad_glUniform1i glUniform1i
+#define glad_glUniform2i glUniform2i
+#define glad_glUniform3i glUniform3i
+#define glad_glUniform4i glUniform4i
+#define glad_glUniform1f glUniform1f
+#define glad_glUniform2f glUniform2f
+#define glad_glUniform3f glUniform3f
+#define glad_glUniform4f glUniform4f
+#define glad_glUniform1iv glUniform1iv
+#define glad_glUniform2iv glUniform2iv
+#define glad_glUniform3iv glUniform3iv
+#define glad_glUniform4iv glUniform4iv
+#define glad_glUniform4fv glUniform4fv
+#define glad_glUniform3fv glUniform3fv
+#define glad_glUniformMatrix3fv glUniformMatrix3fv
+#define glad_glUniformMatrix4fv glUniformMatrix4fv
+#endif
+
 #define glUniform1i(...)        (pc_profiler_add_count_uniform(), glad_glUniform1i(__VA_ARGS__))
 #define glUniform2i(...)        (pc_profiler_add_count_uniform(), glad_glUniform2i(__VA_ARGS__))
 #define glUniform3i(...)        (pc_profiler_add_count_uniform(), glad_glUniform3i(__VA_ARGS__))

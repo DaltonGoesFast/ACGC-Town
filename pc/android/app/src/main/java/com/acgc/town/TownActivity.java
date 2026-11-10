@@ -5,11 +5,27 @@ import android.os.Bundle;
 import org.libsdl.app.SDLActivity;
 
 import java.io.File;
+import java.io.FileOutputStream;
+import java.io.InputStream;
 
-/** SDL2 activity. The game binary is not linked yet; libmain opens a GLES 3 context. */
+/** SDL2 activity. libmain.so is the game. Shaders are copied next to the saved disc before SDL starts. */
 public class TownActivity extends SDLActivity {
+    private void copyAsset(String name, File dest) {
+        dest.getParentFile().mkdirs();
+        try (InputStream in = getAssets().open(name);
+             FileOutputStream out = new FileOutputStream(dest)) {
+            byte[] buf = new byte[8192];
+            int n;
+            while ((n = in.read(buf)) > 0) out.write(buf, 0, n);
+        } catch (Exception ignored) {
+        }
+    }
+
     @Override
     protected void onCreate(Bundle savedInstanceState) {
+        File shaders = new File(getFilesDir(), "shaders");
+        copyAsset("default.vert", new File(shaders, "default.vert"));
+        copyAsset("default.frag", new File(shaders, "default.frag"));
         super.onCreate(savedInstanceState);
     }
 

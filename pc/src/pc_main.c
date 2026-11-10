@@ -3,6 +3,9 @@
 #define _GNU_SOURCE /* Dl_info / dladdr */
 #endif
 #include "pc_platform.h"
+#ifdef __ANDROID__
+#include <unistd.h>
+#endif
 #include "pc_guest_admit.h" /* --max-guests range */
 #include "pc_nook_house.h" /* guest Nook dialogue (M4): the rejoin hold */
 #include "pc_residence.h" /* PC_RESIDENCE_HOUSES */
@@ -261,6 +264,9 @@ void pc_platform_init(void) {
     if (g_pc_dedicated && !g_pc_headless) {
         pc_dedicated_pre_sdl_init(); /* --dedicated: dummy audio driver, selected BEFORE SDL_Init reads the driver choice */
     }
+#ifdef __ANDROID__
+    SDL_SetHint(SDL_HINT_ANDROID_BLOCK_ON_PAUSE, "1"); /* the loop waits while stopped; the GL context is kept and rebound on resume */
+#endif
     if (SDL_Init(g_pc_headless ? (SDL_INIT_TIMER | SDL_INIT_EVENTS)
                                : (SDL_INIT_VIDEO | SDL_INIT_GAMECONTROLLER | SDL_INIT_AUDIO | SDL_INIT_TIMER)) < 0) {
         fprintf(stderr, "SDL_Init failed: %s\n", SDL_GetError());
@@ -280,9 +286,15 @@ void pc_platform_init(void) {
         exit(1); /* the dummy audio driver did not open: a dedicated server must not run with a real/stalled audio device */
     }
 
+#ifdef PC_GLES
+    SDL_GL_SetAttribute(SDL_GL_CONTEXT_PROFILE_MASK, SDL_GL_CONTEXT_PROFILE_ES);
+    SDL_GL_SetAttribute(SDL_GL_CONTEXT_MAJOR_VERSION, 3);
+    SDL_GL_SetAttribute(SDL_GL_CONTEXT_MINOR_VERSION, 0);
+#else
     SDL_GL_SetAttribute(SDL_GL_CONTEXT_MAJOR_VERSION, 3);
     SDL_GL_SetAttribute(SDL_GL_CONTEXT_MINOR_VERSION, 3);
     SDL_GL_SetAttribute(SDL_GL_CONTEXT_PROFILE_MASK, SDL_GL_CONTEXT_PROFILE_CORE);
+#endif
     SDL_GL_SetAttribute(SDL_GL_DOUBLEBUFFER, 1);
     SDL_GL_SetAttribute(SDL_GL_DEPTH_SIZE, 24);
 #ifdef PC_ENHANCEMENTS
@@ -326,6 +338,9 @@ void pc_platform_init(void) {
         exit(1);
     }
 
+#ifdef PC_GLES
+    g_pc_gl_live = 1; /* GLES 3 entry points come from libGLESv3, not glad */
+#else
     if (!gladLoadGL((GLADloadfunc)SDL_GL_GetProcAddress)) {
         fprintf(stderr, "gladLoadGL failed\n");
         SDL_GL_DeleteContext(g_pc_gl_context);
@@ -334,6 +349,7 @@ void pc_platform_init(void) {
         exit(1);
     }
     g_pc_gl_live = 1;
+#endif
 
     SDL_GL_SetSwapInterval(g_pc_dedicated ? 0 : g_pc_settings.vsync); /* --dedicated: no vsync */
 
@@ -588,6 +604,14 @@ int pc_platform_poll_events(void) {
             case SDL_QUIT:
                 g_pc_running = 0;
                 return 0;
+            case SDL_APP_WILLENTERBACKGROUND:
+                /* Keep the GL context. Android may drop the surface; we rebind it on resume instead of creating a new one. */
+                break;
+            case SDL_APP_DIDENTERFOREGROUND:
+                if (g_pc_window != NULL && g_pc_gl_context != NULL) {
+                    SDL_GL_MakeCurrent(g_pc_window, g_pc_gl_context);
+                }
+                break;
             case SDL_WINDOWEVENT:
                 if (event.window.event == SDL_WINDOWEVENT_SIZE_CHANGED) {
                     pc_platform_update_window_size();
@@ -614,11 +638,11 @@ int pc_platform_poll_events(void) {
                     break;
                 }
                 /* (F3 is intentionally unbound: its old 10x speed toggle was removed.) */
-                if (event.key.keysym.sym == SDLK_ESCAPE && !event.key.repeat) {
+                if ((event.key.keysym.sym == SDLK_ESCAPE || event.key.keysym.sym == SDLK_AC_BACK) && !event.key.repeat) {
                     if (g_pc_paused) {
                         pc_pause_menu_handle_event(&event);
                     } else {
-                        pc_pause_menu_toggle();
+                        pc_pause_menu_toggle(); /* Android back opens the same menu as Esc */
                     }
                     break;
                 }
@@ -1716,6 +1740,13 @@ void pc_main_play_online_poll(void) {
 }
 
 int main(int argc, char* argv[]) {
+#ifdef __ANDROID__
+    /* SDLActivity calls this as SDL_main. The disc picker stored the image in internal storage; shaders are copied there too. */
+    {
+        const char* storage = SDL_AndroidGetInternalStoragePath();
+        if (storage != NULL && storage[0] != '\0') chdir(storage);
+    }
+#endif
     pc_relaunch_forward_capture(argc, argv); /* M-C: the whitelisted display / diagnostic options are forwarded by a Play Online relaunch */
     for (int i = 1; i < argc; i++) {
         /* pc_log: -debug*, --debug*, -debug-list, -logtime, -logfile PATH (see pc_log.h). -debug-list exits 0 and a bad value exits 2 HERE,

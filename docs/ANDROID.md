@@ -22,16 +22,32 @@ So the APK builds **armeabi-v7a only**. There is no second copy of `Save_t` and 
 
 Joining a town is the desktop Play Online screen, once the game itself is linked into this activity: `--connect` plus a town fetch, same messages. This APK does not add a packet. `touch_controls` defaults to `on` when the binary is built with `__ANDROID__`.
 
-## What the APK runs today
+## What the APK runs
 
-`libmain.so` is an SDL program that opens a GLES 3 context and clears the screen. It is the renderer path the full port will use (SDL's GL attributes request ES 3.0). It does not link `emu64` or the decomp. Desktop GL calls in `pc/src/pc_gx.c` are not GLES calls, and the game's CMake target is still the desktop one.
+`libmain.so` is the game. `pc/CMakeLists.txt` builds it for `armeabi-v7a` with `PC_GLES`. `SDL_MAIN_HANDLED` is off on Android, so the game's `main` is `SDL_main` and SDL's activity calls it. The process `chdir`s to internal storage, where the chosen disc image sits (the loader looks in `.` and `rom/`) and where `TownActivity` has copied `shaders/default.vert` and `default.frag`.
 
-`LauncherActivity` copies the chosen disc to `files/gafe01.iso` and will not put that file in the APK. `TownActivity` then starts SDL. If the file is missing, the clear stays dark red and logcat says so.
+`PC_GLES` includes `<GLES3/gl3.h>` instead of glad. The context is OpenGL ES 3.0. Shader sources that start with `#version 330 core` are rewritten to `#version 300 es` plus `precision highp float` and `precision highp int`. There is no fixed-function path in `pc_gx.c` (draws are `glDrawArrays` of triangles, textures use `GL_CLAMP_TO_EDGE`). The uniform calls go to the GLES entry points.
 
-## What is left before a phone can play
+Pause and resume: `SDL_HINT_ANDROID_BLOCK_ON_PAUSE` keeps the loop from spinning while the activity is stopped, and `SDL_APP_DIDENTERFOREGROUND` rebinds the existing GL context instead of creating a new one. The Android back key is `SDLK_AC_BACK` and opens the same menu as Esc.
 
-1. Compile `pc/CMakeLists.txt` with the NDK as `armeabi-v7a`, `TARGET_PC`, and `PC_GLES` (not added yet) so `pc_gx.c` includes `<GLES3/gl3.h>` instead of desktop GL.
-2. Replace the GL 3.3 loader (`pc/lib/glad`) on that target. GLES 3 has the entry points in the system library.
-3. Point `SDL_main` at the game's `main` and pass the private-files path as the ROM directory. Play Online is already in that `main`.
-4. Confirm `sizeof` of `Save_t` and one network message against the Linux server binary (the asserts in `abi.c` cover the ABI, not every field).
-5. Ship `arm64-v8a` only after the 64-bit port links, and only with an explicit pack or a serializer if the layouts still differ. Do not turn it on to satisfy a 64-bit-only device until that exists.
+Play Online is that same `main`. `--connect` with a guest profile that already has a name leaves the title on its own. A profile that does not exist yet stays on the title so the player can type a name.
+
+## Layout check
+
+`pc/tools/check_abi_layout.sh` compiles `pc/tools/abi_layout.c` twice and compares the `.abi_nums` section. Gradle runs it before the APK is built. A mismatch prints both rows and exits 1.
+
+The numbers that matched on this machine (linux i386 `-malign-double` and armeabi-v7a):
+
+| Field | Bytes |
+| --- | --- |
+| `sizeof(void*)`, `sizeof(long)` | 4, 4 |
+| `_Alignof(double)` | 8 |
+| `sizeof(Save_t)` | 148128 |
+| `offsetof(Save_t, homes)` | 40168 |
+| `sizeof(Private_c)`, loan offset | 9280, 144 |
+| `sizeof(mHm_hs_c)` | 9904 |
+| `sizeof(PCChatSendMsg)`, `PCChatMsg`, `PCRoomMsg` | 68, 80, 300 |
+
+## What is still open
+
+`arm64-v8a` stays out until the 64-bit port links. A device that refuses 32-bit apps cannot install this APK. The GLES path is the one the game already uses (triangles, shaders, VAOs). It has not been watched on a phone, so a missing GLES entry point would show up as a black screen or a shader log, not as a layout mismatch.
