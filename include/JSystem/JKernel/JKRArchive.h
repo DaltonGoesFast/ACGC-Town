@@ -161,6 +161,11 @@ class JKRArchive : public JKRFileLoader {
         u32 _18;              // _18
         u32 _1C;              // _1C
     };
+#ifdef PC_LOW_ADDRESS_64
+    static_assert(sizeof(SDIDirEntry) == 0x10, "SDIDirEntry is a fixed 0x10-byte on-disc RARC node");
+    static_assert(sizeof(SArcDataInfo) == 0x20, "SArcDataInfo is a fixed 0x20-byte on-disc RARC info block");
+    static_assert(sizeof(SArcHeader) == 0x20, "SArcHeader is a fixed 0x20-byte on-disc RARC header");
+#endif
 
   public:
     virtual bool becomeCurrent(const char*);               // _10

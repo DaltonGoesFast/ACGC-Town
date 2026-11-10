@@ -17,6 +17,27 @@
 #include <SDL.h>
 
 #define PC_DIAG_MAX 48
+#define PC_DIAG_RING 50
+#define PC_DIAG_LINE 180
+
+static char s_ring[PC_DIAG_RING][PC_DIAG_LINE];
+static int s_ring_pos = 0;
+static int s_ring_count = 0;
+
+static void pc_diag_remember(const char* msg) {
+    char* dst;
+    size_t n;
+    if (msg == NULL) return;
+    dst = s_ring[s_ring_pos];
+    n = 0;
+    while (msg[n] != '\0' && n + 1 < PC_DIAG_LINE) {
+        dst[n] = msg[n];
+        n++;
+    }
+    dst[n] = '\0';
+    s_ring_pos = (s_ring_pos + 1) % PC_DIAG_RING;
+    if (s_ring_count < PC_DIAG_RING) s_ring_count++;
+}
 
 static int s_session_fd = -1;
 static char s_crash_path[768];
@@ -86,10 +107,24 @@ static void pc_diag_write_crash(int fd, int sig, siginfo_t* info) {
             wr_fd(fd, slash);
             wr_fd(fd, "+");
             wr_hex(fd, bt.pc[i] - (uintptr_t)inf.dli_fbase);
+            if (inf.dli_sname != NULL) {
+                wr_fd(fd, " ");
+                wr_fd(fd, inf.dli_sname);
+            }
         } else {
             wr_hex(fd, bt.pc[i]);
         }
         wr_fd(fd, "\n");
+    }
+    if (s_ring_count > 0) {
+        int start = (s_ring_pos - s_ring_count + PC_DIAG_RING) % PC_DIAG_RING;
+        int k;
+        wr_fd(fd, "recent ACGC lines:\n");
+        for (k = 0; k < s_ring_count; k++) {
+            wr_fd(fd, "  ");
+            wr_fd(fd, s_ring[(start + k) % PC_DIAG_RING]);
+            wr_fd(fd, "\n");
+        }
     }
 }
 
@@ -243,9 +278,15 @@ void pc_diag_init(void) {
 
 void pc_diag_milestone(const char* msg) {
     if (msg == NULL) return;
+    pc_diag_remember(msg);
     __android_log_print(ANDROID_LOG_INFO, "ACGC", "%s", msg);
     fprintf(stderr, "[PC] %s\n", msg);
-    if (s_session_fd >= 0) fsync(s_session_fd);
+    if (s_session_fd >= 0) {
+        wr_fd(s_session_fd, "[PC] ");
+        wr_fd(s_session_fd, msg);
+        wr_fd(s_session_fd, "\n");
+        fsync(s_session_fd);
+    }
 }
 
 void pc_diag_fail_box(const char* title, const char* msg) {

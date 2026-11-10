@@ -52,6 +52,7 @@ struct ResTIMG {
     s16 mLODBias;                   // _1A
     u32 mImageDataOffset;           // _1C
 };
+static_assert(sizeof(ResTIMG) == 0x20, "ResTIMG is a fixed 0x20-byte on-disc BTI header");
 
 struct ResTIMGPair {
     ResTIMG _00;

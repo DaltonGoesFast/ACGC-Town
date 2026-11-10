@@ -19,6 +19,9 @@
 #ifdef TARGET_PC
 #include "pc_bswap.h"
 #include "pc_lowaddr.h"
+#include "pc_crash.h"
+#include <stdio.h>
+#include <string.h>
 
 /* Font buffer loaded from DOL at runtime (replaces .s file's .incbin) */
 __attribute__((aligned(32)))
@@ -80,6 +83,49 @@ extern void pc_load_asset(const char*, void*, unsigned int, unsigned int, int, i
 void _pc_load_JUTResFONT_Ascfont_fix12(void) {
     pc_load_asset(NULL, (void*)&JUTResFONT_Ascfont_fix12, 0x4160, 0x0A8260, 1 /* SRC_DOL */, 0 /* SWAP_NONE */);
     bswap_bfn1((u8*)&JUTResFONT_Ascfont_fix12, 0x4160);
+}
+
+/* A stub disc has no DOL, so the system font buffer stays zero and JUTResFont
+ * never sees an INF1 block. A native-endian BFN1 lets that parser run. */
+void pc_install_stub_font(void) {
+    u8* d = JUTResFONT_Ascfont_fix12;
+    u8* p;
+    if (*(u32*)(d + 0x0C) != 0) return;
+    memset(d, 0, 0x80);
+    *(u32*)(d + 0x00) = 0x52464E54u; /* RFNT */
+    *(u32*)(d + 0x08) = 0x78;
+    *(u32*)(d + 0x0C) = 4;
+    p = d + 0x20;
+    *(u32*)(p + 0x00) = 0x494E4631u; /* INF1 */
+    *(u32*)(p + 0x04) = 0x14;
+    *(u16*)(p + 0x08) = 0;
+    *(u16*)(p + 0x0A) = 12;
+    *(u16*)(p + 0x0C) = 2;
+    *(u16*)(p + 0x0E) = 8;
+    p += 0x14;
+    *(u32*)(p + 0x00) = 0x57494431u; /* WID1 */
+    *(u32*)(p + 0x04) = 0x10;
+    *(u16*)(p + 0x08) = 0x20;
+    *(u16*)(p + 0x0A) = 0x7E;
+    p += 0x10;
+    *(u32*)(p + 0x00) = 0x4D415031u; /* MAP1 */
+    *(u32*)(p + 0x04) = 0x14;
+    *(u16*)(p + 0x08) = 0;
+    *(u16*)(p + 0x0A) = 0x20;
+    *(u16*)(p + 0x0C) = 0x20;
+    *(u16*)(p + 0x0E) = 1;
+    p += 0x14;
+    *(u32*)(p + 0x00) = 0x474C5931u; /* GLY1 */
+    *(u32*)(p + 0x04) = 0x20;
+    *(u16*)(p + 0x08) = 0x20;
+    *(u16*)(p + 0x0A) = 0x20;
+    *(u16*)(p + 0x0C) = 1;
+    *(u16*)(p + 0x0E) = 1;
+    *(u16*)(p + 0x14) = 0;
+    *(u16*)(p + 0x16) = 1;
+    *(u16*)(p + 0x18) = 1;
+    *(u16*)(p + 0x1A) = 1;
+    *(u16*)(p + 0x1C) = 1;
 }
 }
 #endif /* TARGET_PC */
@@ -159,6 +205,13 @@ void JFWSystem::init() {
     JUTAssertion::create();
     JUTException::create(directPrint);
     systemFont = new JUTResFont(CSetUpParam::systemFontRes, nullptr);
+#ifdef TARGET_PC
+    {
+        char msg[64];
+        snprintf(msg, sizeof(msg), "boot: system font width %d", systemFont != nullptr ? systemFont->getWidth() : -1);
+        pc_diag_milestone(msg);
+    }
+#endif
     debugPrint = JUTDbPrint::start(nullptr, nullptr);
     debugPrint->changeFont(systemFont);
     systemConsoleManager = JUTConsoleManager::createManager(nullptr);

@@ -2969,7 +2969,11 @@ int main(int argc, char* argv[]) {
 #ifdef __ANDROID__
     if (s_boot_test) {
         extern int boot_main(int argc, const char** argv);
+        extern void pc_install_stub_font(void);
         int rc;
+        pc_install_stub_font();
+        pc_disc_init();
+        pc_diag_milestone(pc_disc_is_open() ? "boot test: disc open" : "boot test: disc closed");
         pc_diag_milestone("boot test: boot_main");
         rc = boot_main(argc, (const char**)argv);
         pc_diag_milestone("boot test: boot_main returned");
