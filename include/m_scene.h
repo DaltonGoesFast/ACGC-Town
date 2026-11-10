@@ -191,29 +191,36 @@ JA_LAYOUT_OFF(Scene_Word_Data_FieldCt_c, draw_type, 0x7);
 JA_LAYOUT_SIZE(Scene_Word_Data_ArrangeFurniture_ct_c, 0x2);
 JA_LAYOUT_SIZE(Scene_Word_u, 0x8);
 
+#ifdef PC_GBI_INTERN
+unsigned int pc_gbi_intern(uintptr_t addr);
+#define mSc_PTR_WORD(p) pc_gbi_intern((uintptr_t)(p))
+#else
+#define mSc_PTR_WORD(p) ((u32)(p))
+#endif
+
 #define mSc_DATA_PLAYER(actor_data_p)                               \
     {                                                               \
-        mSc_SCENE_DATA_TYPE_PLAYER_PTR, 1, 0, 0, (u32)actor_data_p, \
+        mSc_SCENE_DATA_TYPE_PLAYER_PTR, 1, 0, 0, mSc_PTR_WORD(actor_data_p), \
     }
 
 #define mSc_DATA_CTRL_ACTORS(n_actors, ctrl_actor_list_p)                           \
     {                                                                               \
-        mSc_SCENE_DATA_TYPE_CTRL_ACTOR_PTR, n_actors, 0, 0, (u32)ctrl_actor_list_p, \
+        mSc_SCENE_DATA_TYPE_CTRL_ACTOR_PTR, n_actors, 0, 0, mSc_PTR_WORD(ctrl_actor_list_p), \
     }
 
 #define mSc_DATA_ACTORS(n_actors, actor_data_p)                           \
     {                                                                     \
-        mSc_SCENE_DATA_TYPE_ACTOR_PTR, n_actors, 0, 0, (u32)actor_data_p, \
+        mSc_SCENE_DATA_TYPE_ACTOR_PTR, n_actors, 0, 0, mSc_PTR_WORD(actor_data_p), \
     }
 
 #define mSc_DATA_OBJ_BANK(n_banks, bank_list_p)                                        \
     {                                                                                  \
-        mSc_SCENE_DATA_TYPE_OBJECT_EXCHANGE_BANK_PTR, n_banks, 0, 0, (u32)bank_list_p, \
+        mSc_SCENE_DATA_TYPE_OBJECT_EXCHANGE_BANK_PTR, n_banks, 0, 0, mSc_PTR_WORD(bank_list_p), \
     }
 
 #define mSc_DATA_DOOR_DATA(n_doors, door_data_list_p)                            \
     {                                                                            \
-        mSc_SCENE_DATA_TYPE_DOOR_DATA_PTR, n_doors, 0, 0, (u32)door_data_list_p, \
+        mSc_SCENE_DATA_TYPE_DOOR_DATA_PTR, n_doors, 0, 0, mSc_PTR_WORD(door_data_list_p), \
     }
 
 #define mSc_DATA_FIELDCT(item_type, bg_num, bg_disp_size, room_type, draw_type)                  \

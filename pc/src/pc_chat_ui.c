@@ -99,6 +99,14 @@ static void chat_close(int sent) {
     printf("[CHAT] input closed (%s)\n", sent ? "sent" : "cancelled");
 }
 
+static void chat_open(SDL_Keycode opener);
+
+void pc_chat_touch_open(void) {
+    chat_init_once();
+    if (s_typing || !pc_chat_can_open()) return;
+    chat_open(0);
+}
+
 static void chat_open(SDL_Keycode opener) {
     s_typing = 1;
     s_len = 0;

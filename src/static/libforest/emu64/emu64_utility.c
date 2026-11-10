@@ -14,10 +14,19 @@ extern "C" unsigned int pc_image_base;
 extern "C" unsigned int pc_image_end;
 extern "C" uintptr_t pc_gbi_unpack_runtime_ptr(unsigned int packed);
 
+#ifdef PC_GBI_INTERN
+extern "C" int pc_gbi_is_token(unsigned int packed);
+extern "C" uintptr_t pc_gbi_resolve(unsigned int packed);
+uintptr_t emu64::seg2k0(u32 segadr) {
+    if (pc_gbi_is_token(segadr)) {
+        return pc_gbi_resolve(segadr);
+    }
+#else
 u32 emu64::seg2k0(u32 segadr) {
+#endif
     uintptr_t odd_ptr = pc_gbi_unpack_runtime_ptr(segadr);
     if (odd_ptr != 0) {
-        return (u32)odd_ptr;
+        return (uintptr_t)odd_ptr;
     }
 
     /* Runtime GBI macros tag direct PC pointers in bit 0. Segment references
@@ -40,6 +49,12 @@ u32 emu64::seg2k0(u32 segadr) {
     u32 seg = (segadr >> 24) & 0xF;
     u32 offset = segadr & 0xFFFFFF;
 
+#ifdef PC_GBI_INTERN
+    if (pc_gbi_is_token(this->segments[seg])) {
+        this->resolved_addresses++;
+        return pc_gbi_resolve(this->segments[seg]) + offset;
+    }
+#endif
     u32 base = this->segments[seg] & ~1u;
 
     if (base == 0) {

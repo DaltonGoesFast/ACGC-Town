@@ -20,9 +20,22 @@ PCSettings g_pc_settings = {
     .borderless_acres = 1,
     .fast_text = 1,
     .show_acre = 1,
+#ifdef __ANDROID__
+    .touch_controls = 1,
+#else
     .touch_controls = -1,
+#endif
+    .touch_run = 1,
+    .touch_camera = 1,
+    .touch_menus = 1,
+    .touch_keyboard = 1,
     .nes_aspect = 1,
     .master_volume = 100,
+#ifdef __ANDROID__
+    .audio = 0,
+#else
+    .audio = 1,
+#endif
     .stick_deadzone = 12,
     .cstick_deadzone = 12,
     .max_guests = 4,
@@ -101,8 +114,19 @@ static const char* DEFAULT_SETTINGS =
     "# Outdoor acre label under the clock (A1 Grass, and so on): 0 = off, 1 = on (local HUD only)\n"
     "show_acre = 1\n"
     "\n"
+#ifdef __ANDROID__
+    "# Touch overlay: on for Android. auto / on / off. auto is on only when a touchscreen is present\n"
+    "touch_controls = on\n"
+#else
     "# Touch overlay (tap or click to walk, on-screen A / B / Tool / Emote): auto, on, or off. auto is on only when a touchscreen is present\n"
     "touch_controls = auto\n"
+#endif
+    "\n"
+    "# While touch_controls is on: 1 = a long drag runs, two fingers move the camera, a short tap confirms menus and text, Chat opens the keyboard\n"
+    "touch_run = 1\n"
+    "touch_camera = 1\n"
+    "touch_menus = 1\n"
+    "touch_keyboard = 1\n"
     "\n"
     "# NES emulator aspect ratio: 0 = stretch to fullscreen, 1 = 4:3 pillarbox\n"
     "nes_aspect = 1\n"
@@ -125,6 +149,15 @@ static const char* DEFAULT_SETTINGS =
     "[Audio]\n"
     "# Master output volume as a percentage (0-100)\n"
     "master_volume = 100\n"
+    "\n"
+#ifdef __ANDROID__
+    "# 1 = open the audio device and run the audio thread, 0 = silent. Android starts at 0.\n"
+    "audio = 0\n"
+#else
+    "# 1 = open the audio device and run the audio thread (default), 0 = silent\n"
+    "audio = 1\n"
+#endif
+    "\n"
     "\n"
     "[Input]\n"
     "# Gamepad stick deadzones as a percentage (0-40)\n"
@@ -229,6 +262,14 @@ static void apply_setting(const char* key, const char* value) {
         if (strcmp(value, "on") == 0 || strcmp(value, "1") == 0) g_pc_settings.touch_controls = 1;
         else if (strcmp(value, "off") == 0 || strcmp(value, "0") == 0) g_pc_settings.touch_controls = 0;
         else if (strcmp(value, "auto") == 0 || strcmp(value, "-1") == 0) g_pc_settings.touch_controls = -1;
+    } else if (strcmp(key, "touch_run") == 0) {
+        if (val == 0 || val == 1) g_pc_settings.touch_run = val;
+    } else if (strcmp(key, "touch_camera") == 0) {
+        if (val == 0 || val == 1) g_pc_settings.touch_camera = val;
+    } else if (strcmp(key, "touch_menus") == 0) {
+        if (val == 0 || val == 1) g_pc_settings.touch_menus = val;
+    } else if (strcmp(key, "touch_keyboard") == 0) {
+        if (val == 0 || val == 1) g_pc_settings.touch_keyboard = val;
     } else if (strcmp(key, "emotes") == 0) {
         if (val == 0 || val == 1) g_pc_settings.emotes = val;
     } else if (strcmp(key, "handover_anim") == 0) {
@@ -245,6 +286,8 @@ static void apply_setting(const char* key, const char* value) {
         if (val == 0 || val == 1) g_pc_settings.nes_aspect = val;
     } else if (strcmp(key, "master_volume") == 0) {
         if (val >= 0 && val <= 100) g_pc_settings.master_volume = val;
+    } else if (strcmp(key, "audio") == 0) {
+        if (val == 0 || val == 1) g_pc_settings.audio = val;
     } else if (strcmp(key, "stick_deadzone") == 0) {
         if (val >= 0 && val <= 40) g_pc_settings.stick_deadzone = val;
     } else if (strcmp(key, "cstick_deadzone") == 0) {
@@ -380,6 +423,12 @@ void pc_settings_save(void) {
     fprintf(f, "# Touch overlay (tap or click to walk, on-screen A / B / Tool / Emote): auto, on, or off. auto is on only when a touchscreen is present\n");
     fprintf(f, "touch_controls = %s\n", g_pc_settings.touch_controls < 0 ? "auto" : g_pc_settings.touch_controls ? "on" : "off");
     fprintf(f, "\n");
+    fprintf(f, "# While touch_controls is on: 1 = a long drag runs, two fingers move the camera, a short tap confirms menus and text, Chat opens the keyboard\n");
+    fprintf(f, "touch_run = %d\n", g_pc_settings.touch_run);
+    fprintf(f, "touch_camera = %d\n", g_pc_settings.touch_camera);
+    fprintf(f, "touch_menus = %d\n", g_pc_settings.touch_menus);
+    fprintf(f, "touch_keyboard = %d\n", g_pc_settings.touch_keyboard);
+    fprintf(f, "\n");
     fprintf(f, "# NES emulator aspect ratio: 0 = stretch to fullscreen, 1 = 4:3 pillarbox\n");
     fprintf(f, "nes_aspect = %d\n", g_pc_settings.nes_aspect);
     fprintf(f, "\n");
@@ -401,6 +450,9 @@ void pc_settings_save(void) {
     fprintf(f, "[Audio]\n");
     fprintf(f, "# Master output volume as a percentage (0-100)\n");
     fprintf(f, "master_volume = %d\n", g_pc_settings.master_volume);
+    fprintf(f, "\n");
+    fprintf(f, "# 1 = open the audio device and run the audio thread, 0 = silent\n");
+    fprintf(f, "audio = %d\n", g_pc_settings.audio);
     fprintf(f, "\n");
     fprintf(f, "[Input]\n");
     fprintf(f, "# Gamepad stick deadzones as a percentage (0-40)\n");

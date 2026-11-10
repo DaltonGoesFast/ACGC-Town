@@ -288,8 +288,8 @@ int graph_dt_frame_phase(struct game_s* game, int period_frames);
 
 #define GRAPH_ALLOC(graph, size)                        \
     ((void*)((graph)->polygon_opaque_thaga.tha.tail_p = \
-                 (char*)((int)(graph)->polygon_opaque_thaga.tha.tail_p - (int)(size))))
-#define GRAPH_ALLOC_TYPE(graph, type, num) (GRAPH_ALLOC(graph, sizeof(type) * (num)))
+                 (char*)(graph)->polygon_opaque_thaga.tha.tail_p - (size)))
+#define GRAPH_ALLOC_TYPE(graph, type, num) ((type*)GRAPH_ALLOC(graph, sizeof(type) * (num)))
 
 #if VERSION != VER_GAFU01_00
 extern u8 SoftResetEnable;

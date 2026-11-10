@@ -162,6 +162,7 @@ int  pc_chat_handle_event(const union SDL_Event* e); /* pc_main.c event loop: 1 
 int  pc_chat_pad_block(void);                       /* pc_pad.c PADRead: 1 = zero the local pad (typing, or the Enter / Esc that closed it still held) */
 int  pc_chat_typing(void);
 int  pc_chat_can_open(void);                        /* free play: a field / room, no menu, message, demo, pause, wheel or text field */
+void pc_chat_touch_open(void);                      /* the on-screen Chat button: SDL_StartTextInput, same line as the T key */
 void pc_chat_draw(struct game_s* game);             /* graph.c, after the PC menus: bubbles + log + the input line */
 /* text typed by the local player (UTF-8): converted, then sent through the real path (pc_net_game_chat_send). 1 = sent. */
 int  pc_chat_submit_utf8(const char* utf8);

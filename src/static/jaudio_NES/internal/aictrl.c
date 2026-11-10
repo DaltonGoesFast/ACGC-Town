@@ -10,6 +10,7 @@
 #include "dolphin/ai.h"
 #ifdef TARGET_PC
 #include "pc_lowaddr.h"
+#include "pc_crash.h"
 #endif
 
 typedef void (*DACCallback)(s16*, s32);
@@ -65,6 +66,7 @@ extern void Jac_Init(void) {
     AIInit(nullptr);
 #ifdef TARGET_PC
     AIInitDMA(PC_PTR32("AIInitDMA dac buffer", dac[2]), DAC_SIZE * 2);
+    pc_diag_milestone("AIInitDMA ok");
 #else
     AIInitDMA((u32)dac[2], DAC_SIZE * 2);
 #endif

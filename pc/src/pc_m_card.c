@@ -25,6 +25,7 @@
 #include "sys_math.h"
 #include "zurumode.h"
 #include "pc_save_bswap.h"
+#include "pc_save_wire.h"
 #include "pc_settings.h"
 #include "m_cockroach.h"
 #include "m_all_grow_ovl.h"
@@ -485,7 +486,7 @@ static int pc_save_write_gci_to(const char* gci_path, const char* tmp_path) {
 
     /* Main Save_t (offset 0x26000) */
     save_copy = (Save_t*)(file_data + GCI_SAVE_MAIN_OFFSET);
-    memcpy(save_copy, &common_data.save.save, sizeof(Save_t));
+    pc_save_wire_store(&common_data.save.save, save_copy);
 
     pc_save_bswap(save_copy, PC_BSWAP_TO_BE);
     {
@@ -810,7 +811,7 @@ static int pc_save_read_gci(const char* path) {
     save_src = (Save_t*)(file_data + GCI_SAVE_MAIN_OFFSET);
     pc_save_bswap_verify_roundtrip((const u8*)save_src, sizeof(Save_t));
 
-    memcpy(&common_data.save.save, save_src, sizeof(Save_t));
+    pc_save_wire_load(save_src, &common_data.save.save);
     pc_save_bswap(&common_data.save.save, PC_BSWAP_FROM_BE);
     pc_board_repair_zeroed_posts(common_data.save.save.noticeboard, mNtc_BOARD_POST_COUNT); /* only ever touches an all-zero post (never a legitimate one) */
 
@@ -893,14 +894,14 @@ static int pc_save_read_gci_to_keep(const char* path) {
 
     /* Load Save_t into l_keepSave (try main, fall back to backup) */
     save_src = (Save_t*)(file_data + GCI_SAVE_MAIN_OFFSET);
-    memcpy(&l_keepSave.save, save_src, sizeof(Save_t));
+    pc_save_wire_load(save_src, &l_keepSave.save);
     pc_save_bswap(&l_keepSave.save, PC_BSWAP_FROM_BE);
 
     /* Validate — if main is corrupt, try backup */
     if (!mLd_CheckId(l_keepSave.save.land_info.id)) {
         OSReport("[PC] Card B: main save invalid, trying backup\n");
         save_src = (Save_t*)(file_data + GCI_SAVE_BACK_OFFSET);
-        memcpy(&l_keepSave.save, save_src, sizeof(Save_t));
+        pc_save_wire_load(save_src, &l_keepSave.save);
         pc_save_bswap(&l_keepSave.save, PC_BSWAP_FROM_BE);
         if (!mLd_CheckId(l_keepSave.save.land_info.id)) {
             OSReport("[PC] Card B: backup save also invalid\n");
@@ -2507,6 +2508,14 @@ int pc_guest_title_item_visible(void) {
     return pc_net_game_role() == PC_NETGAME_ROLE_CLIENT;
 }
 
+/* 1 when --connect already has a guest profile with a name (save/mp/guest.ini or the selected profile). A missing file is a new player. */
+int pc_guest_title_saved_name(void) {
+    PCGuestProfile gp;
+    char perr[256];
+    if (pc_guest_profile_read_selected(&gp, perr, sizeof(perr)) != PC_GUEST_PROFILE_LOADED) return 0;
+    return gp.name[0] != '\0';
+}
+
 const char* pc_guest_title_label(void) {
     if (!s_pc_guest_title_label_done) {
         PCGuestProfile gp;
@@ -3183,7 +3192,7 @@ static int pc_read_gci_land_info(const char* path, Save_t* out) {
         if (file_data) {
             if (fread(file_data, GCI_FILE_DATA_SIZE, 1, fp) == 1) {
                 Save_t* save_src = (Save_t*)(file_data + GCI_SAVE_MAIN_OFFSET);
-                memcpy(out, save_src, sizeof(Save_t));
+                pc_save_wire_load(save_src, out);
                 pc_save_bswap(out, PC_BSWAP_FROM_BE);
                 ok = TRUE;
             }
@@ -3223,7 +3232,7 @@ int pc_save_validate_gci_buffer(const unsigned char* buf, size_t len, PCTownId* 
     if (sv == NULL) {
         return FALSE;
     }
-    memcpy(sv, buf + GCI_HEADER_SIZE + GCI_SAVE_MAIN_OFFSET, sizeof(Save_t));
+    pc_save_wire_load(buf + GCI_HEADER_SIZE + GCI_SAVE_MAIN_OFFSET, sv);
     pc_save_bswap(sv, PC_BSWAP_FROM_BE);
     memset(town, 0, sizeof(*town));
     memcpy(town->land_name, sv->land_info.name, 8);

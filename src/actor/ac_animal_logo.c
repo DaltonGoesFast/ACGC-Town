@@ -406,6 +406,22 @@ static void aAL_pc_game_start_wait(ANIMAL_LOGO_ACTOR* actor, GAME* game) {
     return;
   }
 
+  /* --connect with a guest profile already on disk used to wait here until the player
+   * picked "Join as Guest (NAME)". Arrive once the title is ready. A missing profile
+   * stays on this menu (the name is chosen there, or in Play Online's new-character prompt). */
+  if (!s_aAL_pc_guest_joining && pc_guest_title_item_visible()) {
+    extern int pc_guest_title_saved_name(void);
+    extern int pc_guest_title_join(void);
+    static int s_auto_tried = 0;
+    if (!s_auto_tried && pc_guest_title_saved_name() &&
+        mLd_CheckStartFlag() == TRUE && aAL_wipe_end_check(game) == TRUE && mTD_tdemo_button_ok_check()) {
+      s_auto_tried = 1;
+      if (pc_guest_title_join()) {
+        s_aAL_pc_guest_joining = 1;
+      }
+    }
+  }
+
   /* Debounce */
   if (actor->pc_cursor_cooldown > 0.0f) {
     actor->pc_cursor_cooldown -= dt;

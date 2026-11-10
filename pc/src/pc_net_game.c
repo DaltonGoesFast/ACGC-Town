@@ -262,6 +262,9 @@ static void pcnetgame_server_init_members(void); /* first launch of a dedicated 
 #include <stddef.h> /* offsetof() */
 #include <stdio.h>
 #include <stdlib.h>
+#ifndef _WIN32
+#include <unistd.h>
+#endif
 #include <string.h>
 #include <time.h>
 #include <sys/stat.h> /* M-B: stat() in the town fetch fallback */
@@ -21577,6 +21580,8 @@ static void pcnetgame_ts_build_event(uint8_t* blob) {
     uint8_t* p;
     int i;
     memset(blob, 0, PC_NETGAME_TS_EVENT_LEN);
+    _Static_assert(sizeof(mEv_special_c) == 84 && sizeof(mEv_weekly_u) == 100, "event packet is the 32-bit server layout");
+    _Static_assert(offsetof(Save_t, event_save_data) == 0x20498, "event state moved in Save_t");
     memcpy(blob + PCNG_EV_OFF_SPECIAL, &Save_Get(event_save_data).special, sizeof(mEv_special_c));
     memcpy(blob + PCNG_EV_OFF_WEEKLY, &Save_Get(event_save_data).weekly, sizeof(mEv_weekly_u));
     p = blob + PCNG_EV_OFF_CORE;
@@ -24402,8 +24407,8 @@ static int pcnetgame_txn_apply_dresser(const PCNetGameClientTxn* T, const PCNetG
 
 /* ===== RESTOCK HOST BEGIN: the restock timer, its restart-resume file (save/mp/shop_restock.ini) and the catalog regeneration ===== */
 static uint64_t pcnetgame_restock_wall_ms(void) {
-#if defined(_WIN32)
-    /* MinGW's msvcrt declares timespec_get and does not provide it. The restock file only needs a wall clock. */
+#if defined(_WIN32) || defined(__ANDROID__)
+    /* MinGW's msvcrt and older Android libc do not provide timespec_get. The restock file only needs a wall clock. */
     time_t now = time(NULL);
     return now == (time_t)-1 ? 0 : (uint64_t)now * 1000u;
 #else

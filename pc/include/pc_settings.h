@@ -19,9 +19,14 @@ typedef struct {
     int borderless_acres; /* 0=original acre transitions (faster, draws less), 1=continuous camera/movement */
     int fast_text;        /* 0=normal (B latches the fast reveal for the rest of the message), 1=dialogue is always on the fast reveal. Local presentation only */
     int show_acre;        /* 0=off, 1=draw the outdoor acre (A1, Grass, ...) under the clock. Local HUD only */
-    int touch_controls;   /* -1 = auto (on when SDL has a touch device), 0 = off, 1 = on. Local pad overlay only */
+    int touch_controls;   /* -1 = auto (on when SDL has a touch device), 0 = off, 1 = on. Local pad overlay only. Android builds default this to on. */
+    int touch_run;        /* 1 = a long drag holds B (run) while walking toward the point */
+    int touch_camera;     /* 1 = two fingers drag the C-stick (camera). Pinch is the same drag. */
+    int touch_menus;      /* 1 = a short tap advances dialogue and confirms the highlighted menu row */
+    int touch_keyboard;   /* 1 = the Chat button opens the line and SDL's on-screen keyboard */
     int nes_aspect;       /* NES emulator aspect: 0=fullscreen stretch, 1=4:3 pillarbox (default) */
     int master_volume;    /* Applied at the PC audio output, 0-100 (default 100) */
+    int audio;            /* 1 = start the audio device and producer thread (default on PC). 0 = silent. Android defaults to 0 so a bad audio thread does not close the game. */
     int stick_deadzone;   /* Gamepad main stick deadzone, percent 0-40 (default 12) */
     int cstick_deadzone;  /* Gamepad C-stick deadzone, percent 0-40 (default 12) */
     int max_guests;       /* HOST only (G4): most guests (foreigners, never residents) bound at once, 1..254 (pc_guest_admit_limit(); default 4); malformed / out of range = ignored */

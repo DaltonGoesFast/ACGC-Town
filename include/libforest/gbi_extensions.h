@@ -11,6 +11,13 @@ extern "C" {
 
 #ifndef _GBI_STATIC_PTR
 #ifdef TARGET_PC
+#ifdef PC_GBI_INTERN
+unsigned int pc_gbi_intern(uintptr_t addr);
+#define _GBI_STATIC_PTR(s) pc_gbi_intern((uintptr_t)(s))
+#define _GBI_IS_RUNTIME_PTR_EXPR(s) (__builtin_classify_type(s) == 5 || __builtin_classify_type(s) == 14)
+#define _GBI_RUNTIME_PTR(s) \
+    (_GBI_IS_RUNTIME_PTR_EXPR(s) ? pc_gbi_intern((uintptr_t)(s)) : (unsigned int)(uintptr_t)(s))
+#else
 #ifndef _GBI_STATIC_ASSERT
 #ifdef __cplusplus
 #define _GBI_STATIC_ASSERT(cond, msg) static_assert(cond, msg)
@@ -33,6 +40,7 @@ uintptr_t pc_gbi_unpack_runtime_ptr(unsigned int packed);
 #define _GBI_IS_RUNTIME_PTR_EXPR(s) (__builtin_classify_type(s) == 5 || __builtin_classify_type(s) == 14)
 #define _GBI_RUNTIME_PTR(s) \
     pc_gbi_pack_runtime_ptr((uintptr_t)(s), _GBI_IS_RUNTIME_PTR_EXPR(s), #s, __FILE__, __LINE__)
+#endif /* PC_GBI_INTERN */
 #else
 #define _GBI_STATIC_PTR(s) (unsigned int)(s)
 #define _GBI_RUNTIME_PTR(s) (unsigned int)(s)

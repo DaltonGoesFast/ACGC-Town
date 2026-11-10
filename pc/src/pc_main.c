@@ -3,6 +3,14 @@
 #define _GNU_SOURCE /* Dl_info / dladdr */
 #endif
 #include "pc_platform.h"
+#ifdef __ANDROID__
+#include <unistd.h>
+#include "pc_lowheap.h"
+#include "pc_crash.h"
+#include "pc_lowaddr.h"
+static int pc_game_main(int argc, char** argv);
+static int s_boot_test = 0;
+#endif
 #include "pc_guest_admit.h" /* --max-guests range */
 #include "pc_nook_house.h" /* guest Nook dialogue (M4): the rejoin hold */
 #include "pc_residence.h" /* PC_RESIDENCE_HOUSES */
@@ -12,6 +20,7 @@
 #include "pc_settings.h"
 #include "pc_keybindings.h"
 #include "pc_assets.h"
+#include "pc_crash.h"
 #include "pc_disc.h"
 #include "pc_typing.h"
 #include "pc_chat.h" /* chat (worker CH): the chat line owns the keyboard while it is open */
@@ -261,11 +270,17 @@ void pc_platform_init(void) {
     if (g_pc_dedicated && !g_pc_headless) {
         pc_dedicated_pre_sdl_init(); /* --dedicated: dummy audio driver, selected BEFORE SDL_Init reads the driver choice */
     }
+#ifdef __ANDROID__
+    SDL_SetHint(SDL_HINT_ANDROID_BLOCK_ON_PAUSE, "1"); /* the loop waits while stopped; the GL context is kept and rebound on resume */
+#endif
     if (SDL_Init(g_pc_headless ? (SDL_INIT_TIMER | SDL_INIT_EVENTS)
                                : (SDL_INIT_VIDEO | SDL_INIT_GAMECONTROLLER | SDL_INIT_AUDIO | SDL_INIT_TIMER)) < 0) {
-        fprintf(stderr, "SDL_Init failed: %s\n", SDL_GetError());
+        char msg[256];
+        snprintf(msg, sizeof(msg), "SDL_Init failed: %s", SDL_GetError());
+        pc_diag_fail_box("ACGC Town", msg);
         exit(1);
     }
+    pc_diag_milestone("SDL_Init ok");
     if (g_pc_headless) {
         g_pc_gl_live = 0;
         g_pc_window_w = PC_SCREEN_WIDTH;
@@ -280,11 +295,30 @@ void pc_platform_init(void) {
         exit(1); /* the dummy audio driver did not open: a dedicated server must not run with a real/stalled audio device */
     }
 
+#ifdef PC_GLES
+    SDL_GL_SetAttribute(SDL_GL_CONTEXT_PROFILE_MASK, SDL_GL_CONTEXT_PROFILE_ES);
+    SDL_GL_SetAttribute(SDL_GL_CONTEXT_MAJOR_VERSION, 3);
+    SDL_GL_SetAttribute(SDL_GL_CONTEXT_MINOR_VERSION, 0);
+#ifdef __ANDROID__
+    /* Default settings ask for 4x MSAA and the desktop path asks for 24-bit depth.
+     * Many Android EGL configs, including the emulator, match neither and CreateWindow fails. */
+    g_pc_settings.msaa = 0;
+    SDL_GL_SetAttribute(SDL_GL_RED_SIZE, 8);
+    SDL_GL_SetAttribute(SDL_GL_GREEN_SIZE, 8);
+    SDL_GL_SetAttribute(SDL_GL_BLUE_SIZE, 8);
+    SDL_GL_SetAttribute(SDL_GL_ALPHA_SIZE, 0);
+    SDL_GL_SetAttribute(SDL_GL_DEPTH_SIZE, 16);
+    SDL_GL_SetAttribute(SDL_GL_STENCIL_SIZE, 0);
+#endif
+#else
     SDL_GL_SetAttribute(SDL_GL_CONTEXT_MAJOR_VERSION, 3);
     SDL_GL_SetAttribute(SDL_GL_CONTEXT_MINOR_VERSION, 3);
     SDL_GL_SetAttribute(SDL_GL_CONTEXT_PROFILE_MASK, SDL_GL_CONTEXT_PROFILE_CORE);
+#endif
     SDL_GL_SetAttribute(SDL_GL_DOUBLEBUFFER, 1);
+#ifndef __ANDROID__
     SDL_GL_SetAttribute(SDL_GL_DEPTH_SIZE, 24);
+#endif
 #ifdef PC_ENHANCEMENTS
     if (g_pc_settings.msaa > 0) {
         SDL_GL_SetAttribute(SDL_GL_MULTISAMPLEBUFFERS, 1);
@@ -311,29 +345,52 @@ void pc_platform_init(void) {
             win_pos, win_pos,
             win_w, win_h, flags
         );
+#ifdef __ANDROID__
+        if (!g_pc_window) {
+            pc_diag_milestone(SDL_GetError());
+            SDL_GL_SetAttribute(SDL_GL_RED_SIZE, 5);
+            SDL_GL_SetAttribute(SDL_GL_GREEN_SIZE, 6);
+            SDL_GL_SetAttribute(SDL_GL_BLUE_SIZE, 5);
+            SDL_GL_SetAttribute(SDL_GL_DEPTH_SIZE, 0);
+            g_pc_window = SDL_CreateWindow(
+                PC_WINDOW_TITLE,
+                win_pos, win_pos,
+                win_w, win_h, flags
+            );
+        }
+#endif
     }
     if (!g_pc_window) {
-        fprintf(stderr, "SDL_CreateWindow failed: %s\n", SDL_GetError());
+        char msg[256];
+        snprintf(msg, sizeof(msg), "SDL_CreateWindow failed: %s", SDL_GetError());
+        pc_diag_fail_box("ACGC Town", msg);
         SDL_Quit();
         exit(1);
     }
 
     g_pc_gl_context = SDL_GL_CreateContext(g_pc_window);
     if (!g_pc_gl_context) {
-        fprintf(stderr, "SDL_GL_CreateContext failed: %s\n", SDL_GetError());
+        char msg[320];
+        snprintf(msg, sizeof(msg), "OpenGL ES context failed: %s", SDL_GetError());
+        pc_diag_fail_box("ACGC Town", msg);
         SDL_DestroyWindow(g_pc_window);
         SDL_Quit();
         exit(1);
     }
+    pc_diag_milestone("GL context ok");
 
+#ifdef PC_GLES
+    g_pc_gl_live = 1; /* GLES 3 entry points come from libGLESv3, not glad */
+#else
     if (!gladLoadGL((GLADloadfunc)SDL_GL_GetProcAddress)) {
-        fprintf(stderr, "gladLoadGL failed\n");
+        pc_diag_fail_box("ACGC Town", "gladLoadGL failed");
         SDL_GL_DeleteContext(g_pc_gl_context);
         SDL_DestroyWindow(g_pc_window);
         SDL_Quit();
         exit(1);
     }
     g_pc_gl_live = 1;
+#endif
 
     SDL_GL_SetSwapInterval(g_pc_dedicated ? 0 : g_pc_settings.vsync); /* --dedicated: no vsync */
 
@@ -341,7 +398,9 @@ void pc_platform_init(void) {
 
 #ifdef PC_ENHANCEMENTS
     if (g_pc_settings.msaa > 0) {
+#ifndef PC_GLES
         glEnable(GL_MULTISAMPLE);
+#endif
     }
 #endif
 
@@ -467,6 +526,11 @@ static void pc_test_frame_dump(void) {
 #endif
 
 void pc_platform_swap_buffers(void) {
+    static int s_first_frame = 0;
+    if (!s_first_frame) {
+        s_first_frame = 1;
+        pc_diag_milestone("first frame");
+    }
     pc_gx_draw_pending();
 #ifdef PC_NET_TEST_HOOKS
     pc_test_frame_dump();
@@ -588,6 +652,14 @@ int pc_platform_poll_events(void) {
             case SDL_QUIT:
                 g_pc_running = 0;
                 return 0;
+            case SDL_APP_WILLENTERBACKGROUND:
+                /* Keep the GL context. Android may drop the surface; we rebind it on resume instead of creating a new one. */
+                break;
+            case SDL_APP_DIDENTERFOREGROUND:
+                if (g_pc_window != NULL && g_pc_gl_context != NULL) {
+                    SDL_GL_MakeCurrent(g_pc_window, g_pc_gl_context);
+                }
+                break;
             case SDL_WINDOWEVENT:
                 if (event.window.event == SDL_WINDOWEVENT_SIZE_CHANGED) {
                     pc_platform_update_window_size();
@@ -614,11 +686,11 @@ int pc_platform_poll_events(void) {
                     break;
                 }
                 /* (F3 is intentionally unbound: its old 10x speed toggle was removed.) */
-                if (event.key.keysym.sym == SDLK_ESCAPE && !event.key.repeat) {
+                if ((event.key.keysym.sym == SDLK_ESCAPE || event.key.keysym.sym == SDLK_AC_BACK) && !event.key.repeat) {
                     if (g_pc_paused) {
                         pc_pause_menu_handle_event(&event);
                     } else {
-                        pc_pause_menu_toggle();
+                        pc_pause_menu_toggle(); /* Android back opens the same menu as Esc */
                     }
                     break;
                 }
@@ -1715,7 +1787,40 @@ void pc_main_play_online_poll(void) {
     }
 }
 
+#ifdef __ANDROID__
 int main(int argc, char* argv[]) {
+    /* Stay on SDL's thread and on the stack ART gave that thread. Moving SP onto the low heap
+     * makes the next JNI call abort with StackOverflowError (the Java stack is about 1MB). */
+    char msg[192];
+    long page = sysconf(_SC_PAGESIZE);
+    pc_diag_init();
+    pc_diag_milestone("entered SDL_main");
+    if (page < 4096) page = 4096;
+    if (!pc_lowheap_ok()) {
+        pc_diag_fail_box("ACGC Town", pc_lowheap_error());
+        return 1;
+    }
+    snprintf(msg, sizeof(msg), "heap reserve ok page %ld", page);
+    pc_diag_milestone(msg);
+    pc_diag_milestone("sdl thread stack kept");
+    return pc_game_main(argc, argv);
+}
+
+static int pc_game_main(int argc, char* argv[]) {
+    pc_diag_milestone("game main");
+    {
+        const char* storage = SDL_AndroidGetInternalStoragePath();
+        if (storage != NULL && storage[0] != '\0') chdir(storage);
+    }
+    if (access("/data/user/0/com.acgc.town/files/audio_init_test", F_OK) == 0 ||
+        access("/data/data/com.acgc.town/files/audio_init_test", F_OK) == 0) {
+        /* Run the real boot_main, including the logo cleanup after sound_initial. */
+        s_boot_test = 1;
+        pc_diag_milestone("boot test: armed");
+    }
+#else
+int main(int argc, char* argv[]) {
+#endif
     pc_relaunch_forward_capture(argc, argv); /* M-C: the whitelisted display / diagnostic options are forwarded by a Play Online relaunch */
     for (int i = 1; i < argc; i++) {
         /* pc_log: -debug*, --debug*, -debug-list, -logtime, -logfile PATH (see pc_log.h). -debug-list exits 0 and a bad value exits 2 HERE,
@@ -2310,6 +2415,11 @@ int main(int argc, char* argv[]) {
                 if (p > 0 && p <= 65535) g_pc_net_port = (uint16_t)p;
                 i++;
             }
+        } else if (strcmp(argv[i], "--rom") == 0 && i + 1 < argc) {
+            pc_disc_set_image_path(argv[i + 1]);
+            i++;
+        } else if (strcmp(argv[i], "--no-rom") == 0) {
+            /* The launcher starts with no disc selected. The finder then reports that. */
         } else if (strcmp(argv[i], "--connect") == 0 && i + 1 < argc) {
             char* colon;
             g_pc_net_role = 2;
@@ -2491,6 +2601,17 @@ int main(int argc, char* argv[]) {
     if (g_pc_guest_creation_test != NULL && pc_guest_profile_selected() == NULL && g_pc_character_spec == NULL) {
         fprintf(stderr, "[PC] --guest-creation-test: REFUSED: the TEST-ONLY hook needs --guest-profile NAME\n");
         return 2;
+    }
+
+    /* --connect used to arrive on its own when the guest profile already had a name.
+     * A profile that is not on disk yet stays on the title so the player can type one. */
+    if (g_pc_net_role == 2 && !g_pc_guest && g_pc_character_spec == NULL &&
+        g_pc_bootstrap_resident < 0 && g_pc_bootstrap_guest == NULL) {
+        extern int pc_guest_title_saved_name(void);
+        if (pc_guest_title_saved_name()) {
+            g_pc_guest = 1;
+            printf("[PC] --connect: saved guest name found; arriving automatically (same path as --guest).\n");
+        }
     }
 
     /* Guests G2.3: --guest = CLIENT only (needs --connect), exclusive with --host / --dedicated / --host-observer / --bootstrap-resident / --bootstrap-guest.
@@ -2845,6 +2966,23 @@ int main(int argc, char* argv[]) {
     }
 
     pc_platform_init();
+#ifdef __ANDROID__
+    if (s_boot_test) {
+        extern int boot_main(int argc, const char** argv);
+        int rc;
+        pc_diag_milestone("boot test: boot_main");
+        rc = boot_main(argc, (const char**)argv);
+        pc_diag_milestone("boot test: boot_main returned");
+        if (pc_lowaddr_game_violation_count() != 0) {
+            pc_diag_fail_box("ACGC Town", "A game pointer is still above 4 GB. See the lowaddr AUDIT log.");
+            pc_platform_shutdown();
+            return 2;
+        }
+        pc_diag_milestone("boot test: lowaddr clean");
+        pc_platform_shutdown();
+        return rc;
+    }
+#endif
 #ifdef PC_LOW_ADDRESS_64
     if (g_pc_lowaddr_selftest) {
         int failures = pc_lowaddr_selftest();
@@ -2902,20 +3040,18 @@ int main(int argc, char* argv[]) {
     }
     pc_disc_init();
     if (!pc_assets_init()) {
-        const char* msg =
+        const char* disc_err = pc_disc_last_error();
+        const char* msg = (disc_err != NULL && disc_err[0] != '\0') ? disc_err :
             "No game data found.\n\n"
             "Animal Crossing needs the original GameCube ROM to run.\n"
             "Place a disc image (.iso, .gcm, or .ciso) to the \"rom\" subfolder.";
         fprintf(stderr, "[PC] %s\n", msg);
+        pc_diag_fail_box("Animal Crossing - Missing ROM", msg);
         pc_lowaddr_report();
-        /* A headless dedicated server has no window. The dialog would wait forever. */
-        if (g_pc_window != NULL) {
-            SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_ERROR,
-                                     "Animal Crossing - Missing ROM", msg, g_pc_window);
-        }
         pc_platform_shutdown();
         return 1;
     }
+    pc_diag_milestone("rom opened");
 
     pc_lowaddr_report();
     ac_entry();                         /* sets HotStartEntry = &entry */

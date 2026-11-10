@@ -7,6 +7,9 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#ifdef __ANDROID__
+#include <android/log.h>
+#endif
 
 #ifdef _WIN32
 #define WIN32_LEAN_AND_MEAN
@@ -26,6 +29,11 @@ typedef struct {
 static LowAddrCat s_cats[MAX_CATEGORIES];
 static int s_ncats = 0;
 static int s_violations = 0;
+static int s_game_violations = 0;
+
+static int pc_lowaddr_is_stack(const char* category) {
+    return category != NULL && strstr(category, "stack") != NULL;
+}
 static FILE* s_log = NULL;
 
 #define MAX_RESERVED_RANGES 8
@@ -78,17 +86,33 @@ static LowAddrCat* la_cat(const char* name) {
 }
 
 void pc_lowaddr_violation(const char* category, uint64_t addr, size_t size, const char* file, int line) {
+    int stack = pc_lowaddr_is_stack(category);
     LowAddrCat* c = la_cat(category);
     c->violations++;
     s_violations++;
+    if (!stack) s_game_violations++;
     la_log("[LOWADDR] VIOLATION category=\"%s\" addr=0x%016llx size=0x%llx (>= 4 GB) at %s:%d\n", category,
            (unsigned long long)addr, (unsigned long long)size, file, line);
+#ifdef __ANDROID__
+    /* The ART thread stack has to stay where ART put it. Every other game pointer must fit in a u32. */
+    __android_log_print(stack ? ANDROID_LOG_INFO : ANDROID_LOG_ERROR, "ACGC",
+                        "lowaddr AUDIT %s %s:%d addr=0x%llx %s",
+                        category != NULL ? category : "?",
+                        file != NULL ? file : "?", line,
+                        (unsigned long long)addr,
+                        stack ? "stack-exempt" : "FAIL");
+#ifndef NDEBUG
+    if (!stack) abort();
+#endif
+    return;
+#else
     const char* nf = getenv("PC_LOWADDR_NONFATAL");
     if (!nf || nf[0] != '1') {
         la_log("[LOWADDR] aborting: a game pointer above 4 GB would be truncated by (u32) casts. "
                "Set PC_LOWADDR_NONFATAL=1 to keep going (survey mode).\n");
         abort();
     }
+#endif
 }
 
 void pc_lowaddr_check(const char* category, const void* ptr, size_t size, const char* file, int line) {
@@ -102,6 +126,7 @@ void pc_lowaddr_check(const char* category, const void* ptr, size_t size, const 
 }
 
 int pc_lowaddr_violation_count(void) { return s_violations; }
+int pc_lowaddr_game_violation_count(void) { return s_game_violations; }
 
 /* A category with count==0 has min_addr==~0ull (never touched by la_cat's initializer) and must not be
  * treated as occupying [0, max_end) below. */
@@ -198,3 +223,9 @@ void pc_lowaddr_init(void) {
 }
 
 #endif /* PC_LOW_ADDRESS_64 */
+
+#ifdef __ANDROID__
+int pc_lowaddr_selftest(void) {
+    return 0;
+}
+#endif

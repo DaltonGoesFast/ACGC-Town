@@ -29,7 +29,18 @@ typedef struct JaFilePtr32_ { u32 mAddr; } JaFilePtr32;
  *   JA_FPTR_U32(slot)    - its raw 32-bit value (the original code's "(u32)slot")
  * Without PC_LOW_ADDRESS_64 both expand to the original pointer expressions. */
 #ifdef PC_LOW_ADDRESS_64
+#ifdef PC_GBI_INTERN
+#ifdef __cplusplus
+extern "C" {
+#endif
+uintptr_t pc_gbi_resolve(unsigned int packed);
+#ifdef __cplusplus
+}
+#endif
+#define JA_FPTR_GET(T, slot) ((T*)pc_gbi_resolve((slot).mAddr))
+#else
 #define JA_FPTR_GET(T, slot) ((T*)(uintptr_t)(slot).mAddr)
+#endif
 #define JA_FPTR_U32(slot) ((u32)(slot).mAddr)
 #else
 #define JA_FPTR_GET(T, slot) ((T*)(slot))

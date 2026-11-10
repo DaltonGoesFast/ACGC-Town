@@ -10,9 +10,19 @@
 #error "This project must be compiled as 32-bit (pointer size != 4 bytes)"
 #endif
 
+#ifndef __ANDROID__
 #define SDL_MAIN_HANDLED
+#endif
 #include <SDL.h>
+#ifdef PC_GLES
+#include <GLES3/gl3.h>
+/* Desktop names the game already calls. GLES 3 uses the float forms, and point size is a shader output. */
+#define glClearDepth(d) glClearDepthf((float)(d))
+#define glDepthRange(n, f) glDepthRangef((float)(n), (float)(f))
+#define glPointSize(s) ((void)(s))
+#else
 #include <glad/gl.h>
+#endif
 
 #include <stdio.h>
 #include <stdlib.h>

@@ -1,10 +1,61 @@
 #include <stdint.h>
 #include <stdio.h>
+#include <stdlib.h>
 
 #include "pc_lowaddr.h"
 
 #define PC_GBI_ODD_PTR_TOKEN_BASE 0x02F00000u
 #define PC_GBI_ODD_PTR_TOKEN_COUNT 8192u
+
+#ifdef PC_GBI_INTERN
+/* Segment 14 is unused by this game's display lists. Each token is even so it is not a bit-0 tagged pointer. */
+#define PC_GBI_HIGH_TOKEN_BASE 0x0E000000u
+#define PC_GBI_HIGH_TOKEN_MAX  (1024u * 1024u)
+
+static uintptr_t* s_high_tokens;
+static unsigned int s_high_token_count;
+static unsigned int s_high_token_cap;
+
+int pc_gbi_is_token(unsigned int packed) {
+    unsigned int slot;
+    if (packed < PC_GBI_HIGH_TOKEN_BASE) return 0;
+    slot = (packed - PC_GBI_HIGH_TOKEN_BASE) / 2u;
+    return ((packed - PC_GBI_HIGH_TOKEN_BASE) % 2u) == 0 && slot < s_high_token_count;
+}
+
+uintptr_t pc_gbi_resolve(unsigned int packed) {
+    if (!pc_gbi_is_token(packed)) return (uintptr_t)packed;
+    return s_high_tokens[(packed - PC_GBI_HIGH_TOKEN_BASE) / 2u];
+}
+
+unsigned int pc_gbi_intern(uintptr_t addr) {
+    unsigned int slot;
+    if (addr == 0) return 0;
+    /* An even address below 4 GB already fits in the display-list word. */
+    if (addr < 0x100000000ull && (addr & 1ull) == 0) return (unsigned int)addr;
+    if (s_high_token_count >= PC_GBI_HIGH_TOKEN_MAX) {
+        fprintf(stderr, "[GBI] pointer token table is full (%u)\n", PC_GBI_HIGH_TOKEN_MAX);
+        abort();
+    }
+    if (s_high_token_count == s_high_token_cap) {
+        unsigned int cap = s_high_token_cap ? s_high_token_cap * 2u : 4096u;
+        uintptr_t* grown = (uintptr_t*)realloc(s_high_tokens, (size_t)cap * sizeof(uintptr_t));
+        if (grown == NULL) {
+            fprintf(stderr, "[GBI] pointer token table: out of memory\n");
+            abort();
+        }
+        s_high_tokens = grown;
+        s_high_token_cap = cap;
+    }
+    slot = s_high_token_count++;
+    s_high_tokens[slot] = addr;
+    return PC_GBI_HIGH_TOKEN_BASE + slot * 2u;
+}
+
+unsigned int pc_gbi_pack_u32(uintptr_t addr) {
+    return pc_gbi_intern(addr);
+}
+#endif
 
 static uintptr_t s_odd_ptr_tokens[PC_GBI_ODD_PTR_TOKEN_COUNT];
 static unsigned int s_odd_ptr_token_next = 0;
@@ -19,6 +70,11 @@ __attribute__((constructor)) static void pc_gbi_register_token_range(void) {
     pc_lowaddr_reserve_range("GBI odd-pointer token table",
                               PC_GBI_ODD_PTR_TOKEN_BASE,
                               PC_GBI_ODD_PTR_TOKEN_BASE + (uint64_t)PC_GBI_ODD_PTR_TOKEN_COUNT * 2u);
+#ifdef PC_GBI_INTERN
+    pc_lowaddr_reserve_range("GBI high-pointer tokens",
+                              PC_GBI_HIGH_TOKEN_BASE,
+                              PC_GBI_HIGH_TOKEN_BASE + (uint64_t)PC_GBI_HIGH_TOKEN_MAX * 2u);
+#endif
 }
 
 unsigned int pc_gbi_pack_runtime_ptr(uintptr_t addr, int is_ptr, const char* expr, const char* file, int line) {
@@ -28,8 +84,15 @@ unsigned int pc_gbi_pack_runtime_ptr(uintptr_t addr, int is_ptr, const char* exp
         return (unsigned int)addr;
     }
 
+#ifdef PC_GBI_INTERN
+    /* A pointer above 4 GB does not fit in the display-list word. Keep the full address in the token table. */
+    if (addr >= 0x100000000ull) {
+        return pc_gbi_intern(addr);
+    }
+#else
     /* The packed word is only 32 bits: refuse to truncate a real host pointer silently. */
     PC_LOWADDR_ASSERT("GBI runtime display-list pointer", addr);
+#endif
 
     if ((addr & 1u) == 0) {
         return (unsigned int)(addr | 1u);

@@ -238,22 +238,22 @@ struct JUTResFont : public JUTFont {
     virtual void setGX(JUtility::TColor, JUtility::TColor);    // _10
     virtual f32 drawChar_scale(f32, f32, f32, f32, int, bool); // _14
     virtual int getDescent() const {
-        return mInfoBlock->mDescent;
+        return mInfoBlock != nullptr ? mInfoBlock->mDescent : 0;
     }; // _20
     virtual int getHeight() const {
         return getAscent() + getDescent();
     }; // _24
     virtual int getAscent() const {
-        return mInfoBlock->mAscent;
+        return mInfoBlock != nullptr ? mInfoBlock->mAscent : 0;
     }; // _1C
     virtual int getWidth() const {
-        return mInfoBlock->mWidth;
+        return mInfoBlock != nullptr ? mInfoBlock->mWidth : 0;
     };                                                       // _28
     virtual void getWidthEntry(int, JUTFont::TWidth*) const; // _2C
     virtual int getCellWidth() const;                        // _30
     virtual int getCellHeight() const;                       // _34
     virtual int getFontType() const {
-        return mInfoBlock->mFontType;
+        return mInfoBlock != nullptr ? mInfoBlock->mFontType : 0;
     }; // _38
     virtual const ResFONT* getResFont() const {
         return mResource;

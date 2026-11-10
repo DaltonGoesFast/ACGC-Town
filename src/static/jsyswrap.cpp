@@ -454,9 +454,9 @@ extern u32 JW_GetAramAddress(int res_no) {
     int address = 0;
 
     if (res_no >= RESOURCE_FGDATA && res_no < RESOURCE_FGNPCDATA) {
-        address = JC_JKRAramArchive_getAramAddress_byName(forest_arc_aram_p, (u32)'DATA', aram_resName[res_no]);
+        address = JC_JKRAramArchive_getAramAddress_byName(forest_arc_aram_p, (u32)(uintptr_t)'DATA', aram_resName[res_no]);
     } else if (res_no >= RESOURCE_FGNPCDATA && res_no < RESOURCE_NUM) {
-        address = JC_JKRAramArchive_getAramAddress_byName(forest_arc_aram2_p, (u32)'DATA', aram_resName[res_no]);
+        address = JC_JKRAramArchive_getAramAddress_byName(forest_arc_aram2_p, (u32)(uintptr_t)'DATA', aram_resName[res_no]);
     }
 
     return address;
@@ -470,13 +470,13 @@ extern u32 JW_GetResSizeFileNo(int res_no) {
     int res_size = 0;
 
     if (res_no >= RESOURCE_FGDATA && res_no < RESOURCE_FGNPCDATA) {
-        CSDIFileEntry* entry = JC__JKRGetResourceEntry_byName((u32)'DATA', aram_resName[res_no], forest_arc_aram_p);
+        CSDIFileEntry* entry = JC__JKRGetResourceEntry_byName((u32)(uintptr_t)'DATA', aram_resName[res_no], forest_arc_aram_p);
 
         if (entry != nullptr) {
             res_size = entry->mSize;
         }
     } else if (res_no >= RESOURCE_FGNPCDATA && res_no < RESOURCE_NUM) {
-        CSDIFileEntry* entry = JC__JKRGetResourceEntry_byName((u32)'DATA', aram_resName[res_no], forest_arc_aram2_p);
+        CSDIFileEntry* entry = JC__JKRGetResourceEntry_byName((u32)(uintptr_t)'DATA', aram_resName[res_no], forest_arc_aram2_p);
 
         if (entry != nullptr) {
             res_size = entry->mSize;
@@ -493,7 +493,7 @@ extern void JW_Init() {
     void* arena_hi = OSGetArenaHi();
     void* arena_lo = OSGetArenaLo();
 
-    SystemHeapSize = (u32)arena_hi - (u32)arena_lo - 0xD0;
+    SystemHeapSize = (u32)(uintptr_t)arena_hi - (u32)(uintptr_t)arena_lo - 0xD0;
     JC_JFWSystem_setMaxStdHeap(1);
     JC_JFWSystem_setSysHeapSize(SystemHeapSize);
     JC_JFWSystem_setFifoBufSize(0x10001);

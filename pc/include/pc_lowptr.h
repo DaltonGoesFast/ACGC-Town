@@ -18,16 +18,30 @@
  * the real keyword is needed inside this template. */
 #pragma push_macro("this")
 #undef this
+#ifdef PC_GBI_INTERN
+extern "C" unsigned int pc_gbi_intern(uintptr_t addr);
+extern "C" uintptr_t pc_gbi_resolve(unsigned int packed);
+#endif
 extern "C++" {
 template <class T>
 struct PcLowPtr {
     u32 mAddr;
     PcLowPtr& operator=(T* p) {
+#ifdef PC_GBI_INTERN
+        mAddr = pc_gbi_intern((uintptr_t)p);
+#else
         mAddr = PC_PTR32("PcLowPtr (fixed 32-bit layout field)", p);
+#endif
         return *this;
     }
-    operator T*() const { return (T*)(uintptr_t)mAddr; }
-    T* operator->() const { return (T*)(uintptr_t)mAddr; }
+    operator T*() const {
+#ifdef PC_GBI_INTERN
+        return (T*)pc_gbi_resolve(mAddr);
+#else
+        return (T*)(uintptr_t)mAddr;
+#endif
+    }
+    T* operator->() const { return (T*)(*this); }
 };
 } /* extern "C++" */
 #pragma pop_macro("this")

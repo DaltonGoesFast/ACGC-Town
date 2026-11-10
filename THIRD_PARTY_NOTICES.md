@@ -41,6 +41,7 @@ Unofficial fan project. Not affiliated with, authorised or endorsed by Nintendo.
 | 18 | zlib 1.3.2 (launcher only) | `ACLauncher.exe` | zlib licence | **Confirmed** |
 | 19 | Build tools in the repository: `tools/pyjkernel` (GPLv3, own `LICENSE`), `tools/ninja_syntax.py` (Apache-2.0, Google) and other upstream tools | `tools/` | licence files / headers | **Confirmed**; not compiled into or shipped with the ZIP |
 | 20 | Windows UCRT / system DLLs | system | Microsoft | not redistributed |
+| 21 | SDL2 2.30.10 Android Java activity (`org.libsdl.app`, used by `pc/android`) | `pc/android/app/src/main/java/org/libsdl/app/` | zlib. The files are SDL's own `android-project` sources, copied with their headers. Not taken from zwaetschge/ACGC-Android-Port. The native SDL2 sources are downloaded by CMake at build time from the same release and are not committed. | **Confirmed** for the Java files' origin (SDL zlib). The zlib text is the same one already shipped for the Windows `SDL2.dll` (`licenses/SDL2-LICENSE.txt`). |
 
 ## 3. What remains unresolved (blocks a public binary release until decided)
 

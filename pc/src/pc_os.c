@@ -380,18 +380,26 @@ BOOL OSTryLockMutex(OSMutex* mutex) {
 }
 
 /* --- Message queue --- */
-/* matches OSMessageQueue from dolphin/os/OSMessage.h */
+/* Same layout as dolphin OSMessageQueue. Each OSThreadQueue is two pointers, so on
+ * LP64 the message fields start at byte 32. A fixed 16-byte prefix put msgArray on
+ * top of queueReceive. */
 typedef struct {
-    u8  _threadQueues[16]; /* queueSend + queueReceive - unused on PC */
-    void** msgArray;       /* _10 */
-    int msgCount;          /* _14 */
-    int firstIndex;        /* _18 */
-    int usedCount;         /* _1C */
+    void* queueSendHead;
+    void* queueSendTail;
+    void* queueReceiveHead;
+    void* queueReceiveTail;
+    void** msgArray;
+    int msgCount;
+    int firstIndex;
+    int usedCount;
 } OSMessageQueue_PC;
 
 void OSInitMessageQueue(void* queue, void** msgArray, int msgCount) {
     OSMessageQueue_PC* mq = (OSMessageQueue_PC*)queue;
-    memset(mq->_threadQueues, 0, 16);
+    mq->queueSendHead = NULL;
+    mq->queueSendTail = NULL;
+    mq->queueReceiveHead = NULL;
+    mq->queueReceiveTail = NULL;
     mq->msgArray = msgArray;
     mq->msgCount = msgCount;
     mq->firstIndex = 0;
@@ -400,8 +408,8 @@ void OSInitMessageQueue(void* queue, void** msgArray, int msgCount) {
 
 BOOL OSSendMessage(void* queue, void* msg, int flags) {
     OSMessageQueue_PC* mq = (OSMessageQueue_PC*)queue;
+    (void)flags;
     if (mq->usedCount >= mq->msgCount) {
-        /* full */
         return FALSE;
     }
     int idx = (mq->firstIndex + mq->usedCount) % mq->msgCount;
@@ -412,6 +420,7 @@ BOOL OSSendMessage(void* queue, void* msg, int flags) {
 
 BOOL OSReceiveMessage(void* queue, void** msgPtr, int flags) {
     OSMessageQueue_PC* mq = (OSMessageQueue_PC*)queue;
+    (void)flags;
     if (mq->usedCount == 0) {
         return FALSE;
     }
@@ -425,6 +434,7 @@ BOOL OSReceiveMessage(void* queue, void** msgPtr, int flags) {
 
 BOOL OSJamMessage(void* queue, void* msg, int flags) {
     OSMessageQueue_PC* mq = (OSMessageQueue_PC*)queue;
+    (void)flags;
     if (mq->usedCount >= mq->msgCount) {
         return FALSE;
     }

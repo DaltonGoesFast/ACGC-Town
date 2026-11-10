@@ -14,7 +14,7 @@
 #define __declspec(x)
 /* UCRT does not provide the BSD memory helpers the decomp calls. bcopy's
  * destination is the second argument (the opposite of memcpy). */
-#ifdef _WIN32
+#if defined(_WIN32) || defined(__ANDROID__)
 #define bzero(dst, n) memset((dst), 0, (size_t)(n))
 #define bcopy(src, dst, n) memmove((dst), (src), (size_t)(n))
 #define bcmp(a, b, n) memcmp((a), (b), (size_t)(n))

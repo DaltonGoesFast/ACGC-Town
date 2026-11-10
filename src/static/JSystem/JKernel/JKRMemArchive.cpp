@@ -23,7 +23,7 @@ JKRMemArchive::JKRMemArchive(s32 entryNum, EMountDirection mountDirection) : JKR
     }
 }
 
-JKRMemArchive::JKRMemArchive(void* mem, u32 size, JKRMemBreakFlag breakFlag) : JKRArchive((s32)mem, MOUNT_MEM) {
+JKRMemArchive::JKRMemArchive(void* mem, u32 size, JKRMemBreakFlag breakFlag) : JKRArchive((s32)(intptr_t)mem, MOUNT_MEM) {
     mIsMounted = false;
     if (!open(mem, size, breakFlag)) {
         return;
@@ -47,7 +47,7 @@ JKRMemArchive::~JKRMemArchive() {
 
 #if DEBUG // function is needed to generate certain strings first, however this is not what the original function looks
           // like
-void JKRMemArchive::fixedInit(s32) {
+void JKRMemArchive::fixedInit(s32)(intptr_t) {
     JUT_ASSERT(isMounted());
     JUT_PANIC("mMountCount == 1"); // some member is called mMountCount, if there's a game with this assert, fix
     JUT_ASSERT(mArcHeader->signature == 'RARC');
@@ -84,7 +84,7 @@ bool JKRMemArchive::open(s32 entryNum, JKRArchive::EMountDirection mountDirectio
         mFileEntries = (SDIFileEntry*)((u8*)&mArcInfoBlock->num_nodes + mArcInfoBlock->file_entry_offset);
         mStrTable = (char*)((u8*)&mArcInfoBlock->num_nodes + mArcInfoBlock->string_table_offset);
 
-        mArchiveData = (u8*)((u32)mArcHeader + mArcHeader->header_length + mArcHeader->file_data_offset);
+        mArchiveData = (u8*)((u32)(uintptr_t)mArcHeader + mArcHeader->header_length + mArcHeader->file_data_offset);
         mIsOpen = true;
     }
 #if DEBUG
@@ -103,7 +103,7 @@ bool JKRMemArchive::open(void* buffer, u32 bufferSize, JKRMemBreakFlag flag) {
     mDirectories = (SDIDirEntry*)((u8*)&mArcInfoBlock->num_nodes + mArcInfoBlock->node_offset);
     mFileEntries = (SDIFileEntry*)((u8*)&mArcInfoBlock->num_nodes + mArcInfoBlock->file_entry_offset);
     mStrTable = (char*)((u8*)&mArcInfoBlock->num_nodes + mArcInfoBlock->string_table_offset);
-    mArchiveData = (u8*)(((u32)mArcHeader + mArcHeader->header_length) + mArcHeader->file_data_offset);
+    mArchiveData = (u8*)(((u32)(uintptr_t)mArcHeader + mArcHeader->header_length) + mArcHeader->file_data_offset);
     mIsOpen = (flag == MBF_1) ? true : false; // mIsOpen might be u8
     mHeap = JKRHeap::findFromRoot(buffer);
     mCompression = JKRCOMPRESSION_NONE;

@@ -122,7 +122,7 @@ static void Nap_AudioSysProcess(AudioPort* port) {
                 AG.main_group.subtracks[0]->port[0] = port->command.arg2;
             }
             break;
-        case AUDIOCMD_MAIN_GROUP_SET_FREQ_SCALE:
+        case AUDIOCMD_MAIN_GROUP_SET_FREQ_SCALE: {
             s32 idx = 128 + port->param.asS32;
 
             AG.main_group.subtracks[0]->frequency_scale = PCENTTABLE2[idx];
@@ -130,6 +130,7 @@ static void Nap_AudioSysProcess(AudioPort* port) {
             AG.main_group.subtracks[0]->vibrato_params.depth_target = port->command.arg2 * 4;
             AG.main_group.subtracks[0]->vibrato_params.depth_change_delay = 32;
             break;
+        }
         case AUDIOCMD_MAIN_GROUP_SET_VOL_SCALE:
             AG.main_group.subtracks[0]->volume_scale = port->param.asF32;
             AG.main_group.subtracks[0]->changes.flags.volume = TRUE;
@@ -152,7 +153,7 @@ static void Nap_AudioSysProcess(AudioPort* port) {
             OverwriteBank(port->command.opcode - AUDIOCMD_SET_PERC_BANK, port->command.arg1, port->command.arg2,
                           port->param.asS32);
             break;
-        case AUDIOCMD_FORCE_STOP_ALL_GROUPS:
+        case AUDIOCMD_FORCE_STOP_ALL_GROUPS: {
             s32 flags = port->param.asS32;
 
             if (flags == AUDIO_NOTE_RELEASE) {
@@ -165,6 +166,7 @@ static void Nap_AudioSysProcess(AudioPort* port) {
 
             Nap_SilenceCheck_Inner(flags);
             break;
+        }
         case AUDIOCMD_CLEAR_STAY_CACHE:
             Nas_SzStayDelete(port->param.asS32);
             break;
@@ -356,7 +358,7 @@ extern void Nap_AudioPortProcess(u32 msg) {
 }
 
 extern s32 Nap_CheckSpecChange(void) {
-    s32 msg;
+    OSMesg mesg;
     s32 res;
 
     /* Spec-change is not complete until reset pipeline fully settles. */
@@ -364,11 +366,11 @@ extern s32 Nap_CheckSpecChange(void) {
         return 0;
     }
 
-    res = Z_osRecvMesg(AG.spec_change_mq_p, (OSMesg*)&msg, OS_MESG_NOBLOCK);
+    res = Z_osRecvMesg(AG.spec_change_mq_p, &mesg, OS_MESG_NOBLOCK);
 
     if (res == -1) {
         return 0;
-    } else if (msg != AG.spec_id) {
+    } else if ((s32)(uintptr_t)mesg != AG.spec_id) {
         return -1;
     } else {
         return 1;
@@ -376,11 +378,11 @@ extern s32 Nap_CheckSpecChange(void) {
 }
 
 static void __ClearSpecChangeQ(void) {
-    s32 msg;
+    OSMesg mesg;
     s32 res;
 
     do {
-        res = Z_osRecvMesg(AG.spec_change_mq_p, (OSMesg*)&msg, OS_MESG_NOBLOCK);
+        res = Z_osRecvMesg(AG.spec_change_mq_p, &mesg, OS_MESG_NOBLOCK);
     } while (res != -1);
 }
 
@@ -726,10 +728,10 @@ extern s32 CreateAudioTask(Acmd* cmds, s16* pSamples, u32 nSamples, s32 param_4)
 
         port_cmds = 0;
         if (AG.reset_status == 0) {
-            u32 msg;
+            OSMesg mesg;
 
-            while (Z_osRecvMesg(AG.thread_cmd_proc_mq_p, (OSMesg*)&msg, OS_MESG_NOBLOCK) != -1) {
-                Nap_AudioPortProcess(msg);
+            while (Z_osRecvMesg(AG.thread_cmd_proc_mq_p, &mesg, OS_MESG_NOBLOCK) != -1) {
+                Nap_AudioPortProcess((u32)(uintptr_t)mesg);
                 port_cmds++;
             }
 

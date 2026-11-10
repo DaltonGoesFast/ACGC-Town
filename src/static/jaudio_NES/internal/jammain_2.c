@@ -2102,7 +2102,7 @@ static u32 Cmd_Transpose()
 static u32 Cmd_CloseTrack()
 {
 	u8 index = SEQ_ARG[0];
-	if (index >= (u32)ARRAY_COUNT(SEQ_P->children)) {
+	if (index >= (u32)(uintptr_t)ARRAY_COUNT(SEQ_P->children)) {
 		return 0x80;
 	}
 	Jaq_CloseTrack(SEQ_P->children[index]);
@@ -2555,7 +2555,7 @@ static u32 Cmd_Printf()
 	size_t i;
 
 	fmtCount = 0;
-	for (i = 0; i < (u32)ARRAY_COUNT(fmtStr); ++i) {
+	for (i = 0; i < (u32)(uintptr_t)ARRAY_COUNT(fmtStr); ++i) {
 		fmtStr[i] = __ByteRead(SEQ_P);
 		if (fmtStr[i] == '\0') {
 			// Handle end of string
@@ -2612,7 +2612,7 @@ static u32 Cmd_Printf()
 	for (i = 0; i < fmtCount; ++i) {
 		fmtParms[i] = __ByteRead(SEQ_P);
 		if (fmtFlags[i] == 2) {
-			fmtParms[i] = (u32)Jam_OfsToAddr(SEQ_P, fmtParms[i]);
+			fmtParms[i] = (u32)(uintptr_t)Jam_OfsToAddr(SEQ_P, fmtParms[i]);
 		// } else if (fmtFlags[i] == 5) {
 		// 	fmtParms[i] = SEQ_P->trackId;
 		}
@@ -2948,7 +2948,7 @@ try_interrupt:
 			goto timed;
 		}
 		if (track->_D0 != -1 && track->_D4 == 0) {
-			for (local_64 = 0; local_64 < (int)track->_90; local_64++) {
+			for (local_64 = 0; local_64 < (int)(intptr_t)track->_90; local_64++) {
 				track->_94[local_64]      = -1;
 				track->channels[local_64] = NULL;
 			}
@@ -2993,7 +2993,7 @@ try_interrupt:
 				for (iVar11 = 0; iVar11 < (bVar10 >> 3 & 3); iVar11++) {
 					uVar2 = uVar2 << 8 | __ByteRead(track);
 				}
-				if ((u32)(bVar10 >> 3 & 3) == 1 && uVar2 >= 0x80) {
+				if ((u32)(uintptr_t)(bVar10 >> 3 & 3) == 1 && uVar2 >= 0x80) {
 					uVar2 = __ExchangeRegisterValue(track, uVar2 - 0x80);
 				}
 			} else {
