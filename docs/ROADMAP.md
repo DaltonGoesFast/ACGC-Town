@@ -71,6 +71,8 @@ The server does not render this HUD. It already sends the inventory and field st
 
 ## Build notes for the server
 
+A dedicated server under systemd has no terminal. Operator lines (`help`, `status`, `players`, `kick`, `promote`, `save`, `stop`) can be written to `servers/<id>/console.fifo`.
+
 The Linux server that was built and started is 32-bit (`-m32 -malign-double`), which matches the GameCube/`long`-is-32-bit ABI and the 8-byte alignment of `double` the save layout expects. `u32` and `s32` are `int` on LP64 so a future 64-bit Linux build does not treat them as 8-byte `long`, but many other headers still use `long` for 32-bit fields, so `-DPC_ALLOW_64BIT=ON` is not a finished Linux configuration. See the README for the exact commands.
 
 Do not commit disc images, extracted assets, `servers/`, or `save/`.

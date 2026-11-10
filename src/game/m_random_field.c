@@ -943,6 +943,11 @@ extern void mRF_CheckBeastRoad() {
         mCoBG_Collision_u* collision_data = mFI_GetBkNum2ColTop(block_x, block_z);
         u8 type = mFI_BkNum2BlockType(block_x, block_z);
 
+        /* A block whose collision is not loaded (town reload, acre not in memory) has a null top.
+         * Dereferencing it segfaults. Skip the block; the road check runs again when it is loaded. */
+        if (collision_data == NULL) {
+            continue;
+        }
         mRF_BlockInf2CheckBeastRoad(type, collision_data);
       }
     }

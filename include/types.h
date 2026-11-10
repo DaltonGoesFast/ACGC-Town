@@ -12,6 +12,13 @@
  * GCC defines __declspec as a builtin keyword, so we must #undef it first. */
 #undef __declspec
 #define __declspec(x)
+/* UCRT does not provide the BSD memory helpers the decomp calls. bcopy's
+ * destination is the second argument (the opposite of memcpy). */
+#ifdef _WIN32
+#define bzero(dst, n) memset((dst), 0, (size_t)(n))
+#define bcopy(src, dst, n) memmove((dst), (src), (size_t)(n))
+#define bcmp(a, b, n) memcmp((a), (b), (size_t)(n))
+#endif
 #else
 #include "MSL_C/w_math.h"
 #endif

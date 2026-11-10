@@ -37,6 +37,9 @@
 #else
 #include <pthread.h>
 #include <unistd.h>
+#include <errno.h>
+#include <fcntl.h>
+#include <sys/stat.h>
 #endif
 
 extern int  pcfa_save_ready(void);
@@ -55,6 +58,7 @@ int g_pc_dedicated = 0;
 /* ------------------------------------------------------------------------------------------------------------------------------------- */
 
 static uint16_t s_port = 0;
+static char     s_fifo_path[512]; /* Linux: servers/<id>/console.fifo; empty when no fifo is listening */
 static Uint32   s_start_ticks = 0;
 static int      s_audio_ok = 0;
 static char     s_audio_driver[32] = "?";
@@ -549,6 +553,7 @@ static void pc_ded_reader_loop(
 #else
     int fd
 #endif
+    , int mark_eof
 ) {
     char buf[512];
     char line[PC_DED_LINE_MAX + 1];
@@ -588,22 +593,68 @@ static void pc_ded_reader_loop(
     if (len > 0) {
         pc_ded_enqueue(line, len, truncated); /* a final line without a newline */
     }
-    s_stdin_eof = 1;
+    if (mark_eof) {
+        s_stdin_eof = 1;
+    }
 }
 
 #ifdef _WIN32
 static HANDLE s_stdin_handle = NULL;
 static unsigned __stdcall pc_ded_reader_thread(void* arg) {
     (void)arg;
-    pc_ded_reader_loop(s_stdin_handle);
+    pc_ded_reader_loop(s_stdin_handle, 1);
     return 0;
 }
 #else
 static int s_stdin_fd = 0;
 static void* pc_ded_reader_thread(void* arg) {
     (void)arg;
-    pc_ded_reader_loop(s_stdin_fd);
+    pc_ded_reader_loop(s_stdin_fd, 1);
     return NULL;
+}
+
+/* systemd has no console: stdin is already EOF. A FIFO under the server directory takes the same
+ * lines (help, status, players, kick, promote, save, stop). Mode 0600, and the thread holds the
+ * fifo open read-write so a writer closing does not look like EOF. */
+static void* pc_ded_fifo_thread(void* arg) {
+    (void)arg;
+    for (;;) {
+        int fd = open(s_fifo_path, O_RDWR);
+        if (fd < 0) {
+            return NULL;
+        }
+        pc_ded_reader_loop(fd, 0);
+        close(fd);
+        usleep(100000); /* a writer closing must not spin the reopen */
+    }
+    return NULL;
+}
+
+static int pc_ded_start_fifo(void) {
+    pthread_t t;
+    const char* dir;
+    if (!pc_server_active()) {
+        return 0;
+    }
+    dir = pc_server_dir();
+    if (dir == NULL || dir[0] == '\0') {
+        return 0;
+    }
+    snprintf(s_fifo_path, sizeof(s_fifo_path), "%s/console.fifo", dir);
+    if (mkfifo(s_fifo_path, 0600) != 0 && errno != EEXIST) {
+        pc_dedicated_say("console fifo: could not create %s (%s)", s_fifo_path, strerror(errno));
+        s_fifo_path[0] = '\0';
+        return 0;
+    }
+    chmod(s_fifo_path, 0600);
+    if (pthread_create(&t, NULL, pc_ded_fifo_thread, NULL) != 0) {
+        pc_dedicated_say("console fifo: could not start the reader for %s", s_fifo_path);
+        s_fifo_path[0] = '\0';
+        return 0;
+    }
+    pthread_detach(t);
+    pc_dedicated_say("console fifo: %s  (example: echo status > %s)", s_fifo_path, s_fifo_path);
+    return 1;
 }
 #endif
 
@@ -861,6 +912,9 @@ void pc_dedicated_startup(uint16_t port) {
     pc_dedicated_say("dedicated server starting: role=host port=%u observer=on (--host-observer init reused) console=on version=%s", (unsigned)port, PC_VERSION_STRING);
     PC_LOG(PCL_GENERAL, "dedicated mode: port=%u observer=on console=on\n", (unsigned)port);
     s_stdin_started = pc_ded_start_stdin_thread();
+#ifndef _WIN32
+    (void)pc_ded_start_fifo();
+#endif
 #ifdef _WIN32
     if (s_ded_interactive && !s_con_edit) {
         pc_dedicated_say("console: the line editor is not available (%s); typing may be interrupted by log lines", s_con_edit_why[0] ? s_con_edit_why : "the editor could not start");
@@ -1119,6 +1173,7 @@ static void pc_ded_cmd_help(void) {
            "  items <furniture|tools|clothing|wallpaper|carpet|miscellaneous|all> [page]   list items by category (categories are incomplete; see docs)\n"
            "  give <player|peer N|\"name\"> <id> [qty]   put qty (1-15, default 1) copies in the player's FREE pockets, all-or-nothing; player = resident or guest name (see `players`, `guests`)\n"
            "  where [<player>|peer N]   last reported position (x, y, z, acre) of one / every connected player (the server has no player of its own)\n"
+           "  kick <player>|peer N   disconnect a connected player (best-effort DISCONNECT, then the normal peer teardown)\n"
            "  net status|peers|resync   network role / transport counters / per-peer state; resync is reported unsupported (no general resync exists)\n"
            "  time get   the game clock (date, time, weekday)\n"
            "  day [status] | day roll now   the day rollover: game date, renew / growth dates, state (idle / due / deferred: why), last roll; 'roll now' skips the wait for players in buildings\n"
@@ -2440,6 +2495,25 @@ static void pc_ded_cmd_stop(void) {
     pc_ded_flush();
 }
 
+static void pc_ded_cmd_kick(char* args) {
+    PCNetGameDedicatedPeerInfo pi;
+    args = pc_ded_skip_ws(args);
+    if (args == NULL || *args == '\0') {
+        pc_ded_printf("usage: kick <player>|peer N\n");
+        pc_ded_flush();
+        return;
+    }
+    if (!pc_ded_find_peer(args, &pi)) {
+        pc_ded_printf("KICK FAILED: no connected player '%s' (see `players`; `peer <N>` also works)\n", args);
+        pc_ded_flush();
+        return;
+    }
+    pc_net_evict((PCNetPeerId)pi.peer);
+    pc_ded_printf("[DEDICATED] kick: peer %d \"%s\" told to disconnect\n", pi.peer, pi.name);
+    PC_LOG(PCL_GENERAL, "dedicated: kick peer %d \"%s\"\n", pi.peer, pi.name);
+    pc_ded_flush();
+}
+
 static void pc_ded_execute(char* line) {
     char* p = line;
     char* end;
@@ -2496,6 +2570,8 @@ static void pc_ded_execute(char* line) {
         pc_ded_cmd_give(args);
     } else if (strcmp(cmd, "where") == 0) {
         pc_ded_cmd_where(args);
+    } else if (strcmp(cmd, "kick") == 0) {
+        pc_ded_cmd_kick(args);
     } else if (strcmp(cmd, "net") == 0) {
         pc_ded_cmd_net(args);
     } else if (strcmp(cmd, "time") == 0) {
@@ -2601,7 +2677,9 @@ void pc_dedicated_console_poll(void) {
     }
     if (s_stdin_eof && !s_stdin_eof_reported) {
         s_stdin_eof_reported = 1;
-        pc_ded_printf("[DEDICATED] console input closed (EOF); the server keeps running (stop it with Ctrl+C or a termination request)\n");
+        pc_ded_printf("[DEDICATED] console input closed (EOF); the server keeps running%s%s\n",
+                      s_fifo_path[0] != '\0' ? ". Operator commands: echo <command> > " : " (stop it with Ctrl+C or a termination request)",
+                      s_fifo_path[0] != '\0' ? s_fifo_path : "");
         PC_LOG(PCL_GENERAL, "dedicated: console input closed (EOF), server keeps running\n");
         pc_ded_flush();
     }

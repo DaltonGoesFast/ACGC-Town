@@ -84,8 +84,11 @@ The dedicated server is the same `AnimalCrossing` binary with `--dedicated`. On 
 
 Build it as 32-bit. The decomp's `long` is a 32-bit GameCube type, and i386 System V aligns `double` on 4 bytes unless `-malign-double` is set. That flag keeps `Save_t` on the layout the multiplayer code checks. A 64-bit Linux link is not the build to use yet: `u32`/`s32` are `unsigned int`/`int` under `__LP64__` (they stay `long` on Windows), but many headers still say `long` where they mean 32 bits.
 
+On Ubuntu 24.04, install `qemu-user` before the i386 SDL package. Without it, apt tries to remove `samba`, `nfs-kernel-server`, and `network-manager` while setting up the 32-bit libraries.
+
 ```bash
 sudo dpkg --add-architecture i386
+sudo apt install qemu-user
 sudo apt install build-essential gcc-multilib g++-multilib cmake libsdl2-dev:i386 libgl1-mesa-dev:i386
 export PKG_CONFIG_PATH=/usr/lib/i386-linux-gnu/pkgconfig
 export PKG_CONFIG_LIBDIR=/usr/lib/i386-linux-gnu/pkgconfig
@@ -120,10 +123,11 @@ Or without the script:
 ./AnimalCrossing --host 7777 --dedicated --ws-port 7778
 ```
 
-- UDP `7777` is the native client port (`--connect ip:7777`).
+- UDP `7777` is the native client port. Joining is `./AnimalCrossing --connect <ip>:7777 --town-fetch --online-ui`. `--connect` turns `--town-fetch` on by itself (`AC_NO_AUTO_TOWN_FETCH=1` leaves it off). Without a town fetch the guest reads an empty local save and fails with `no valid town save is loaded`. `--online-ui` is the failure dialog (Retry / saved copy / Quit).
+- A second window on the same PC must not share `save/mp/guest.ini` and `save/mp/guest_token.dat`. Give each one `--guest-profile NAME` or `AC_GUEST_PROFILE=NAME` (files `save/mp/guest_<name>.ini` and `save/mp/guest_token_<name>.dat`). One profile must not run in two processes.
 - TCP `7778` is the WebSocket port. Each binary frame is one ACNP datagram, the same bytes as a UDP packet. `ws_port = 0` in `server_config.ini` turns it off.
 - First launch creates `servers/default/` and, once a disc is present, asks for a town name on stdin (1–8 characters) if the town file is missing. Later launches load `servers/default/town/`.
-- Console: `help`, `status`, `players`, `save`, `stop`. Ctrl+C asks the game loop to stop.
+- Console: `help`, `status`, `players`, `kick`, `promote`, `save`, `stop`. Ctrl+C asks the game loop to stop. Under systemd, stdin is already closed. The same commands go to `servers/default/console.fifo` (mode 0600), for example `echo stop > servers/default/console.fifo`.
 - Without a disc image the process creates the server directory, binds UDP and WebSocket, prints that the ROM is missing, and exits 1. It does not invent a town.
 
 The plan for Android, the browser client, and touch controls is [docs/ROADMAP.md](docs/ROADMAP.md).

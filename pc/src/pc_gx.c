@@ -2016,8 +2016,16 @@ void GXSetTexCoordGen2(u32 dst, u32 func, u32 src, u32 mtx, GXBool normalize, u3
         g_gx.tex_gen_mtx[dst] = mtx;
     }
 }
-void GXSetLineWidth(u8 width, u32 texOffsets) { glLineWidth(width / 16.0f); }
-void GXSetPointSize(u8 size, u32 texOffsets) { glPointSize(size / 16.0f); }
+void GXSetLineWidth(u8 width, u32 texOffsets) {
+    (void)texOffsets;
+    if (!g_pc_gl_live) return;
+    glLineWidth(width / 16.0f);
+}
+void GXSetPointSize(u8 size, u32 texOffsets) {
+    (void)texOffsets;
+    if (!g_pc_gl_live) return;
+    glPointSize(size / 16.0f);
+}
 void GXEnableTexOffsets(u32 coord, GXBool line, GXBool point) {
     (void)coord; (void)line; (void)point;
 }

@@ -1755,7 +1755,11 @@ int main(int argc, char* argv[]) {
             printf("  --rain [intensity]  Force rainy weather; intensity is light, normal, or heavy\n");
             printf("  --uber-shader       Disable shader specialization (single uber shader)\n");
             printf("  --host [port]       Start hosting (default port 7777); game plays normally while waiting\n");
-            printf("  --connect ip[:port] Connect to a host (default port 7777); game plays normally while connecting\n");
+            printf("  --connect ip[:port] Connect to a host (default port 7777). Also downloads the host town\n");
+            printf("                      (--town-fetch) unless AC_NO_AUTO_TOWN_FETCH=1 or --town-dir is set.\n");
+            printf("                      Add --online-ui for the fetch failure boxes. A second window on this PC\n");
+            printf("                      needs its own --guest-profile NAME (or AC_GUEST_PROFILE) so the two do not\n");
+            printf("                      share save/mp/guest.ini and guest_token.dat.\n");
             printf("  --pickup-test-seed  Host-only test fixture: seeds a few field tiles with an ordinary\n");
             printf("                      item for the pickup regression test. Never touches gameplay\n");
             printf("                      otherwise; see pc_net_game.c.\n");
@@ -2458,6 +2462,23 @@ int main(int argc, char* argv[]) {
         fflush(stdout);
         return 0;
     }
+    /* AC_GUEST_PROFILE=NAME is the same selection as --guest-profile, for a second window or a launcher. */
+    if (pc_guest_profile_selected() == NULL && g_pc_character_spec == NULL) {
+        const char* envp = getenv("AC_GUEST_PROFILE");
+        char perr[160];
+        if (envp != NULL && envp[0] != '\0') {
+            perr[0] = '\0';
+            if (!pc_guest_profile_name_check(envp, perr, sizeof(perr)) || !pc_guest_profile_select(envp)) {
+                fprintf(stderr, "[PC] AC_GUEST_PROFILE: REFUSED: '%s': %s\n"
+                                "usage: AC_GUEST_PROFILE=NAME AnimalCrossing --connect HOST[:PORT] --guest\n",
+                        envp, perr[0] != '\0' ? perr : "could not select that profile");
+                return 2;
+            }
+            g_pc_guest = 1;
+            printf("[PC] AC_GUEST_PROFILE=%s (save/mp/guest_<name>.ini and save/mp/guest_token_<name>.dat; same as --guest-profile)\n", envp);
+        }
+    }
+
     if (g_pc_character_spec != NULL && pc_guest_profile_selected() != NULL) {
         fprintf(stderr, "[PC] --character: REFUSED: --character cannot be combined with --guest-profile (pick one)\n"
                         "usage: AnimalCrossing --connect HOST[:PORT] --character NAME|UUIDPREFIX   (see --help)\n");
@@ -2558,6 +2579,16 @@ int main(int argc, char* argv[]) {
         if (!pc_bootstrap_guest_validate(g_pc_bootstrap_guest)) {
             fflush(stdout);
             return 2;
+        }
+    }
+
+    /* A --connect without a town download reads the empty local save and fails with
+     * "no valid town save is loaded". Fetch unless the user pinned a directory or opted out. */
+    if (g_pc_net_role == 2 && g_pc_town_dir == NULL && !g_pc_town_fetch) {
+        const char* off = getenv("AC_NO_AUTO_TOWN_FETCH");
+        if (off == NULL || strcmp(off, "1") != 0) {
+            g_pc_town_fetch = 1;
+            printf("[PC] --connect: fetching the host town (--town-fetch). Set AC_NO_AUTO_TOWN_FETCH=1 to keep the local save.\n");
         }
     }
 

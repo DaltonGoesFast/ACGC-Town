@@ -79,7 +79,11 @@ void ksNesEmuFrame(void* wp, void* sp, u32 flags) { (void)wp; (void)sp; (void)fl
 int CARDGetAttributes(int chan, int fileNo, u8* attr) { (void)chan; (void)fileNo; (void)attr; return -1; }
 int CARDSetAttributes(int chan, int fileNo, u8 attr) { (void)chan; (void)fileNo; (void)attr; return -1; }
 int CARDFastOpen(int chan, int fileNo, void* fileInfo) { (void)chan; (void)fileNo; (void)fileInfo; return -1; }
+/* Windows gets bcmp from the types.h macro. On Linux glibc provides the function;
+ * defining it here as well is only for targets that have neither. */
+#if !defined(_WIN32) && !defined(__linux__) && !defined(__APPLE__)
 int bcmp(const void* a, const void* b, unsigned int n) { return memcmp(a, b, n); }
+#endif
 
 /* nesinfo — now provided by famicom_nesinfo.cpp */
 

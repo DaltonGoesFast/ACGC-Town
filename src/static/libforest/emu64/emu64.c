@@ -5995,17 +5995,23 @@ void emu64::emu64_set_verbose(int verbose) {
 
 /* C wrapper methods */
 
+#ifdef TARGET_PC
+extern "C" int g_pc_gl_live;
+#endif
+
 extern void emu64_init(void) {
+#ifdef TARGET_PC
+    if (!g_pc_gl_live) return;
+#endif
     emu64_class.emu64_init();
 }
 
 extern void emu64_cleanup(void) {
+#ifdef TARGET_PC
+    if (!g_pc_gl_live) return;
+#endif
     emu64_class.emu64_cleanup();
 }
-
-#ifdef TARGET_PC
-extern "C" int g_pc_gl_live;
-#endif
 
 // hack - inlines in emu64_taskstart C wrapper otherwise
 #pragma dont_inline on

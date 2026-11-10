@@ -1,9 +1,12 @@
 #ifdef TARGET_PC
 #include <ctype.h>
-/* glibc already provides a _tolower macro. Define the MSL helper only when it does not. */
-#ifndef _tolower
-static inline int _tolower(int c) { return tolower((c)); }
+/* A macro, not a static inline: MinGW's ctype.h already declares _tolower as a
+ * function, and a second definition fails to compile. glibc's macro is replaced
+ * with the same call. */
+#ifdef _tolower
+#undef _tolower
 #endif
+#define _tolower(c) tolower((c))
 #else
 #ifndef _CTYPE_H
 #define _CTYPE_H
