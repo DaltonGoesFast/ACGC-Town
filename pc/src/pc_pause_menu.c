@@ -14,6 +14,7 @@
 #include "pc_room_ui.h" /* roommates: the move-in notice line */
 #include "pc_version.h" /* the title screen's version corner (pc_version_corner_draw) */
 #include "pc_dedicated.h" /* g_pc_dedicated */
+#include "pc_touch.h"
 
 #include "m_font.h"
 #include "m_rcp.h"
@@ -436,6 +437,7 @@ void pc_net_notice_draw(struct game_s* game) {
 
     pc_acre_label_draw(game);
     pc_net_ping_draw(game);
+    pc_touch_draw(game);
 
     if (g_pc_paused || game == NULL || game->graph == NULL) return;
     {

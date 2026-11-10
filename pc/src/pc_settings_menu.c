@@ -27,6 +27,7 @@ enum {
     ITEM_BORDERLESS_ACRES,
     ITEM_FAST_TEXT,
     ITEM_SHOW_ACRE,
+    ITEM_TOUCH,
     ITEM_NES_ASPECT,
     ITEM_MASTER_VOLUME,
     ITEM_STICK_DEADZONE,
@@ -58,6 +59,7 @@ static const Item tab_gameplay_items[] = {
     { "Borderless acres", ITEM_BORDERLESS_ACRES, 0 },
     { "Fast text",        ITEM_FAST_TEXT,        0 },
     { "Acre label",       ITEM_SHOW_ACRE,        0 },
+    { "Touch controls",   ITEM_TOUCH,            0 },
     { "NES aspect",       ITEM_NES_ASPECT,       0 },
 };
 
@@ -274,6 +276,7 @@ static void recompute_dirty(void) {
         (s_pending.borderless_acres != g_pc_settings.borderless_acres) ||
         (s_pending.fast_text        != g_pc_settings.fast_text) ||
         (s_pending.show_acre        != g_pc_settings.show_acre) ||
+        (s_pending.touch_controls   != g_pc_settings.touch_controls) ||
         (s_pending.nes_aspect       != g_pc_settings.nes_aspect) ||
         (s_pending.master_volume    != g_pc_settings.master_volume) ||
         (s_pending.stick_deadzone   != g_pc_settings.stick_deadzone) ||
@@ -338,6 +341,9 @@ static void item_cycle(int id, int dir) {
             break;
         case ITEM_SHOW_ACRE:
             s_pending.show_acre = !s_pending.show_acre;
+            break;
+        case ITEM_TOUCH:
+            s_pending.touch_controls = s_pending.touch_controls < 0 ? 1 : s_pending.touch_controls > 0 ? 0 : -1;
             break;
         case ITEM_NES_ASPECT:
             s_pending.nes_aspect = !s_pending.nes_aspect;
@@ -415,6 +421,9 @@ static void item_format(int id, char* buf, size_t n) {
         case ITEM_SHOW_ACRE:
             snprintf(buf, n, "%s", s_pending.show_acre ? "< On >" : "< Off >");
             break;
+        case ITEM_TOUCH:
+            snprintf(buf, n, "%s", s_pending.touch_controls < 0 ? "< Auto >" : s_pending.touch_controls ? "< On >" : "< Off >");
+            break;
         case ITEM_NES_ASPECT:
             snprintf(buf, n, "%s", s_pending.nes_aspect ? "< 4:3 >" : "< Stretch >");
             break;
@@ -452,6 +461,7 @@ static int item_changed(int id) {
         case ITEM_BORDERLESS_ACRES: return s_pending.borderless_acres != g_pc_settings.borderless_acres;
         case ITEM_FAST_TEXT:        return s_pending.fast_text        != g_pc_settings.fast_text;
         case ITEM_SHOW_ACRE:        return s_pending.show_acre        != g_pc_settings.show_acre;
+        case ITEM_TOUCH:            return s_pending.touch_controls   != g_pc_settings.touch_controls;
         case ITEM_NES_ASPECT:    return s_pending.nes_aspect    != g_pc_settings.nes_aspect;
         case ITEM_MASTER_VOLUME: return s_pending.master_volume != g_pc_settings.master_volume;
         case ITEM_STICK_DEADZONE:  return s_pending.stick_deadzone  != g_pc_settings.stick_deadzone;

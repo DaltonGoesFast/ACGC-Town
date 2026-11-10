@@ -60,6 +60,8 @@ Pocket Camp-style, not a GameCube pad drawn on the screen:
 - One contextual action button (the GameCube A button) whose label follows what the player is standing next to: talk, pick up, drop, shop, confirm.
 - Camera drag, and a way to open the menu. L/R/X/Y/Z stay available but are not the first thing on screen.
 
+The desktop client has a first pass of this (`settings.ini` `touch_controls` = `auto`, `on`, or `off`, `pc/src/pc_touch.c`). A tap or a left click steers the stick toward that ground point. On-screen A, B, Tool, and Emote buttons hold those controls. `auto` turns the overlay on only when SDL reports a touch device, so a normal mouse-and-keyboard session stays as it was until the setting is `on`. The action button is still labelled A; it does not yet rename itself for talk or pick up. Camera drag is not in this pass. The same functions are what an Android or browser build should call. Nothing is added to the network protocol.
+
 ### Pocket Camp-style HUD
 
 An overlay drawn by the client, not a rewrite of every GameCube menu on day one.

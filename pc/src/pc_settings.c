@@ -20,6 +20,7 @@ PCSettings g_pc_settings = {
     .borderless_acres = 1,
     .fast_text = 1,
     .show_acre = 1,
+    .touch_controls = -1,
     .nes_aspect = 1,
     .master_volume = 100,
     .stick_deadzone = 12,
@@ -99,6 +100,9 @@ static const char* DEFAULT_SETTINGS =
     "\n"
     "# Outdoor acre label under the clock (A1 Grass, and so on): 0 = off, 1 = on (local HUD only)\n"
     "show_acre = 1\n"
+    "\n"
+    "# Touch overlay (tap or click to walk, on-screen A / B / Tool / Emote): auto, on, or off. auto is on only when a touchscreen is present\n"
+    "touch_controls = auto\n"
     "\n"
     "# NES emulator aspect ratio: 0 = stretch to fullscreen, 1 = 4:3 pillarbox\n"
     "nes_aspect = 1\n"
@@ -221,6 +225,10 @@ static void apply_setting(const char* key, const char* value) {
         if (val == 0 || val == 1) g_pc_settings.fast_text = val;
     } else if (strcmp(key, "show_acre") == 0) {
         if (val == 0 || val == 1) g_pc_settings.show_acre = val;
+    } else if (strcmp(key, "touch_controls") == 0) {
+        if (strcmp(value, "on") == 0 || strcmp(value, "1") == 0) g_pc_settings.touch_controls = 1;
+        else if (strcmp(value, "off") == 0 || strcmp(value, "0") == 0) g_pc_settings.touch_controls = 0;
+        else if (strcmp(value, "auto") == 0 || strcmp(value, "-1") == 0) g_pc_settings.touch_controls = -1;
     } else if (strcmp(key, "emotes") == 0) {
         if (val == 0 || val == 1) g_pc_settings.emotes = val;
     } else if (strcmp(key, "handover_anim") == 0) {
@@ -368,6 +376,9 @@ void pc_settings_save(void) {
     fprintf(f, "\n");
     fprintf(f, "# Outdoor acre label under the clock (A1 Grass, and so on): 0 = off, 1 = on (local HUD only)\n");
     fprintf(f, "show_acre = %d\n", g_pc_settings.show_acre);
+    fprintf(f, "\n");
+    fprintf(f, "# Touch overlay (tap or click to walk, on-screen A / B / Tool / Emote): auto, on, or off. auto is on only when a touchscreen is present\n");
+    fprintf(f, "touch_controls = %s\n", g_pc_settings.touch_controls < 0 ? "auto" : g_pc_settings.touch_controls ? "on" : "off");
     fprintf(f, "\n");
     fprintf(f, "# NES emulator aspect ratio: 0 = stretch to fullscreen, 1 = 4:3 pillarbox\n");
     fprintf(f, "nes_aspect = %d\n", g_pc_settings.nes_aspect);

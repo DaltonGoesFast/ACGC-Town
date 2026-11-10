@@ -975,6 +975,7 @@ static const char* g_pc_character_spec = NULL;
 /* Play Online "New character" (PC_RELAUNCH_NEW_CHARACTER): the in-process connect asks pc_main_prepare_store_character for a NEW store character WITHOUT looking anything up by
  * name; the Rover scene chooses the real name. Set by pc_po_connect only, cleared right after the character is prepared (and on rollback). */
 static int s_pc_character_new = 0;
+static char s_pc_new_character_name[40]; /* Play Online name prompt; empty means the NewChar placeholder */
 #define PC_NEW_CHARACTER_PLACEHOLDER "NewChar" /* in-memory only: the Rover name editor clears it and the finish saves what the player typed */
 static const char* g_pc_character_import = NULL;
 static int g_pc_characters_list = 0;
@@ -1211,7 +1212,7 @@ static int pc_main_prepare_store_character(void) {
     err[0] = '\0';
     if (s_pc_character_new) {
         /* explicit NEW request: never resolve by name (a name could match an existing character) */
-        if (!pc_character_prepare_new(NULL, PC_NEW_CHARACTER_PLACEHOLDER, &c, err, sizeof(err))) {
+        if (!pc_character_prepare_new(NULL, s_pc_new_character_name[0] != '\0' ? s_pc_new_character_name : PC_NEW_CHARACTER_PLACEHOLDER, &c, err, sizeof(err))) {
             fprintf(stderr, "[PC] new character: REFUSED: a new character cannot be created: %s\n", err);
             return -1;
         }
@@ -1450,9 +1451,11 @@ static int pc_po_connect(char* err, size_t errcap) {
     g_pc_bootstrap_resident_pid_set = 0;
     memset(ss, 0, sizeof(*ss));
     s_pc_character_new = 0;
+    s_pc_new_character_name[0] = '\0';
     if (s_po.kind == PC_RELAUNCH_NEW_CHARACTER) {
         g_pc_character_spec = NULL;
         s_pc_character_new = 1;
+        if (s_po.name[0] != '\0') snprintf(s_pc_new_character_name, sizeof(s_pc_new_character_name), "%s", s_po.name);
         (void)pc_po_select_profile(NULL);
     } else if (s_po.kind == PC_RELAUNCH_CHARACTER) {
         snprintf(s_po_character, sizeof(s_po_character), "%s", s_po.name);

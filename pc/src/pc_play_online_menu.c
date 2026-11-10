@@ -20,7 +20,7 @@
 #include <string.h>
 
 enum { PG_SERVERS, PG_ACTIONS, PG_CHARS, PG_DELETE, PG_MCHARS, PG_MACT, PG_IMPORT, PG_LEGACY, PG_ICONF, PG_IRES };
-enum { T_NONE, T_SRV_NAME, T_SRV_ADDR, T_SRV_PORT, T_CHAR_NAME, T_CHAR_LABEL, T_GCI_PATH }; /* T_CHAR_NAME is unused: "New character" connects at once and the Rover scene asks for the name (the slot keeps the title / hint tables aligned) */
+enum { T_NONE, T_SRV_NAME, T_SRV_ADDR, T_SRV_PORT, T_CHAR_NAME, T_CHAR_LABEL, T_GCI_PATH }; /* T_CHAR_NAME is the name asked before a new character is created (the Rover scene can still edit it) */
 
 #define VISIBLE 8
 #define CHAR_ROWS 5 /* the character page shows fewer, taller rows (a player model beside each name) */
@@ -196,7 +196,7 @@ static int text_max(void) {
         case T_SRV_NAME: return PC_SERVER_NAME_MAX;
         case T_SRV_ADDR: return PC_SERVER_ADDR_MAX - 1;
         case T_SRV_PORT: return 5;
-        case T_CHAR_NAME: return 16;
+        case T_CHAR_NAME: return 8; /* the game stores 8 characters */
         case T_CHAR_LABEL: return 16;
         case T_GCI_PATH: return 330;
     }
@@ -227,13 +227,24 @@ static void do_connect(const PCServer* s, int kind, const char* name, const char
     }
 }
 
+/* The fetch and handshake already explain the failure. These lines are the same facts in plainer words. */
+static const char* friendly_join_error(const char* msg) {
+    if (msg == NULL || msg[0] == '\0') return "Could not connect. Check the address and that the server is running.";
+    if (strstr(msg, "timed out") != NULL) return "The server did not answer. Check the address, port 7777, and that the dedicated server is running.";
+    if (strstr(msg, "could not start connecting") != NULL || strstr(msg, "networking could not") != NULL) return "Could not open a connection to that address. Check the host and the port.";
+    if (strstr(msg, "town-serve") != NULL || strstr(msg, "no town transfer") != NULL) return "The server is not sharing its town. A dedicated server shares it unless town serve was turned off.";
+    if (strstr(msg, "no valid town") != NULL) return "The server has no town yet. Start it once with a GAFE01 disc so it can create the town, then join again.";
+    if (strstr(msg, "Already online") != NULL) return "This game is already connected. Leave that session before joining another server.";
+    return msg;
+}
+
 void pc_play_online_menu_connect_result(int ok, const char* msg) {
     if (ok) {
         set_msg(0, "%s", msg != NULL ? msg : "Connected: loading the town ...");
         /* s_launched stays 1: the menu is inert (and drawn) while the title fades out; pc_main closes it once the title scene is gone */
     } else {
         s_launched = 0; /* back to the menu, the character page, with the reason */
-        set_msg(1, "%s", msg != NULL ? msg : "Could not connect");
+        set_msg(1, "%s", friendly_join_error(msg));
     }
 }
 
@@ -325,6 +336,19 @@ static void text_commit(void) {
             s_page = PG_IRES;
             s_sel = 0;
             s_scroll = 0;
+            return;
+        }
+        case T_CHAR_NAME: {
+            char name[9];
+            if (!pc_guest_profile_name_check(s_buf, why, sizeof(why)) || strlen(s_buf) > 8) {
+                set_msg(1, "%s", (s_buf[0] == '\0' || strlen(s_buf) > 8) ? "Use 1 to 8 letters, digits, or hyphens" : why);
+                return;
+            }
+            snprintf(name, sizeof(name), "%s", s_buf);
+            text_end();
+            if (s_cur >= 0 && s_cur < s_nsrv) {
+                do_connect(&s_srv[s_cur], PC_RELAUNCH_NEW_CHARACTER, name, name);
+            }
             return;
         }
         case T_CHAR_LABEL:
@@ -476,7 +500,13 @@ void pc_play_online_menu_enter(void) {
     s_msg[0] = '\0';
     s_cur = -1;
     reload_servers();
-    goto_page(PG_SERVERS, 0);
+    {
+        int i, sel = 0;
+        for (i = 0; i < s_nsrv; i++) {
+            if (s_srv[i].last_character[0] != '\0') sel = i; /* the last saved server that has been joined */
+        }
+        goto_page(PG_SERVERS, sel);
+    }
 }
 
 int pc_play_online_menu_active(void) {
@@ -571,10 +601,8 @@ int pc_play_online_menu_confirm(void) {
         case PG_CHARS:
             if (s_sel < s_nchr) {
                 char_connect(s_sel);
-            } else if (s_sel == s_nchr) { /* New character: connect at once, the Rover scene on the train asks for the name (the ONLY name prompt) */
-                if (s_cur >= 0 && s_cur < s_nsrv) {
-                    do_connect(&s_srv[s_cur], PC_RELAUNCH_NEW_CHARACTER, NULL, NULL);
-                }
+            } else if (s_sel == s_nchr) { /* New character: ask for a name here, instead of starting as Guest / NewChar */
+                text_begin(T_CHAR_NAME, "");
             } else if (s_sel == s_nchr + 1) { /* Import characters */
                 goto_page(PG_IMPORT, 0);
             } else if (s_sel == s_nchr + 2) { /* Manage characters (never connects) */
@@ -775,7 +803,10 @@ static void row_label(int i, char* out, size_t cap) {
     out[0] = '\0';
     switch (s_page) {
         case PG_SERVERS:
-            if (i < s_nsrv) snprintf(out, cap, "%s", s_srv[i].name); /* the configured name only; address / port stay stored and used for the connection */
+            if (i < s_nsrv) {
+                if (s_srv[i].port == PC_SERVER_DEFAULT_PORT) snprintf(out, cap, "%s   %s", s_srv[i].name, s_srv[i].address);
+                else snprintf(out, cap, "%s   %s:%d", s_srv[i].name, s_srv[i].address, s_srv[i].port);
+            }
             else if (i == s_nsrv) snprintf(out, cap, "Add server");
             else snprintf(out, cap, "Back");
             break;
@@ -872,7 +903,7 @@ static void draw_char_list(struct game_s* game) {
 
 static void draw_text_entry(struct game_s* game) {
     static const char* const k_title[] = { "", "- Server name -", "- Server address -", "- Server port -", "- New character name -", "- Display name -", "- Save file (.gci) path -" };
-    static const char* const k_hint[] = { "", "1..32 characters", "IPv4 or hostname, Ctrl+V pastes", "1..65535 (empty = 7777)", "A-Z a-z 0-9 - (1..16)", "Local label only (A-Z a-z 0-9 -)", "Ctrl+V pastes the full path of the .gci (read only)" };
+    static const char* const k_hint[] = { "", "1..32 characters", "IPv4 or hostname, Ctrl+V pastes", "1..65535 (empty = 7777)", "1 to 8 letters, digits, or hyphens. The train can still change it.", "Local label only (A-Z a-z 0-9 -)", "Ctrl+V pastes the full path of the .gci (read only)" };
     char line[64];
     pc_menu_draw_centered(game, k_title[s_text], 70.0f, 255, 255, 255, 255, 1.0f);
     {
@@ -892,7 +923,7 @@ void pc_play_online_menu_draw(struct game_s* game, int with_dim_backdrop) {
     if (s_text != T_NONE) {
         draw_text_entry(game);
     } else if (s_page == PG_SERVERS) {
-        draw_list(game, "- Play Online: choose a server -", s_nsrv == 0 ? "No saved servers: Add server (or --server-add)" : "Confirm = select, Cancel = back");
+        draw_list(game, "- Play Online: choose a server -", s_nsrv == 0 ? "No saved servers yet. Add server remembers it in save/mp/servers.ini" : "Saved servers. Confirm opens one, Cancel goes back");
     } else if (s_page == PG_ACTIONS) {
         snprintf(buf, sizeof(buf), "- %s -", s_srv[s_cur].name);
         sanitize(buf);

@@ -58,6 +58,7 @@ BOOL PADInit(void) {
 #include "pc_net_game.h"
 #include "pc_play_online_menu.h" /* pc_play_online_menu_text_blocking */
 #include "pc_chat.h"             /* chat (worker CH): pc_chat_pad_block */
+#include "pc_touch.h"            /* touch overlay and mouse click-to-move */
 
 u32 PADRead(PADStatus* status) {
     memset(status, 0, sizeof(PADStatus) * 4);
@@ -220,6 +221,7 @@ u32 PADRead(PADStatus* status) {
         status[0].triggerLeft = 0;
         status[0].triggerRight = 0;
     }
+    pc_touch_apply(&buttons, &stickX, &stickY, &wheel_kb, &emote_kb, &mouse_x, &mouse_y);
     pc_tool_wheel_input(wheel_kb, wheel_pad, mouse_x, mouse_y, wheel_rx, wheel_ry, deadzone_threshold(g_pc_settings.stick_deadzone), &buttons, &cstickX, &cstickY);
 
     if (pc_tool_wheel_is_open()) { /* the analog L/R triggers must not leak into the game while the wheel is up either */
