@@ -22,6 +22,7 @@ static int s_boot_test = 0;
 #include "pc_assets.h"
 #include "pc_crash.h"
 #include "pc_touch.h"
+#include "pc_save_wire.h"
 #include "pc_disc.h"
 #include "pc_typing.h"
 #include "pc_chat.h" /* chat (worker CH): the chat line owns the keyboard while it is open */
@@ -757,6 +758,7 @@ int pc_platform_poll_events(void) {
                  * SDL_HINT_ANDROID_BLOCK_ON_PAUSE waits inside SDL until the surface is back, which is the multi-second
                  * idle gap when the activity pauses (a redundant orientation request used to cause that). */
                 pc_diag_milestone("app background");
+                pc_save_flush_background();
                 break;
             case SDL_APP_DIDENTERFOREGROUND:
                 pc_diag_milestone("app foreground");
@@ -1517,6 +1519,9 @@ static char s_po_character[48]; /* backing store of g_pc_character_spec for the 
 
 int pc_main_play_online_request(const char* host, int port, int kind, const char* name) {
     char tmp[320];
+    if (pc_offline_solo_active()) {
+        return 0;
+    }
     if (s_po.state != PO_IDLE || host == NULL || strlen(host) >= sizeof(s_po.host)) {
         return 0;
     }
@@ -1618,7 +1623,12 @@ static int pc_po_prepare_legacy_guest(char* err, size_t errcap) {
 
 /* Steps 2..8. 1 = committed (the fade to the title was requested), 0 = rolled back (err holds the menu message). */
 static int pc_po_connect(char* err, size_t errcap) {
-    PCConnectSession* ss = pc_session();
+    PCConnectSession* ss;
+    if (pc_offline_solo_active()) {
+        if (err != NULL && errcap > 0) snprintf(err, errcap, "Play Offline does not connect.");
+        return 0;
+    }
+    ss = pc_session();
     PCConnectSession ss_snap = *ss;
     char host_snap[sizeof(g_pc_net_host_ip)];
     char gspec_snap[sizeof(g_pc_guest_spec)];
@@ -1825,6 +1835,10 @@ int pc_play_online_title_hold(void) {
 
 void pc_main_play_online_poll(void) {
     char err[300];
+    if (pc_offline_solo_active()) {
+        s_po.state = PO_IDLE;
+        return;
+    }
     if (s_po.state == PO_IDLE) {
         return;
     }

@@ -512,6 +512,8 @@ int  pc_audio_is_active(void);
 void pc_audio_set_paused(int paused);
 void pc_audio_shutdown(void);
 void pc_audio_start_producer_thread(void);
+int  pc_audio_producer_running(void);
+void pc_audio_apply_setting(void);
 void pc_audio_mq_init(void);
 void pc_audio_mq_shutdown(void);
 

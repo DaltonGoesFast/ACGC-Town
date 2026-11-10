@@ -452,6 +452,51 @@ void pc_version_corner_draw(struct game_s* game, int overlay_open) {
     pc_text_draw(game, text, x, y, 255, 255, 255, 200, scale);
 }
 
+static int s_toast_kind = 0;
+static Uint32 s_toast_until = 0;
+static int s_toast_seen = 0;
+
+void pc_net_status_toast(const char* kind) {
+    Uint32 now = SDL_GetTicks();
+    s_toast_seen = 1;
+    if (kind != NULL && strcmp(kind, "connecting") == 0) s_toast_kind = 1;
+    else if (kind != NULL && strcmp(kind, "connected") == 0) { s_toast_kind = 2; s_toast_until = now + 4000u; }
+    else { s_toast_kind = 3; s_toast_until = now + 4000u; }
+}
+
+static void pc_net_status_toast_draw(struct game_s* game) {
+    PCNetGameLinkState st;
+    Uint32 now;
+    const char* text;
+    int r, g, b;
+    if (game == NULL || game->graph == NULL) return;
+    st = pc_net_game_client_link_state();
+    now = SDL_GetTicks();
+    if (st == PC_NETGAME_LINK_CONNECTING || st == PC_NETGAME_LINK_HANDSHAKE) {
+        s_toast_kind = 1;
+        s_toast_seen = 1;
+    } else if (st == PC_NETGAME_LINK_READY) {
+        if (s_toast_kind != 2) s_toast_until = now + 4000u;
+        s_toast_kind = 2;
+        s_toast_seen = 1;
+    } else if (s_toast_seen && s_toast_kind != 0 && s_toast_kind != 3 && st == PC_NETGAME_LINK_DISCONNECTED) {
+        s_toast_kind = 3;
+        s_toast_until = now + 4000u;
+    }
+    if (s_toast_kind == 0) return;
+    if (s_toast_kind != 1 && (Sint32)(now - s_toast_until) >= 0) {
+        s_toast_kind = 0;
+        return;
+    }
+    if (s_toast_kind == 1) { text = "Connecting"; r = 255; g = 214; b = 120; }
+    else if (s_toast_kind == 2) { text = "Connected"; r = 150; g = 210; b = 150; }
+    else { text = "Disconnected"; r = 214; g = 120; b = 100; }
+    mFont_SetMatrix(game->graph, mFont_MODE_FONT);
+    pc_text_draw(game, text, 118.0f, 8.0f, 20, 24, 18, 160, 0.85f);
+    pc_text_draw(game, text, 117.0f, 7.0f, r, g, b, 235, 0.85f);
+    mFont_UnSetMatrix(game->graph, mFont_MODE_FONT);
+}
+
 void pc_net_notice_draw(struct game_s* game) {
     int join_warning = 0;
     const char* join_msg;
@@ -459,6 +504,7 @@ void pc_net_notice_draw(struct game_s* game) {
     pc_acre_label_draw(game);
     pc_net_ping_draw(game);
     pc_touch_draw(game);
+    pc_net_status_toast_draw(game);
 
     if (g_pc_paused || game == NULL || game->graph == NULL) return;
     {

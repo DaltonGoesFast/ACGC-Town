@@ -30,6 +30,7 @@ typedef struct {
     int touch_stick;     /* 1 = show the fallback stick. The nub toggles this and saves it. */
     int touch_move;      /* 1 = tap the ground to walk. 0 = taps no longer steer. */
     int touch_haptics;   /* 1 = a short buzz on a button or a reached tap. */
+    int touch_virtual_pad; /* 1 = show the stick and A/B discs. Default 0: tap the picture instead. */
     int nes_aspect;       /* NES emulator aspect: 0=fullscreen stretch, 1=4:3 pillarbox (default) */
     int master_volume;    /* Applied at the PC audio output, 0-100 (default 100) */
     int audio;            /* 1 = start the audio device and producer thread (default on PC). 0 = silent. Android defaults to 0 so a bad audio thread does not close the game. */

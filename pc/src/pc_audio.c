@@ -80,6 +80,57 @@ int pc_audio_is_on(void) {
     return g_pc_settings.audio;
 }
 
+int pc_audio_producer_running(void) {
+    return audio_producer_thread != NULL && SDL_AtomicGet(&audio_thread_running);
+}
+
+static void pc_audio_callback(void* userdata, Uint8* stream, int len);
+
+static int pc_audio_open_device(void) {
+    SDL_AudioSpec want, have;
+    if (audio_device != 0 || audio_null) return 1;
+    if (g_pc_headless) {
+        audio_null = 1;
+        SDL_AtomicSet(&audio_null_running, 1);
+        audio_null_thread = SDL_CreateThread(pc_audio_null_func, "AudioNull", NULL);
+        printf("[AUDIO] headless null consumer (no device) rate=%d\n", PC_AUDIO_SAMPLE_RATE);
+        return audio_null_thread != NULL;
+    }
+    memset(&want, 0, sizeof(want));
+    want.freq = PC_AUDIO_SAMPLE_RATE;
+    want.format = AUDIO_S16SYS;
+    want.channels = 2;
+    want.samples = 512;
+    want.callback = pc_audio_callback;
+    audio_device = SDL_OpenAudioDevice(NULL, 0, &want, &have, 0);
+    if (audio_device == 0) {
+        printf("[AUDIO] Failed to open: %s\n", SDL_GetError());
+        return 0;
+    }
+    printf("[AUDIO] Opened: freq=%d fmt=0x%04X ch=%d samples=%d\n",
+           have.freq, have.format, have.channels, have.samples);
+    return 1;
+}
+
+void pc_audio_apply_setting(void) {
+    if (!g_pc_settings.audio) {
+        SDL_AtomicSet(&audio_thread_running, 0);
+        if (audio_producer_thread) {
+            SDL_WaitThread(audio_producer_thread, NULL);
+            audio_producer_thread = NULL;
+        }
+        if (audio_device != 0) SDL_PauseAudioDevice(audio_device, 1);
+        printf("[AUDIO] sound off, frame tick keeps the title moving\n");
+        return;
+    }
+    if (!pc_audio_open_device()) {
+        printf("[AUDIO] sound on but no device, frame tick keeps the title moving\n");
+        return;
+    }
+    pc_audio_start_producer_thread();
+    if (audio_device != 0) SDL_PauseAudioDevice(audio_device, 0);
+}
+
 void pc_audio_start_producer_thread(void) {
     if (!g_pc_settings.audio) {
         printf("[AUDIO] audio=0, producer thread not started\n");
@@ -137,31 +188,12 @@ void AIInit(u8* stack) {
     }
     if (audio_device != 0 || audio_null) return;
 
-    if (g_pc_headless) {
-        audio_null = 1;
-        SDL_AtomicSet(&audio_null_running, 1);
-        audio_null_thread = SDL_CreateThread(pc_audio_null_func, "AudioNull", NULL);
-        printf("[AUDIO] headless null consumer (no device) rate=%d\n", PC_AUDIO_SAMPLE_RATE);
-        if (g_pc_dedicated) pc_dedicated_audio_opened(audio_null_thread != NULL, PC_AUDIO_SAMPLE_RATE, 2, 512);
+    if (!pc_audio_open_device()) {
+        if (g_pc_dedicated) pc_dedicated_audio_opened(0, 0, 0, 0);
         return;
     }
-
-    SDL_AudioSpec want, have;
-    memset(&want, 0, sizeof(want));
-    want.freq = PC_AUDIO_SAMPLE_RATE;
-    want.format = AUDIO_S16SYS;
-    want.channels = 2;
-    want.samples = 512;
-    want.callback = pc_audio_callback;
-
-    audio_device = SDL_OpenAudioDevice(NULL, 0, &want, &have, 0);
-    if (audio_device != 0) {
-        printf("[AUDIO] Opened: freq=%d fmt=0x%04X ch=%d samples=%d (requested: freq=%d)\n",
-               have.freq, have.format, have.channels, have.samples, want.freq);
-        if (g_pc_dedicated) pc_dedicated_audio_opened(1, have.freq, have.channels, have.samples);
-    } else {
-        printf("[AUDIO] Failed to open: %s\n", SDL_GetError());
-        if (g_pc_dedicated) pc_dedicated_audio_opened(0, 0, 0, 0); /* dedicated: a stalled audio producer is not acceptable -> exits 1 */
+    if (g_pc_dedicated) {
+        pc_dedicated_audio_opened(1, PC_AUDIO_SAMPLE_RATE, 2, audio_null ? 512 : 512);
     }
 }
 

@@ -48,9 +48,11 @@ extern void sAdo_GameFrame() {
     /* audio=0 never starts the producer, so the spec-change message that
      * second_game waits on is never posted and the title stays black. */
     {
-        extern int pc_audio_is_on(void);
+        extern int pc_audio_producer_running(void);
         extern void pc_audio_process_frame(void);
-        if (!pc_audio_is_on()) pc_audio_process_frame();
+        /* Sound off, or the device never opened: one tick on the game thread so
+         * second_game is not stuck waiting for the producer. */
+        if (!pc_audio_producer_running()) pc_audio_process_frame();
     }
 #endif
 }

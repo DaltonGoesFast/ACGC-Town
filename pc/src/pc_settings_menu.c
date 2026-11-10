@@ -30,6 +30,7 @@ enum {
     ITEM_TOUCH,
     ITEM_NES_ASPECT,
     ITEM_MASTER_VOLUME,
+    ITEM_SOUND,
     ITEM_STICK_DEADZONE,
     ITEM_CSTICK_DEADZONE,
     ITEM_BINDINGS,
@@ -65,6 +66,7 @@ static const Item tab_gameplay_items[] = {
 };
 
 static const Item tab_audio_items[] = {
+    { "Sound",         ITEM_SOUND,         0 },
     { "Master volume", ITEM_MASTER_VOLUME, 0 },
 };
 
@@ -100,7 +102,7 @@ typedef enum {
 } SubPage;
 
 static int s_hud_sel = 0;
-#define HUD_BACK 6
+#define HUD_BACK 7
 
 static int     s_active = 0;
 static SubPage s_sub    = SUB_SETTINGS;
@@ -292,7 +294,9 @@ static void recompute_dirty(void) {
         (s_pending.touch_left_hand  != g_pc_settings.touch_left_hand) ||
         (s_pending.touch_stick      != g_pc_settings.touch_stick) ||
         (s_pending.touch_move       != g_pc_settings.touch_move) ||
-        (s_pending.touch_haptics    != g_pc_settings.touch_haptics);
+        (s_pending.touch_haptics    != g_pc_settings.touch_haptics) ||
+        (s_pending.touch_virtual_pad != g_pc_settings.touch_virtual_pad) ||
+        (s_pending.audio            != g_pc_settings.audio);
 }
 
 static void snapshot(void) {
@@ -359,6 +363,9 @@ static void item_cycle(int id, int dir) {
             break;
         case ITEM_NES_ASPECT:
             s_pending.nes_aspect = !s_pending.nes_aspect;
+            break;
+        case ITEM_SOUND:
+            s_pending.audio = !s_pending.audio;
             break;
         case ITEM_MASTER_VOLUME: {
             int v = s_pending.master_volume + (dir > 0 ? 10 : -10);
@@ -440,6 +447,9 @@ static void item_format(int id, char* buf, size_t n) {
         case ITEM_NES_ASPECT:
             snprintf(buf, n, "%s", s_pending.nes_aspect ? "< 4:3 >" : "< Stretch >");
             break;
+        case ITEM_SOUND:
+            snprintf(buf, n, "%s", s_pending.audio ? "< On >" : "< Off >");
+            break;
         case ITEM_MASTER_VOLUME:
             snprintf(buf, n, "< %d%% >", s_pending.master_volume);
             break;
@@ -479,6 +489,7 @@ static int item_changed(int id) {
         case ITEM_SHOW_ACRE:        return s_pending.show_acre        != g_pc_settings.show_acre;
         case ITEM_TOUCH:            return s_pending.touch_controls   != g_pc_settings.touch_controls;
         case ITEM_NES_ASPECT:    return s_pending.nes_aspect    != g_pc_settings.nes_aspect;
+        case ITEM_SOUND:         return s_pending.audio != g_pc_settings.audio;
         case ITEM_MASTER_VOLUME: return s_pending.master_volume != g_pc_settings.master_volume;
         case ITEM_STICK_DEADZONE:  return s_pending.stick_deadzone  != g_pc_settings.stick_deadzone;
         case ITEM_CSTICK_DEADZONE: return s_pending.cstick_deadzone != g_pc_settings.cstick_deadzone;
@@ -556,6 +567,10 @@ static void apply_pending(void) {
 
     g_pc_settings = s_pending;
     pc_settings_apply();
+    {
+        extern void pc_audio_apply_setting(void);
+        pc_audio_apply_setting();
+    }
     s_pending_dirty = 0;
     recompute_restart_needed();
 
@@ -617,6 +632,7 @@ static void hud_cycle(int dir) {
         case 3: s_pending.touch_stick = !s_pending.touch_stick; break;
         case 4: s_pending.touch_move = !s_pending.touch_move; break;
         case 5: s_pending.touch_haptics = !s_pending.touch_haptics; break;
+        case 6: s_pending.touch_virtual_pad = !s_pending.touch_virtual_pad; break;
         default: s_sub = SUB_SETTINGS; return;
     }
     recompute_dirty();
@@ -630,20 +646,21 @@ static void hud_value(int row, char* buf, size_t n) {
         case 3: snprintf(buf, n, "%s", s_pending.touch_stick ? "On" : "Off"); break;
         case 4: snprintf(buf, n, "%s", s_pending.touch_move ? "On" : "Off"); break;
         case 5: snprintf(buf, n, "%s", s_pending.touch_haptics ? "On" : "Off"); break;
+        case 6: snprintf(buf, n, "%s", s_pending.touch_virtual_pad ? "On" : "Off"); break;
         default: snprintf(buf, n, "Back"); break;
     }
 }
 
 static void draw_hud_page(struct game_s* game) {
-    static const char* names[7] = {
-        "HUD scale", "HUD opacity", "Hand", "Stick", "Tap to move", "Haptics", "Back"
+    static const char* names[8] = {
+        "HUD scale", "HUD opacity", "Hand", "Stick", "Tap to move", "Haptics", "Virtual pad", "Back"
     };
     int i, r, g, b, a;
     pc_menu_draw_centered(game, "- Touch HUD -", 28.0f, 255, 255, 255, 255, 1.0f);
-    for (i = 0; i < 7; i++) {
+    for (i = 0; i < 8; i++) {
         char value[24];
         int on = (i == s_hud_sel);
-        float y = 58.0f + (float)i * 20.0f;
+        float y = 52.0f + (float)i * 18.0f;
         hud_value(i, value, sizeof(value));
         pc_menu_row_colors(on, &r, &g, &b, &a);
         pc_menu_draw_left(game, names[i], 48.0f, y, r, g, b, a, on ? PC_MENU_SCALE_SELECTED : 1.0f);

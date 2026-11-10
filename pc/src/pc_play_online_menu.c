@@ -9,6 +9,7 @@
 #include "pc_text_draw.h"
 #include "pc_relaunch.h" /* PC_RELAUNCH_* kinds (the relaunch itself is no longer used here) */
 #include "pc_servers.h"
+#include "pc_pause_menu.h" /* pc_net_status_toast */
 
 #include "m_font.h"
 #include "m_rcp.h"
@@ -244,6 +245,7 @@ static void do_connect(const PCServer* s, int kind, const char* name, const char
     /* In-process connect (no relaunch): the request is executed by pc_main_play_online_poll() (pc_vi.c) at the end of this frame. The menu ignores input meanwhile. */
     if (pc_main_play_online_request(s->address, s->port, kind, name)) {
         s_launched = 1;
+        pc_net_status_toast("connecting");
         set_msg(0, "Connecting to %s ...", s->name);
     } else {
         set_msg(1, "%s", "Could not start the connection (bad server or character name)");
@@ -263,9 +265,11 @@ static const char* friendly_join_error(const char* msg) {
 
 void pc_play_online_menu_connect_result(int ok, const char* msg) {
     if (ok) {
+        pc_net_status_toast("connected");
         set_msg(0, "%s", msg != NULL ? msg : "Connected: loading the town ...");
         /* s_launched stays 1: the menu is inert (and drawn) while the title fades out; pc_main closes it once the title scene is gone */
     } else {
+        pc_net_status_toast("disconnected");
         s_launched = 0; /* back to the menu, the character page, with the reason */
         set_msg(1, "%s", friendly_join_error(msg));
     }
