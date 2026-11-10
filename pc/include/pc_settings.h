@@ -26,6 +26,7 @@ typedef struct {
     int touch_keyboard;   /* 1 = the Chat button opens the line and SDL's on-screen keyboard */
     int nes_aspect;       /* NES emulator aspect: 0=fullscreen stretch, 1=4:3 pillarbox (default) */
     int master_volume;    /* Applied at the PC audio output, 0-100 (default 100) */
+    int audio;            /* 1 = start the audio device and producer thread (default on PC). 0 = silent. Android defaults to 0 so a bad audio thread does not close the game. */
     int stick_deadzone;   /* Gamepad main stick deadzone, percent 0-40 (default 12) */
     int cstick_deadzone;  /* Gamepad C-stick deadzone, percent 0-40 (default 12) */
     int max_guests;       /* HOST only (G4): most guests (foreigners, never residents) bound at once, 1..254 (pc_guest_admit_limit(); default 4); malformed / out of range = ignored */

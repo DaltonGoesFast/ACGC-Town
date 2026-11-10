@@ -1559,18 +1559,16 @@ void HS_Event_Reset() {
 }
 
 void HS_Event_Update() {
-    //! TODO: this has to be wrong
-    typedef struct {
-        u8 a, b;
-    } tempBuf;
-    tempBuf message;
-
     while (1) {
-        // this should take a void** for message, and it fills out the OSMessage(which is a void*)
-        if (!OSReceiveMessage(&SoundQ, (OSMessage*)&message, 0)) {
+        /* HS_Event_Write packs (a << 24) | (b << 16) into the message word.
+         * Receiving into a 2-byte local writes past it on every ABI. */
+        OSMessage raw;
+        u32 word;
+        if (!OSReceiveMessage(&SoundQ, &raw, 0)) {
             break;
         }
-        __Sound_Write_HVC(message.a, message.b);
+        word = (u32)(uintptr_t)raw;
+        __Sound_Write_HVC((u8)(word >> 24), (u8)(word >> 16));
     }
 }
 

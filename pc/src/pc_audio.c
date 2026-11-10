@@ -77,6 +77,10 @@ static int pc_audio_producer_func(void* data) {
 }
 
 void pc_audio_start_producer_thread(void) {
+    if (!g_pc_settings.audio) {
+        printf("[AUDIO] audio=0, producer thread not started\n");
+        return;
+    }
     if (audio_producer_thread) return;
     SDL_AtomicSet(&audio_thread_running, 1);
     audio_producer_thread = SDL_CreateThread(pc_audio_producer_func, "AudioProducer", NULL);
@@ -123,6 +127,10 @@ static void pc_audio_callback(void* userdata, Uint8* stream, int len) {
 
 void AIInit(u8* stack) {
     (void)stack;
+    if (!g_pc_settings.audio) {
+        printf("[AUDIO] audio=0, device not opened\n");
+        return;
+    }
     if (audio_device != 0 || audio_null) return;
 
     if (g_pc_headless) {

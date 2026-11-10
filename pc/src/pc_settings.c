@@ -31,6 +31,11 @@ PCSettings g_pc_settings = {
     .touch_keyboard = 1,
     .nes_aspect = 1,
     .master_volume = 100,
+#ifdef __ANDROID__
+    .audio = 0,
+#else
+    .audio = 1,
+#endif
     .stick_deadzone = 12,
     .cstick_deadzone = 12,
     .max_guests = 4,
@@ -144,6 +149,15 @@ static const char* DEFAULT_SETTINGS =
     "[Audio]\n"
     "# Master output volume as a percentage (0-100)\n"
     "master_volume = 100\n"
+    "\n"
+#ifdef __ANDROID__
+    "# 1 = open the audio device and run the audio thread, 0 = silent. Android starts at 0.\n"
+    "audio = 0\n"
+#else
+    "# 1 = open the audio device and run the audio thread (default), 0 = silent\n"
+    "audio = 1\n"
+#endif
+    "\n"
     "\n"
     "[Input]\n"
     "# Gamepad stick deadzones as a percentage (0-40)\n"
@@ -272,6 +286,8 @@ static void apply_setting(const char* key, const char* value) {
         if (val == 0 || val == 1) g_pc_settings.nes_aspect = val;
     } else if (strcmp(key, "master_volume") == 0) {
         if (val >= 0 && val <= 100) g_pc_settings.master_volume = val;
+    } else if (strcmp(key, "audio") == 0) {
+        if (val == 0 || val == 1) g_pc_settings.audio = val;
     } else if (strcmp(key, "stick_deadzone") == 0) {
         if (val >= 0 && val <= 40) g_pc_settings.stick_deadzone = val;
     } else if (strcmp(key, "cstick_deadzone") == 0) {
@@ -434,6 +450,9 @@ void pc_settings_save(void) {
     fprintf(f, "[Audio]\n");
     fprintf(f, "# Master output volume as a percentage (0-100)\n");
     fprintf(f, "master_volume = %d\n", g_pc_settings.master_volume);
+    fprintf(f, "\n");
+    fprintf(f, "# 1 = open the audio device and run the audio thread, 0 = silent\n");
+    fprintf(f, "audio = %d\n", g_pc_settings.audio);
     fprintf(f, "\n");
     fprintf(f, "[Input]\n");
     fprintf(f, "# Gamepad stick deadzones as a percentage (0-40)\n");

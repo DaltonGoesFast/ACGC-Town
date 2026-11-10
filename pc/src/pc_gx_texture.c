@@ -3,8 +3,46 @@
 #include "pc_texture_pack.h"
 #include "pc_profiler.h"
 #include "pc_settings.h"
+#include "pc_lowaddr.h"
 #include <dolphin/gx/GXEnum.h>
 #include <stdlib.h>
+
+#ifdef PC_GBI_INTERN
+unsigned int pc_gbi_intern(uintptr_t addr);
+int pc_gbi_is_token(unsigned int packed);
+uintptr_t pc_gbi_resolve(unsigned int packed);
+
+/* High texture pointers do not fit in a GX u32. Intern each address once so a
+ * later frame that sees the same buffer does not fill the token table. */
+#define PC_GX_HI_PTRS 4096
+static uintptr_t s_gx_hi_ptr[PC_GX_HI_PTRS];
+static unsigned int s_gx_hi_tok[PC_GX_HI_PTRS];
+static int s_gx_hi_n;
+
+static u32 pc_gx_pack_ptr(const char* cat, const void* p) {
+    uintptr_t a = (uintptr_t)p;
+    int i;
+    if (a < 0x100000000ull && (a & 1ull) == 0) return (u32)a;
+    for (i = 0; i < s_gx_hi_n; i++) {
+        if (s_gx_hi_ptr[i] == a) return s_gx_hi_tok[i];
+    }
+    if (s_gx_hi_n < PC_GX_HI_PTRS) {
+        unsigned int tok = pc_gbi_intern(a);
+        s_gx_hi_ptr[s_gx_hi_n] = a;
+        s_gx_hi_tok[s_gx_hi_n++] = tok;
+        return tok;
+    }
+    return PC_PTR32(cat, p);
+}
+
+static void* pc_gx_unpack_ptr(u32 w) {
+    if (pc_gbi_is_token(w)) return (void*)pc_gbi_resolve(w);
+    return (void*)(uintptr_t)w;
+}
+#else
+static u32 pc_gx_pack_ptr(const char* cat, const void* p) { return PC_PTR32(cat, p); }
+static void* pc_gx_unpack_ptr(u32 w) { return (void*)(uintptr_t)w; }
+#endif
 
 static int pc_gx_tlut_force_be(void);
 static void decode_rgb5a3_entry(u16 val, u8* r, u8* g, u8* b, u8* a);
@@ -202,7 +240,7 @@ void GXInitTexObj(void* obj, void* image_ptr, u16 width, u16 height, u32 format,
                   u32 wrap_s, u32 wrap_t, u8 mipmap) {
     u32* o = (u32*)obj;
     memset(o, 0, TEXOBJ_SIZE * sizeof(u32));
-    o[TEXOBJ_IMAGE_PTR] = PC_PTR32("GX texobj image", image_ptr);
+    o[TEXOBJ_IMAGE_PTR] = pc_gx_pack_ptr("GX texobj image", image_ptr);
     o[TEXOBJ_WIDTH] = width;
     o[TEXOBJ_HEIGHT] = height;
     o[TEXOBJ_FORMAT] = format;
@@ -223,7 +261,7 @@ void GXInitTexObjCI(void* obj, void* image_ptr, u16 width, u16 height, u32 forma
 
 void GXInitTexObjData(void* obj, void* image_ptr) {
     u32* o = (u32*)obj;
-    o[TEXOBJ_IMAGE_PTR] = PC_PTR32("GX texobj image", image_ptr);
+    o[TEXOBJ_IMAGE_PTR] = pc_gx_pack_ptr("GX texobj image", image_ptr);
 }
 
 void GXInitTexObjLOD(void* obj, u32 min_filt, u32 mag_filt, f32 min_lod, f32 max_lod,
@@ -601,7 +639,7 @@ static void pc_gx_load_tex_obj_impl(void* obj, u32 id) {
     if (id >= 8) return;
 
     u32* o = (u32*)obj;
-    void* image_ptr = (void*)(uintptr_t)o[TEXOBJ_IMAGE_PTR];
+    void* image_ptr = pc_gx_unpack_ptr(o[TEXOBJ_IMAGE_PTR]);
     int width = (int)o[TEXOBJ_WIDTH];
     int height = (int)o[TEXOBJ_HEIGHT];
     u32 format = o[TEXOBJ_FORMAT];
@@ -616,7 +654,7 @@ static void pc_gx_load_tex_obj_impl(void* obj, u32 id) {
     if (format == GX_TF_C4 || format == GX_TF_C8) {
         int tlut_name = (int)o[TEXOBJ_TLUT_NAME];
         if (tlut_name >= 0 && tlut_name < 16 && g_gx.tlut[tlut_name].data) {
-            tlut_ptr_key = PC_PTR32("GX TLUT", g_gx.tlut[tlut_name].data);
+            tlut_ptr_key = pc_gx_pack_ptr("GX TLUT", g_gx.tlut[tlut_name].data);
             tlut_hash_key = tlut_content_hash(g_gx.tlut[tlut_name].data,
                                               g_gx.tlut[tlut_name].format,
                                               g_gx.tlut[tlut_name].n_entries,
@@ -851,7 +889,7 @@ void GXInvalidateTexRegion(void* region) { (void)region; }
 void GXInitTlutObj(void* obj, void* lut, u32 fmt, u16 n_entries) {
     u32* o = (u32*)obj;
     memset(o, 0, 4 * sizeof(u32));
-    o[TLUTOBJ_DATA] = PC_PTR32("GX TLUT", lut);
+    o[TLUTOBJ_DATA] = pc_gx_pack_ptr("GX TLUT", lut);
     o[TLUTOBJ_FORMAT] = fmt;
     o[TLUTOBJ_N_ENTRIES] = n_entries;
 }
@@ -860,7 +898,7 @@ void GXLoadTlut(void* obj, u32 idx) {
     pc_gx_flush_if_begin_complete();
     if (idx >= 16) return;
     u32* o = (u32*)obj;
-    g_gx.tlut[idx].data = (const void*)(uintptr_t)o[TLUTOBJ_DATA];
+    g_gx.tlut[idx].data = pc_gx_unpack_ptr(o[TLUTOBJ_DATA]);
     g_gx.tlut[idx].format = (int)o[TLUTOBJ_FORMAT];
     g_gx.tlut[idx].n_entries = (int)o[TLUTOBJ_N_ENTRIES];
     g_gx.tlut[idx].is_be = 1; /* default to BE (ROM/JSystem data) */
@@ -910,7 +948,7 @@ u16    GXGetTexObjHeight(const void* obj) { return (u16)((const u32*)obj)[TEXOBJ
 u16    GXGetTexObjWidth(const void* obj)  { return (u16)((const u32*)obj)[TEXOBJ_WIDTH]; }
 u32    GXGetTexObjWrapS(const void* obj)  { return ((const u32*)obj)[TEXOBJ_WRAP_S]; }
 u32    GXGetTexObjWrapT(const void* obj)  { return ((const u32*)obj)[TEXOBJ_WRAP_T]; }
-void*  GXGetTexObjData(const void* obj)   { return (void*)(uintptr_t)((const u32*)obj)[TEXOBJ_IMAGE_PTR]; }
+void*  GXGetTexObjData(const void* obj)   { return pc_gx_unpack_ptr(((const u32*)obj)[TEXOBJ_IMAGE_PTR]); }
 
 void GXDestroyTexObj(void* obj) {
     u32* o = (u32*)obj;
