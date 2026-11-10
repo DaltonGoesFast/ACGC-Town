@@ -10,6 +10,8 @@
 #include "ac_uki.h"
 #ifdef TARGET_PC
 #include "pc_bswap.h"
+#include "pc_net_game.h" /* X1b: pc_net_game_client_pocket_locked() -- see mPlib_able_submenu_type1() */
+#include "pc_pvp_authority.h" /* player-vs-player: pc_pvp_puppet_near() -- see mPlib_Check_scoop_after() */
 #endif
 
 int g_mPlib_wade_disabled = FALSE;
@@ -1297,6 +1299,46 @@ extern void mPlib_change_player_face(GAME* game) {
     mPlib_change_player_face_pallet(game);
 }
 
+/* PC multiplayer (Stage 4C-1): explicit-parameter counterpart to mPlib_change_player_face() +
+ * mPlib_Get_UseFacePalletRom_p(), for building a face texture/palette pair for a player OTHER
+ * than Now_Private (a remote multiplayer peer) without touching Now_Private, gamePT, or any
+ * Object_Exchange_c bank. This is a byte-for-byte transcription of those two functions' existing
+ * logic -- see mPlib_Get_UseFaceTexRom_p()/mPlib_Get_UseFacePalletRom_p() above -- parameterized on
+ * explicit (sex, face_type, sunburn_rank, swell, decoy) instead of reading
+ * Now_Private->gender/face/sunburn.rank and Common_Get(player_bee_swell_flag)/
+ * Common_Get(player_decoy_flag). swell/decoy are exposed only for parameter parity with the
+ * functions this mirrors; ordinary remote appearance sync passes FALSE/FALSE for both (bee-sting
+ * swelling and NPC-decoy disguise are per-frame transient local states, not yet synchronized).
+ * Writes exactly 0xE00 bytes to face_tex_p and mNW_PALETTE_SIZE bytes to face_pallet_p; both must
+ * be caller-owned, non-NULL buffers of at least that size -- no-op if either is NULL. */
+extern void mPlib_Load_FaceTexAndPallet(void* face_tex_p, void* face_pallet_p, int sex, int face_type,
+                                        int sunburn_rank, int swell, int decoy) {
+    u32 tex_rom_p;
+    u32 pallet_rom_p;
+
+    if (face_tex_p == NULL || face_pallet_p == NULL) {
+        return;
+    }
+
+    tex_rom_p = mPlib_Get_UseFaceTexRom_p_common(sex, face_type, swell, decoy);
+    _JW_GetResourceAram(tex_rom_p, (u8*)face_tex_p, 0xE00);
+    DCStoreRangeNoSync(face_tex_p, 0xE00);
+
+    if (sunburn_rank > 0 && decoy == FALSE) {
+        u32 idx = mPlib_Get_UseFaceRom_index(sex, face_type, swell, FALSE, mPlayer_USE_FACE_ROM_TYPE_PAL);
+        u32 base = mPlib_Get_UseFaceTexRom_p_common(mPr_SEX_FEMALE, mPr_FACE_TYPE7, TRUE, TRUE);
+        pallet_rom_p = base + 0xE00 + (sunburn_rank + idx) * 0x20;
+    } else {
+        pallet_rom_p = tex_rom_p + 0xE00;
+    }
+
+    _JW_GetResourceAram(pallet_rom_p, (u8*)face_pallet_p, mNW_PALETTE_SIZE);
+#ifdef TARGET_PC
+    mPlib_ByteSwapPlayerPalette((u16*)face_pallet_p);
+#endif
+    DCStoreRangeNoSync(face_pallet_p, mNW_PALETTE_SIZE);
+}
+
 extern PLAYER_ACTOR* get_player_actor_withoutCheck(GAME_PLAY* play) {
     return (PLAYER_ACTOR*)&play->actor_info.list[ACTOR_PART_PLAYER].actor[0];
 }
@@ -2579,6 +2621,16 @@ static int mPlib_CheckScene_AbleSubmenu(void) {
 extern int mPlib_able_submenu_type1(GAME* game) {
     int res = FALSE;
 
+#ifdef TARGET_PC
+    /* X1b lock (b), CLIENT ONLY (the predicate is false for single-player and the host): while a pickup/drop/bury request or its
+     * host-transactional commit is unresolved, the inventory / map / A-button board opens, the mailbox and the mscore stay closed, so
+     * the pocket slot the transaction refers to cannot be rearranged before the host's outcome. Every caller evaluates this once per
+     * frame inside an && chain (m_submenu.c, ac_mailbox_move.c_inc, ac_mscore_control.c) and nothing loops on it. */
+    if (pc_net_game_client_pocket_locked()) {
+        return FALSE;
+    }
+#endif
+
     if (GET_PLAYER_ACTOR_GAME(game)->check_request_main_priority_proc(game, mPlayer_REQUEST_PRIORITY_19) > 0 &&
         mPlib_Check_SetOrderSubmenu() == FALSE && mPlib_check_request_change_item() == FALSE &&
         mPlib_check_player_warp_forEvent() == FALSE &&
@@ -3244,6 +3296,13 @@ extern int mPlib_Check_scoop_after(GAME* game, xyz_t* pos_p, mActor_name_t* item
 
                                 return mPlayer_INDEX_AIR_SCOOP;
                             }
+#ifdef TARGET_PC
+                            /* player-vs-player: another player's puppet counts like a villager (no hole is dug under a player);
+                             * the swing becomes the vanilla AIR_SCOOP and the hit itself is the host-validated PVP_HIT_REQ */
+                            if (pc_pvp_puppet_near(pos_p->x, pos_p->z, 39.0f)) {
+                                return mPlayer_INDEX_AIR_SCOOP;
+                            }
+#endif
 
                             hit_actor_p = mPlib_Search_exist_psnowman_inCircle_forScoop(game, pos_p, SQ(39.0f));
                             if (hit_actor_p != NULL) {

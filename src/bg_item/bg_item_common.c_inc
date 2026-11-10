@@ -1,3 +1,13 @@
+#ifdef TARGET_PC
+#include "pc_net_game.h" /* Stage 5B-3: pc_net_game_notify_local_drop_landing() -- see this file's
+                           * two bIT_actor_drop_move_fly*() landing sites, below. */
+/* outdoor furniture C1 (pc/src/pc_ofurn_draw.c): placed pieces drawn as models from the field-item actor (draw / presentation tick / teardown) */
+extern int pc_ofurn_hide_leaf(int ut_x, int ut_z, int item);
+extern void pc_ofurn_bgitem_move(GAME_PLAY* play);
+extern void pc_ofurn_bgitem_draw(GAME_PLAY* play);
+extern void pc_ofurn_bgitem_destruct(void);
+#endif
+
 static void bit_cmn_single_drawS(GAME* game, bg_item_common_info_c* common_info, mActor_name_t fg_item, xyz_t* pos,
                                  s_xyz* angle, xyz_t* scale, u8 alpha, bIT_DRAW_BF_PROC draw_bf,
                                  bIT_DRAW_AF_PROC draw_af, rgba_t* col);
@@ -704,6 +714,18 @@ static void bIT_actor_drop_move_fly_destruct(bg_item_drop_c* drop) {
                 bIT_common_hole_throw(drop->fg_item, *fg_item_p, &drop->target_position, 1);
             } else {
                 mFI_SetFG_common(drop->fg_item, drop->target_position, FALSE);
+#ifdef TARGET_PC
+                /* Stage 5B-3: forced-completion landing (scene/actor teardown mid-animation) -- the
+                 * real field write is the mFI_SetFG_common() just above; announce it the same way
+                 * the natural-completion site does, only if this is the tile a host-local ordinary
+                 * drop is actually watching. */
+                {
+                    int ut_x, ut_z;
+                    if (mFI_Wpos2UtNum(&ut_x, &ut_z, drop->target_position)) {
+                        pc_net_game_notify_local_drop_landing(ut_x, ut_z, (int)drop->fg_item);
+                    }
+                }
+#endif
             }
         }
 
@@ -811,6 +833,11 @@ static int bIT_actor_drop_entry_main(bg_item_drop_table_c* drop_info, bg_item_dr
     return res;
 }
 
+/* World Ecology T0 -- see drop_fruit()'s own doc comment below (this file) before adding ANY host-
+ * authority/network gating near this function: fruit_set() is drop_fruit()'s own low-level mutator and
+ * is reached from the SAME four call sites (tree shake, tree chop, bee-birth, and the balloon pop in
+ * ac_fuusen.c) through the same shared item_tree_fruit_drop_proc() seam -- a gate here would break the
+ * balloon path exactly like a gate inside drop_fruit() itself would. */
 static int fruit_set(mActor_name_t fg_item, int ut_x, int ut_z, s16 num, int drop_type, xyz_t* pos,
                      ACTOR* parent_actor) {
     xyz_t drop_pos;
@@ -1005,6 +1032,7 @@ static int bIT_fruit_set(mActor_name_t fg_item, int ut_x, int ut_z, s16 count, i
     return fruit_set(fg_item, ut_x, ut_z, count, type, &tmp, NULL);
 }
 
+
 typedef struct fruit_drop_s {
     mActor_name_t src_tree_item;
     mActor_name_t dropped_item;
@@ -1012,6 +1040,25 @@ typedef struct fruit_drop_s {
     s16 drop_count;
 } bIT_fruit_drop_c;
 
+/* World Ecology T0 (shared foundation for the FUTURE T1 tree task) -- READ BEFORE ADDING HOST-
+ * AUTHORITY GATING HERE: drop_fruit()/fruit_set() are reached from FOUR call sites, traced end to end
+ * for this milestone's T0 pass:
+ *   1. m_player_main_shake_tree.c_inc  (tree SHAKE  -- a player-action seam T1 will gate)
+ *   2. m_player_main_swing_axe.c_inc   (tree CHOP   -- a player-action seam T1 will gate)
+ *   3. m_player_common.c_inc           (BEE-BIRTH, ~line 6794-6799 -- a player-action seam T1 will gate)
+ *   4. ac_fuusen.c                     (BALLOON pop -- NOT a player action; must NEVER be gated)
+ * All four reach here through the SAME function pointer, Common_Get(clip).bg_item_clip->
+ * item_tree_fruit_drop_proc (-> bg_item_tree_fruit_drop() -> drop_fruit()/fruit_set(), this file) --
+ * there is no way to tell which of the four call sites is currently calling in from inside this
+ * function or bg_item_tree_fruit_drop() itself.
+ * DO NOT add a host-authority gate (or any other network check) INSIDE drop_fruit()/fruit_set()/
+ * bg_item_tree_fruit_drop() to make tree shake/chop authoritative: a blanket gate here would also
+ * silently break the balloon drop for every player, host or client, which has nothing to do with tree
+ * authority at all. T1 must gate at the THREE PLAYER-ACTION CALL SITES themselves (1-3 above, each
+ * right before it calls item_tree_fruit_drop_proc(...)), leaving ac_fuusen.c's balloon call site
+ * completely untouched -- exactly the same shape as this milestone's existing DIG_BURIED/MONEY_ROCK_HIT
+ * validators, which gate at the seam that initiates the action, never inside a shared low-level mutator.
+ * Zero behavioral change in this T0 pass: this comment is documentation only. */
 static void drop_fruit(mActor_name_t fg_item, int ut_x, int ut_z, xyz_t* drop_pos, ACTOR* parent_actor) {
     static bIT_fruit_drop_c fg_ytable[] = {
         { TREE_APPLE_FRUIT, ITM_FOOD_APPLE, TREE_APPLE_NOFRUIT_0, 3 },
@@ -1133,6 +1180,18 @@ static void bg_item_tree_fruit_drop(mActor_name_t fg_item, int ut_x, int ut_z, x
         drop_fruit(fg_item, ut_x, ut_z, drop_pos, NULL);
     }
 }
+
+/* World Ecology T1: pc_tree_birth_bee_visual() used to be defined here, but this file is #include'd
+ * into FOUR separate translation units (bg_item.c, bg_cherry_item.c, bg_winter_item.c, bg_xmas_item.c),
+ * and unlike every other TARGET_PC helper above (which are either static or, like
+ * pc_net_game_notify_local_drop_landing(), merely called from here while actually defined in a real
+ * standalone .c file), this one needs external linkage for Check_BirthBee_common()
+ * (m_player_common.c_inc, a different translation unit) to call it. Giving it external linkage while
+ * its body lived in this shared .c_inc meant it was compiled into all four object files, causing a
+ * `multiple definition of 'pc_tree_birth_bee_visual'` link error. Following the codebase's existing
+ * convention for externally-linked helpers used from this file (define once, in a real .c file; declare
+ * extern in the shared header), its definition now lives in bg_item.c, immediately after this file's
+ * own #include. See bg_item_h.h for its declaration and bg_item.c for the definition + full doc. */
 
 static int bIT_actor_dig_hole_effect_entry(mActor_name_t fg_item, xyz_t* pos, u16 frames, u16 wait_frames) {
     int ut_x;
@@ -1761,6 +1820,22 @@ static void bIT_actor_drop_move_fly(bg_item_drop_c* drop) {
 
             if ((drop->flags & 4) == 0) {
                 mFI_SetFG_common(drop->fg_item, drop->target_position, TRUE);
+#ifdef TARGET_PC
+                /* Stage 5B-3: natural-completion landing -- the real field write is the
+                 * mFI_SetFG_common() just above (note this branch is only reached on the SECOND
+                 * time the landing condition is met: an ordinary drop bounces once first, via the
+                 * drop->_6E branch above, which does not reach here). Announce it only if this is
+                 * the tile a host-local ordinary drop is actually watching -- see
+                 * pc_net_game_notify_local_drop_landing()'s own doc for why every other drop-table
+                 * user (money-rock, get-scoop, pickup-exchange, putin-scoop, a client's own Stage
+                 * 5B-1 drop) safely falls through as a no-op here. */
+                {
+                    int ut_x, ut_z;
+                    if (mFI_Wpos2UtNum(&ut_x, &ut_z, drop->target_position)) {
+                        pc_net_game_notify_local_drop_landing(ut_x, ut_z, (int)drop->fg_item);
+                    }
+                }
+#endif
             }
         }
     } else {
@@ -2620,6 +2695,12 @@ static void bg_item_common_classifyitemDataTable(const GAME_PLAY* const play, bg
                         }
                     }
 
+#ifdef TARGET_PC
+                    /* outdoor furniture C1 (pc/src/pc_ofurn_draw.c): a PLACED piece is drawn as its model, not as the leaf (town field only; a leaf without a marker is unchanged) */
+                    if (flag && *fg_p != EMPTY_NO && ITEM_IS_FTR(*fg_p) && pc_ofurn_hide_leaf(base_ut_x + ut_x, base_ut_z + ut_z, *fg_p)) {
+                        flag = FALSE;
+                    }
+#endif
                     if (flag) {
                         int type = type_data.type;
                         int before_start;
@@ -2834,6 +2915,9 @@ static void bg_item_common_renew_draw_and_crs_data_perfect(GAME_PLAY* play, bg_i
 }
 
 static void bg_item_common_destruct(GAME_PLAY* play, ACTOR* actorx, bg_item_common_c* common) {
+#ifdef TARGET_PC
+    pc_ofurn_bgitem_destruct(); /* outdoor furniture C1: the placed-piece models and their collision leave with the field-item actor */
+#endif
     bIT_actor_drop_destruct(&common->drop_info);
     bIT_actor_drop_destruct(&common->fruit_drop_info);
     bIT_actor_hole_effect_destruct(common->hole);
@@ -2927,6 +3011,73 @@ static void bg_item_common_draw_check(GAME_PLAY* play, bg_item_common_c* common,
     }
 }
 
+#ifdef TARGET_PC
+/* "Cosmetic world reactions behind menus" (multiplayer only; m_play.c Game_play_pc_submenu_live_tick ticks this actor while a
+ * free-play submenu is open in a live session, with g_pc_submenu_world_tick set). A FILTERED pass of bg_item_common_move that
+ * keeps only what is pure presentation and never writes the town map:
+ *   - drops: ONLY "presentation" fly drops (flag 0x4 = the landing never calls mFI_SetFG_common, no hole flag 0x8, not the
+ *     honeycomb, whose wait state moves the bee actor): the TREE_DROP falling fruit / bells / furniture (pc_bg_item_present_tree_drop)
+ *     and the fly-away items of bIT_actor_fly_entry. Every other drop (a plant drop, an ordinary drop that writes its tile on
+ *     landing, a buried-into-hole drop) is HELD exactly as vanilla holds it and resumes when the menu closes.
+ *   - the shine-spot glow (eEC effects only) and the fade-out alpha of a removed item (its tile was written at entry).
+ *   - the draw-table refresh when ONLY update_fg is pending (a tile changed by the host / tile sync: tree -> stump, an item
+ *     dropped or picked up, a hole, a weed pulled): a read of the live grid into this actor's own draw tables (vanilla's own
+ *     refresh path); it is skipped while born_item / a wade / remove_cut_tree_info_bitfield is pending (those touch the hole /
+ *     beecomb block state: they wait for the menu to close).
+ * HELD (vanilla freeze): the dig / bury hole effects (they write the tile when they finish), pitfalls (they grab the player), the
+ * money-rock coin window (gameplay timer + reset write), outdoor-furniture models / collision (pc_ofurn_bgitem_move registers
+ * move-bg collision). */
+extern unsigned g_pc_menu_cos_drop_ticks;   /* m_play.c */
+extern unsigned g_pc_menu_cos_drop_held;
+extern unsigned g_pc_menu_cos_redraws;
+extern unsigned g_pc_menu_cos_redraw_held;
+
+static void bIT_pc_menu_drop_move(bg_item_drop_table_c* drop_info) {
+    bg_item_drop_c* drop = drop_info->drop_p;
+    int i;
+
+    for (i = 0; i < drop_info->count; i++, drop++) {
+        if (drop->move_proc == NULL) {
+            continue;
+        }
+        if (drop->move_proc == &bIT_actor_drop_move_fly && (drop->flags & 4) != 0 && (drop->flags & 8) == 0 &&
+            drop->fg_item != HONEYCOMB && drop->layer <= 0 && drop->wait_counter <= 0) {
+            xyz_t_move(&drop->offset, &ZeroVec);
+            drop->move_proc(drop);
+            g_pc_menu_cos_drop_ticks++;
+        } else {
+            g_pc_menu_cos_drop_held++;
+        }
+    }
+}
+
+static void bg_item_common_pc_menu_cosmetic_move(GAME_PLAY* play, ACTOR* actorx, bg_item_common_c* common, int ticks) {
+    bg_item_draw_table_c* draw_tbl;
+    int i;
+
+    bIT_pc_menu_drop_move(&common->drop_info);
+    bIT_pc_menu_drop_move(&common->fruit_drop_info);
+    bIT_actor_shin_effect_move((GAME*)play, common->shin);
+    bIT_actor_fade_move((GAME*)play, common->fade, ticks);
+
+    if (mFI_FGisUpDate() == TRUE) {
+        if (mFI_ItemisBorn() != TRUE && !mFI_CheckPlayerWade(mFI_WADE_END) && Common_Get(remove_cut_tree_info_bitfield) == 0) {
+            bg_item_common_renew_draw_and_crs_data_perfect(play, common, 1);
+            g_pc_menu_cos_redraws++;
+        } else {
+            g_pc_menu_cos_redraw_held++;
+        }
+    }
+
+    draw_tbl = common->draw_table;
+    for (i = 0; i < mFM_VISIBLE_BLOCK_NUM; i++, draw_tbl++) {
+        if (draw_tbl->draw_flag == TRUE) {
+            bg_item_common_draw_check(play, common, actorx, draw_tbl);
+        }
+    }
+}
+#endif
+
 static void bg_item_common_move(GAME_PLAY* play, ACTOR* actorx, bg_item_common_c* common) {
     static f32 logic_accum = 0.0f;
     int flags;
@@ -2934,6 +3085,16 @@ static void bg_item_common_move(GAME_PLAY* play, ACTOR* actorx, bg_item_common_c
     int ticks = graph_dt_60hz_ticks((GAME*)play, &logic_accum);
     bg_item_draw_table_c* draw_tbl;
 
+#ifdef TARGET_PC
+    {
+        extern int g_pc_submenu_world_tick; /* m_actor.c: set only while m_play.c ticks this actor behind an open submenu */
+
+        if (g_pc_submenu_world_tick) {
+            bg_item_common_pc_menu_cosmetic_move(play, actorx, common, ticks);
+            return;
+        }
+    }
+#endif
     bIT_actor_drop_move(&common->drop_info, ticks);
     bIT_actor_drop_move(&common->fruit_drop_info, ticks);
     bIT_actor_hole_effect_move((GAME*)play, common->hole, ticks);
@@ -2961,6 +3122,9 @@ static void bg_item_common_move(GAME_PLAY* play, ACTOR* actorx, bg_item_common_c
             bg_item_common_draw_check(play, common, actorx, draw_tbl);
         }
     }
+#ifdef TARGET_PC
+    pc_ofurn_bgitem_move(play); /* outdoor furniture C1: which placed pieces are drawn, their collision (no furniture behaviour code) */
+#endif
 }
 
 static int bIT_actor_pit_entry_del(bg_item_pit_c* pit, int param_2, int param_3, xyz_t* pos,
@@ -3212,6 +3376,9 @@ static void bg_item_common_draw(GAME_PLAY* play, bg_item_common_c* common, bg_it
     bIT_actor_fade_draw(game, &common->common_info, common->fade);
 
     bit_draw_ta_clr(game);
+#ifdef TARGET_PC
+    pc_ofurn_bgitem_draw(play); /* outdoor furniture C1: the placed pieces' models (their own render state, after the field items) */
+#endif
 }
 
 static void bg_item_common_construct(GAME* game, bg_item_common_c* common) {

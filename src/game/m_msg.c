@@ -11,6 +11,8 @@
 #include "sys_matrix.h"
 #ifdef TARGET_PC
 #include "pc_bswap.h"
+#include "pc_nook_house.h" /* Guest Nook dialogue (M4): generated messages >= MSG_MAX */
+#include "pc_settings.h"   /* fast_text: always use the fast dialogue reveal */
 #endif
 
 static u32 Msg_table_rom_start = 0;
@@ -41,7 +43,11 @@ static void mMsg_sound_MessageStatus(u8 status);
 #include "../src/game/m_msg_wait.c_inc"
 #include "../src/game/m_msg_disappear_wait.c_inc"
 
+#ifdef PC_LOW_ADDRESS_64
+#include "../src/data/pc_split/m_msg_split.h"
+#else
 #include "../src/game/m_msg_data.c_inc"
+#endif
 #include "../src/game/m_msg_draw_window.c_inc"
 #include "../src/game/m_msg_draw_font.c_inc"
 
@@ -124,6 +130,10 @@ extern void mMsg_debug_draw(gfxprint_t* gfxprint) {
 }
 
 extern void mMsg_Main(GAME* game) {
+#ifdef TARGET_PC
+    mMsg_pc_dump_hook();
+    mMsg_pc_work_items_hook();
+#endif
     mMsg_Main_Window(&mMsg_window, game);
     mChoice_Main(&mMsg_window.choice_window, game);
 }

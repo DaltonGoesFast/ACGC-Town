@@ -10,6 +10,9 @@
 #include "libultra/libultra.h"
 #include "m_lib.h"
 #include "libc64/qrand.h"
+#ifdef TARGET_PC
+#include "pc_net_game.h" /* Batch G5: pc_net_game_role() */
+#endif
 
 /* 'zero' time (uninitialized time value for mushroom saved time) */
 static lbRTC_time_c l_mmsr_zeto_time = { 0, 0, 0, 0, 0, 0, 0 };
@@ -279,6 +282,13 @@ static void mMsr_ClearMushrooms(int clear_num, int block_x, int block_z) {
     for (i = 0; i < FG_BLOCK_TOTAL_NUM; i++) {
         int clearable_num =
             mMsr_GetBlockClearAbleMushroomNum((mActor_name_t*)fg_block->items, Save_Get(deposit[i]), candidate[i]);
+#ifdef TARGET_PC
+        if (clearable_num != 0 && pc_net_game_host_remote_player_in_acre(i % FG_BLOCK_X_NUM + 1, i / FG_BLOCK_X_NUM + 1)) {
+            /* Batch A (A2): never clear a mushroom in an acre a READY remote player stands in (host only; 0 for solo / client) */
+            clearable_num = 0;
+            bzero(candidate[i], UT_Z_NUM * sizeof(u16));
+        }
+#endif
         candidate_num[i] = clearable_num;
         if (candidate_num[i] != 0) {
             total_candidate_num += candidate_num[i];
@@ -329,6 +339,13 @@ static void mMsr_ClearMushrooms(int clear_num, int block_x, int block_z) {
  * if there are any.
  **/
 extern void mMsr_FirstClearMushroom() {
+#ifdef TARGET_PC
+    /* Batch G5: load-time clear of "missed" mushrooms mutates shared fg tiles and the saved mushroom_time; a
+     * network CLIENT never owns either (host replicates tiles, client never persists). Host/solo unchanged. */
+    if (pc_net_game_role() == PC_NETGAME_ROLE_CLIENT) {
+        return;
+    }
+#endif
     int first_clear_num;
     lbRTC_time_c mush_rtc_time;
     mMsr_time_c* mush_time = Save_GetPointer(mushroom_time);
@@ -588,7 +605,12 @@ static void mMsr_SetMushroomNum(int mushroom_num, int player_bx, int player_bz) 
     for (bz = 0; bz < FG_BLOCK_Z_NUM; bz++) {
         for (bx = 0; bx < FG_BLOCK_X_NUM; bx++) {
             /* ensure we do not spawn a mushroom in the acre the player is currently in */
-            if (bx != player_bx - 1 && bz != player_bz - 1) {
+            if (bx != player_bx - 1 && bz != player_bz - 1
+#ifdef TARGET_PC
+                /* Batch A (A2): nor in an acre a READY remote player stands in (host only; 0 for solo / client) */
+                && !pc_net_game_host_remote_player_in_acre(bx + 1, bz + 1)
+#endif
+            ) {
                 *candidate_p = mMsr_GetBlockSetAbleMushroomTreeNum((mActor_name_t*)fg_block->items);
                 if (*candidate_p != 0 && ((possible_col_bitfield >> bx) & 1) == 0) {
                     possible_cols++;
@@ -664,6 +686,15 @@ static void mMsr_SetMushroomNum(int mushroom_num, int player_bx, int player_bz) 
  * @param mushroom_num player_pos Current world position of the player
  **/
 extern void mMsr_SetMushroom(xyz_t player_pos) {
+#ifdef TARGET_PC
+    /* Batch G5: per-frame mushroom spawn/clear (via mFI_FieldMove) writes shared fg tiles directly. A network
+     * CLIENT spawns phantom mushrooms the host rejects on pickup and clears host-spawned ones locally, so skip
+     * it before any tile or mushroom_time write; the host's spawns/clears reach the client via FIELD_UPDATE.
+     * Host/solo: unchanged. */
+    if (pc_net_game_role() == PC_NETGAME_ROLE_CLIENT) {
+        return;
+    }
+#endif
     int player_bx, player_bz;
     lbRTC_time_c mush_rtc;
     mMsr_time_c* mush_time = Save_GetPointer(mushroom_time);

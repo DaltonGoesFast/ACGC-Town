@@ -1,5 +1,8 @@
 #include "libforest/emu64/emu64.hpp"
 #include "libforest/emu64.h"
+#ifdef TARGET_PC
+#include "pc_lowaddr.h"
+#endif
 
 // #include "MSL_C/w_math.h"
 #include "libultra/libultra.h"
@@ -623,6 +626,11 @@ static void emu64_init2(GXRenderModeObj* render_mode) {
 
 void emu64::emu64_init() {
     bzero(this, sizeof(emu64));
+#ifdef TARGET_PC
+    PC_LOWADDR_CHECK("emu64 instance", this, sizeof(emu64));
+    PC_LOWADDR_CHECK("emu64 texture cache (.data)", texture_buffer_data, sizeof(texture_buffer_data));
+    PC_LOWADDR_CHECK("emu64 texture cache (.bss)", texture_buffer_bss, sizeof(texture_buffer_bss));
+#endif
     GXSetCurrentGXThread();
     emu64_init2(&GXNtsc480IntDf);
     GXSetAlphaUpdate(GX_FALSE);
@@ -4412,6 +4420,10 @@ void emu64::dl_G_NOOP() {
                 g_pc_widescreen_stretch = 2; /* pillarbox mode for UI */
                 break;
             }
+            if (this->gfx.words.w1 == PC_NOOP_CLEAR_DEPTH) {
+                pc_gx_clear_depth_now(); /* multiplayer menu over the live world (m_play.c) */
+                break;
+            }
 #endif
             if (this->gfx.words.w1 == 0) {
                 EMU64_LOG("gsDPNoOp(),");
@@ -5983,17 +5995,30 @@ void emu64::emu64_set_verbose(int verbose) {
 
 /* C wrapper methods */
 
+#ifdef TARGET_PC
+extern "C" int g_pc_gl_live;
+#endif
+
 extern void emu64_init(void) {
+#ifdef TARGET_PC
+    if (!g_pc_gl_live) return;
+#endif
     emu64_class.emu64_init();
 }
 
 extern void emu64_cleanup(void) {
+#ifdef TARGET_PC
+    if (!g_pc_gl_live) return;
+#endif
     emu64_class.emu64_cleanup();
 }
 
 // hack - inlines in emu64_taskstart C wrapper otherwise
 #pragma dont_inline on
 extern void emu64_taskstart(Gfx* gfx) {
+#ifdef TARGET_PC
+    if (!g_pc_gl_live) return;
+#endif
     emu64_class.emu64_taskstart(gfx);
 }
 #pragma dont_inline reset

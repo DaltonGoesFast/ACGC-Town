@@ -3,6 +3,10 @@ static void aNPC_actor_dt(ACTOR* actorx, GAME* game) {
     NPC_ACTOR* nactorx = (NPC_ACTOR*)actorx;
     ACTOR* palActor = nactorx->palActor;
 
+#ifdef TARGET_PC
+    aNPC_pc_lease_on_destroy(nactorx); /* M9-C / Patch 8: END for an outstanding talk BEGIN (outdoor and indoor villagers) */
+#endif
+
 #ifndef aNPC_NPC2
     aNPC_reset_out_of_door_flg(ctrl, actorx);
     aNPC_reset_umb_open_flg(ctrl, actorx);

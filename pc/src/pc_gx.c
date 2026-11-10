@@ -337,6 +337,12 @@ void pc_gx_init(void) {
         quad_index_buf[q * 6 + 5] = base + 3;
     }
 
+    if (!g_pc_gl_live) {
+        pc_gx_texture_init();
+        g_gx.dirty = PC_GX_DIRTY_ALL;
+        return;
+    }
+
     glGenVertexArrays(1, &g_gx.vao);
     glGenBuffers(1, &g_gx.vbo);
     glGenBuffers(1, &g_gx.ebo);
@@ -402,6 +408,27 @@ void pc_gx_begin_frame(void) {
     glClearColor(g_gx.clear_color[0], g_gx.clear_color[1], g_gx.clear_color[2], g_gx.clear_color[3]);
     glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
     pc_profiler_add_time(PC_PROF_TIMER_GX_BEGIN, prof_start);
+}
+
+/* Mid-frame depth clear (display-list tag PC_NOOP_CLEAR_DEPTH, emu64 dl_G_NOOP): the multiplayer "world behind the menu" draw
+ * (m_play.c) renders the live 3D world and then the submenu overlay in the same frame; vanilla drew the menu over a flat prerendered
+ * picture, i.e. over an EMPTY depth buffer, so the overlay's own 3D models (inventory player, catalog items) depth-test against
+ * nothing. This restores exactly that: pending batches are flushed first (they keep their depth), then only depth is cleared. */
+void pc_gx_clear_depth_now(void) {
+    GLboolean scissor;
+
+    pc_gx_draw_pending();
+    scissor = glIsEnabled(GL_SCISSOR_TEST);
+    if (scissor) {
+        glDisable(GL_SCISSOR_TEST);
+    }
+    glDepthMask(GL_TRUE);
+    glClearDepth(g_gx.clear_depth);
+    glClear(GL_DEPTH_BUFFER_BIT);
+    if (scissor) {
+        glEnable(GL_SCISSOR_TEST);
+    }
+    DIRTY(PC_GX_DIRTY_DEPTH); /* the depth mask was changed behind the dirty system */
 }
 
 void pc_gx_restore_after_nes(void) {
@@ -697,6 +724,10 @@ int pc_gx_draw_call_count = 0;
  * so the run renders with the state it was built under. */
 void pc_gx_draw_pending(void) {
     int count = g_gx.pending_verts;
+    if (!g_pc_gl_live) {
+        g_gx.pending_verts = 0;
+        return;
+    }
     if (count == 0) return;
 
     glBindVertexArray(g_gx.vao);
@@ -731,6 +762,10 @@ void pc_gx_draw_pending(void) {
 
 void pc_gx_flush_vertices(void) {
     int count = g_gx.current_vertex_idx - g_gx.pending_verts;
+    if (!g_pc_gl_live) {
+        g_gx.pending_verts = g_gx.current_vertex_idx;
+        return;
+    }
     if (count <= 0) return;
 
     Uint64 flush_start = pc_profiler_begin_timer();
@@ -1981,8 +2016,16 @@ void GXSetTexCoordGen2(u32 dst, u32 func, u32 src, u32 mtx, GXBool normalize, u3
         g_gx.tex_gen_mtx[dst] = mtx;
     }
 }
-void GXSetLineWidth(u8 width, u32 texOffsets) { glLineWidth(width / 16.0f); }
-void GXSetPointSize(u8 size, u32 texOffsets) { glPointSize(size / 16.0f); }
+void GXSetLineWidth(u8 width, u32 texOffsets) {
+    (void)texOffsets;
+    if (!g_pc_gl_live) return;
+    glLineWidth(width / 16.0f);
+}
+void GXSetPointSize(u8 size, u32 texOffsets) {
+    (void)texOffsets;
+    if (!g_pc_gl_live) return;
+    glPointSize(size / 16.0f);
+}
 void GXEnableTexOffsets(u32 coord, GXBool line, GXBool point) {
     (void)coord; (void)line; (void)point;
 }
@@ -2101,7 +2144,7 @@ static void pc_gx_copy_tex_execute_impl(void* dest, GXBool clear) {
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
-        pc_gx_efb_capture_store((u32)(uintptr_t)dest, efb_tex);
+        pc_gx_efb_capture_store(PC_PTR32("EFB copy dest", dest), efb_tex);
         glBindTexture(GL_TEXTURE_2D, 0);
         pc_profiler_add_count_texture_bind();
         pc_gx_texture_bind_cache_invalidate();

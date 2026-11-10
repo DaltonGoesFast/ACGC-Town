@@ -7,6 +7,10 @@
 #include "m_bgm.h"
 #include "m_event.h"
 #include "_mem.h"
+#ifdef TARGET_PC
+#include "pc_net_game.h" /* X1 review M1: pc_net_game_client_pocket_locked() -- see wait_talk_start() */
+#include "pc_host_observer.h" /* --host-observer: pc_host_observer_active() -- see mDemo_Request() */
+#endif
 
 /* Z-X */
 static f32 direct_vector[mDemo_DIRECT_NUM][2] = { { -1.0f, 0.0f },      { -F_SQRT2, F_SQRT2 }, { 0.0f, 1.0f },
@@ -419,6 +423,16 @@ static int set_talk_default() {
 static int wait_talk_start() {
     PLAYER_ACTOR* player = GET_PLAYER_ACTOR_NOW();
 
+#ifdef TARGET_PC
+    /* X1 review M1: EVERY talk (villager gift flow, shops, museum, post office, ...) starts here. While a network CLIENT has an unresolved
+     * pickup/drop/bury or its host-transactional commit, a conversation must not start: it could give / sell / swap the very item the
+     * host is about to remove from the pockets (a duplicate), or its sale proceeds would be overwritten. Returning FALSE is the existing
+     * 'player cannot talk right now' answer (the speaker simply keeps waiting and starts the moment the lock clears: RTT, hard-capped at
+     * 60 s by the client); single-player and the host are never locked. A talk already running (change_player == FALSE flows) is untouched. */
+    if (demo->data.talk.change_player && pc_net_game_client_pocket_locked()) {
+        return FALSE;
+    }
+#endif
     if (demo->data.talk.change_player) {
         if (mPlib_get_player_actor_main_index(gamePT) != 65 &&
             mPlib_request_main_talk_type1(gamePT, demo->current.actor, demo->data.talk.turn, FALSE) == FALSE) {
@@ -727,6 +741,15 @@ static int wait_emsg2_end() {
     return res;
 }
 
+static f32 weight_of_talk_position(ACTOR* actor);
+#ifdef TARGET_PC
+/* roommates (pc_room_ui.c): the vanilla talk-position test of an actor (the player close enough, facing it); the gyroid asks the host first only when a talk would start */
+int mDemo_PC_TalkPositionOk(ACTOR* actor) {
+    return actor != NULL && GET_PLAYER_ACTOR_NOW() != NULL && weight_of_talk_position(actor) >= 0.0f;
+}
+extern void* g_pc_demo_force_talk_actor; /* pc_room_ui.c: the gyroid's talk starts once the host answered the A (one shot, no new A press) */
+#endif
+
 static f32 weight_of_talk_position(ACTOR* actor) {
     PLAYER_ACTOR* player = GET_PLAYER_ACTOR_NOW();
     f32 actor_talk_dist;
@@ -822,7 +845,14 @@ static int choice_demo_sub() {
              (demo->request_save.type != mDemo_TYPE_NONE || type >= demo->priority_type)) &&
             (*check_func[type])() != FALSE) {
             if (type == mDemo_TYPE_TALK) {
+#ifdef TARGET_PC
+                if ((chkTrigger(BUTTON_A) || (request->actor != NULL && (void*)request->actor == g_pc_demo_force_talk_actor)) && request->talk_weight > max_talk_weight) {
+                    if ((void*)request->actor == g_pc_demo_force_talk_actor) {
+                        g_pc_demo_force_talk_actor = NULL; /* one shot */
+                    }
+#else
                 if (chkTrigger(BUTTON_A) && request->talk_weight > max_talk_weight) {
+#endif
                     idx = i;
                     max_talk_weight = request->talk_weight;
                 }
@@ -975,6 +1005,19 @@ extern void mDemo_stock_clear() {
 extern int mDemo_Request(int type, ACTOR* actor, mDemo_REQUEST_PROC req_proc) {
     f32 weight = 1.0f;
     int request_num = demo->request_num;
+
+#ifdef TARGET_PC
+    /* --host-observer: the hidden server observer is "not talkable". Every message-window demo (a villager / event NPC forcing a SPEAK, a TALK, a
+     * REPORT / SPEECH announcement, an EVENTMSG) would wait for a button press that never comes (the observer has no input), freezing that NPC in
+     * its talk state and the demo state machine for good. Refused exactly like any other "cannot talk right now" answer: every caller re-requests
+     * every frame and ignores the result, so the NPC simply stays in its idle state. Door / scroll / outdoor demos are not message demos and are
+     * untouched (the observer never moves). */
+    if (pc_host_observer_active() &&
+        (type == mDemo_TYPE_TALK || type == mDemo_TYPE_SPEAK || type == mDemo_TYPE_REPORT || type == mDemo_TYPE_SPEECH ||
+         type == mDemo_TYPE_EVENTMSG || type == mDemo_TYPE_EVENTMSG2)) {
+        return FALSE;
+    }
+#endif
 
     if (request_num < mDemo_REQUEST_NUM) {
         if (type >= demo->priority_type) {

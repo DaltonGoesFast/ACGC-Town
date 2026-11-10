@@ -18,6 +18,11 @@
 #include "m_room_type.h"
 #include "m_common_data.h"
 
+#ifdef TARGET_PC
+#include "pc_net_game.h" /* mail milestone M0: pc_net_game_role() */
+#include "pc_host_observer.h" /* --host-observer: pc_host_observer_active() */
+#endif
+
 static Mail_c l_mpr_mail;
 Private_c g_foreigner_private;
 
@@ -760,6 +765,15 @@ extern int mPr_LoadPak_and_SetPrivateInfo2(Private_c* unused_private, u8 player_
     Private_c* priv;
     int res = FALSE;
 
+#ifdef TARGET_PC
+    if (pc_host_observer_active()) {
+        /* --host-observer: this function COPIES g_foreigner_private INTO private_data[i] when the PersonalIDs compare equal (a returning
+         * resident). The observer is a static record outside private_data[] with a reserved PersonalID that equals no resident, and it never
+         * travels, so the merge is unreachable; refused explicitly so that it can never alias a resident slot (and never rebinds now_private). */
+        return FALSE;
+    }
+#endif
+
     if (player_no < mPr_FOREIGNER) {
         u32 loan;
         mHm_hs_c* house;
@@ -863,6 +877,11 @@ static int mPr_SendMotherMailPost(PersonalID_c* pid, int player_no, mActor_name_
     mHm_hs_c* home;
     int res = FALSE;
 
+#ifdef TARGET_PC
+    if (pc_net_game_role() == PC_NETGAME_ROLE_CLIENT) {
+        return FALSE; /* mail milestone M0: a client never writes the mother's letter (it can carry a gift) into its local mailbox; for a client resident the host does not generate it yet (open: M4) */
+    }
+#endif
     mail = &l_mpr_mail;
     home = Save_GetPointer(homes[mHS_get_arrange_idx(player_no)]);
 

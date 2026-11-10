@@ -18,6 +18,9 @@
 #include "m_mark_room.h"
 #include "sys_matrix.h"
 #include "m_rcp.h"
+#ifdef TARGET_PC
+#include "pc_net_game.h" /* pc_net_game_client_room_edit_locked() (own-room edit lock, see ac_my_room_msg_ctrl.c_inc / ac_my_room_move.c_inc) */
+#endif
 
 enum {
     aMR_ICON_LEAF,
@@ -106,6 +109,13 @@ enum {
     aMR_MSG_STATE_DELETE_AGB_PROGRAMQ,
     aMR_MSG_STATE_START_EMU_DOWN_LOAD,
     aMR_MSG_STATE_RECHECK_AGB_CONNECT,
+#ifdef TARGET_PC
+    /* dresser storage (multiplayer client, host feature ON only; appended: every vanilla state keeps its value) */
+    aMR_MSG_STATE_PC_DRESSER_WAIT_PAGE,
+    aMR_MSG_STATE_PC_DRESSER_PAGE,
+    aMR_MSG_STATE_PC_DRESSER_TXN,
+    aMR_MSG_STATE_PC_DRESSER_GYROID, /* the gyroid-style overlay in dresser mode (pc_dresser_ui) */
+#endif
 
     aMR_MSG_STATE_NUM
 };
@@ -1788,6 +1798,9 @@ static void My_Room_Actor_ct(ACTOR* actorx, GAME* game) {
     GAME_PLAY* play = (GAME_PLAY*)game;
 
     bzero(&l_aMR_work, sizeof(l_aMR_work));
+#ifdef TARGET_PC
+    pc_net_game_dresser_room_visit(); /* dresser storage: a new room visit (the move lock trusts only this visit's host answers) */
+#endif
     my_room->scene = Save_Get(scene_no);
     aMR_SetClip(actorx);
     aMR_InitFurnitureWork();
@@ -1993,11 +2006,528 @@ static int aMR_SetLeaf(const xyz_t* pos, f32 scale) {
     return FALSE;
 }
 
+#ifdef TARGET_PC
+/* ===== PC multiplayer furniture sync (Stage 1): live export / quiescence / live reload =====
+ * The live room does NOT work on a copy: mFM_SetFgUtPtoHomeInfo / fg2_p alias Save_Get(homes[h]).floors[f] (aMR_GetLayerTopFg returns pointers INTO the save). While the
+ * room is live, aMR_MakeItemDataInFurniture moved the contents of every storage furniture out of the upper layers into ftr_actor->items[] (and left the cells EMPTY),
+ * aMR_ClearSwitchSaveData zeroed ftr_switch, and the teardown (My_Room_Actor_dt) writes all of it back (aMR_SaveSwitchData + aMR_KeepItem2Fg). aMR_pc_export_home builds
+ * "what the teardown would write at this instant" on a COPY; the live room is never modified by it. */
+#include <string.h>
+#include <stdio.h>
+#include "ac_my_indoor.h"
+#include "m_museum_display.h" /* mMmd_FossilInfo / mMmd_MakeMuseumDisplayData: the museum fossil room live refresh below */
+
+extern int g_pc_house_test_fidelity;
+
+/* The live room as a PLAYER HOUSE room (never the cottage / a shop): out = actor, house index, floor. FALSE when anything does not line up, including the
+ * save aliasing (a layer pointer of the field that is not the save's layer: the export would then not describe what the room uses). */
+static int aMR_pc_live_house(MY_ROOM_ACTOR** my_room_out, int* idx_out, int* floor_out) {
+    mActor_name_t field_id;
+    MY_ROOM_ACTOR* my_room;
+    int idx;
+    int floor_no;
+    int l;
+    mHm_lyr_c* lyr;
+
+    if (aMR_CLIP == NULL || aMR_CLIP->my_room_actor_p == NULL || l_aMR_work.ftr_actor_list == NULL || l_aMR_work.used_list == NULL) {
+        return FALSE;
+    }
+
+    my_room = (MY_ROOM_ACTOR*)aMR_CLIP->my_room_actor_p;
+    if (my_room->scene == SCENE_COTTAGE_MY) {
+        return FALSE;
+    }
+
+    field_id = mFI_GetFieldId();
+    if (mFI_GET_TYPE(field_id) != mFI_FIELD_PLAYER0_ROOM) {
+        return FALSE;
+    }
+
+    idx = (field_id - mFI_FIELD_PLAYER0_ROOM) & 3;
+    floor_no = mFI_GetPlayerHouseFloorNo(my_room->scene);
+    if (floor_no < 0 || floor_no >= mHm_ROOM_NUM) {
+        return FALSE;
+    }
+
+    lyr = &Save_Get(homes[idx]).floors[floor_no].layer_main;
+    for (l = 0; l < mHm_LAYER_NUM; l++) {
+        if (aMR_GetLayerTopFg(l) != lyr[l].items[0]) {
+            return FALSE;
+        }
+    }
+
+    *my_room_out = my_room;
+    *idx_out = idx;
+    *floor_out = floor_no;
+    return TRUE;
+}
+
+/* 1 when the room is in a state where nothing is half-way: no demo / message / pickup / placement / push-pull in progress, every furniture actor is idle and
+ * the wallpaper / carpet changers are idle. Owner-agnostic (a visitor's room is judged the same way). The caller adds the player / scene / submenu terms. */
+/* Dresser storage (worker 3): 1 = furniture item `ftr_item` (any rotation) is a vanilla ITEM storage piece (its profile has the DRAWERS / WARDROBE / CLOSET
+ * interaction: the pieces whose FTR_ACTOR.items[] keep slots the drawer / wardrobe dialogue opens). The music box (MUSIC_DISK) is NOT item storage. Pure data
+ * (the static profile table): usable by the host / dedicated server without a room. */
+int aMR_pc_ftr_is_item_storage(int ftr_item) {
+    aFTR_PROFILE* profile;
+
+    if (ftr_item <= 0 || ftr_item > 0xFFFF || !ITEM_IS_FTR((mActor_name_t)ftr_item)) {
+        return FALSE;
+    }
+    profile = aMR_GetFurnitureProfile(mRmTp_FtrItemNo2FtrIdx((mActor_name_t)ftr_item));
+    if (profile == NULL || profile == &iam_dummy) {
+        return FALSE;
+    }
+    return aFTR_CHECK_INTERACTION(profile->interaction_type, aFTR_INTERACTION_TYPE_DRAWERS) ||
+           aFTR_CHECK_INTERACTION(profile->interaction_type, aFTR_INTERACTION_TYPE_WARDROBE) ||
+           aFTR_CHECK_INTERACTION(profile->interaction_type, aFTR_INTERACTION_TYPE_CLOSET);
+}
+
+/* diagnostic (read by the verbose in-room commit log): why aMR_pc_room_quiet() said "not quiet" last time */
+static const char* aMR_pc_quiet_why = "";
+static int aMR_pc_quiet_a = 0, aMR_pc_quiet_b = 0, aMR_pc_quiet_c = 0;
+const char* aMR_pc_room_quiet_why(int* a, int* b, int* c) {
+    *a = aMR_pc_quiet_a;
+    *b = aMR_pc_quiet_b;
+    *c = aMR_pc_quiet_c;
+    return aMR_pc_quiet_why;
+}
+
+/* 6p: 1 = the 27-slot dresser screen (gyroid overlay in dresser mode) is open and SETTLED: the overlay is up and in its play state, the room's message state is the
+ * dresser screen's and nothing else is requested. The screen is modal: the only room edits it makes are the synchronous vanilla keep-slot put / take (pocket <->
+ * the opened piece's keep slots, both changed in the same call), so a snapshot taken in this state is consistent and an in-room commit may land while it stays
+ * open (vanilla-slot edits and extra-slot transactions then work together in one visit of the screen). */
+static int aMR_pc_dresser_screen_settled_room(MY_ROOM_ACTOR* my_room) {
+    GAME_PLAY* play = (GAME_PLAY*)gamePT;
+
+    if (my_room == NULL || play == NULL || gamePT->exec != play_main || !pc_dresser_ui_active() || aMR_pc_gyroid_ftr == NULL ||
+        my_room->msg_type != aMR_MSG_STATE_PC_DRESSER_GYROID || my_room->requested_msg_type != my_room->msg_type) {
+        /* requested == msg_type = no message change pending (aMR_MessageControl switches only when they differ; an ACTIVE state keeps them equal) */
+        return FALSE;
+    }
+    if (play->submenu.process_status != mSM_PROCESS_PLAY || play->submenu.overlay == NULL) {
+        return FALSE;
+    }
+    return aMR_pc_gyroid_ftr == &l_aMR_work.ftr_actor_list[my_room->demo_ftrID];
+}
+
+int aMR_pc_dresser_screen_settled(void) {
+    MY_ROOM_ACTOR* my_room;
+    int idx;
+    int floor_no;
+
+    return aMR_pc_live_house(&my_room, &idx, &floor_no) && aMR_pc_dresser_screen_settled_room(my_room);
+}
+
+int aMR_pc_room_quiet(void) {
+    MY_ROOM_ACTOR* my_room;
+    int idx;
+    int floor_no;
+    int i;
+    int dresser_open;
+
+    aMR_pc_quiet_why = "not a live own room";
+    if (!aMR_pc_live_house(&my_room, &idx, &floor_no)) {
+        return FALSE;
+    }
+    aMR_pc_quiet_why = "room state";
+    aMR_pc_quiet_a = my_room->state;
+    aMR_pc_quiet_b = my_room->msg_type;
+    aMR_pc_quiet_c = my_room->parent_ftr.ftrID;
+    dresser_open = aMR_pc_dresser_screen_settled_room(my_room); /* 6p: the open dresser screen's own demo / message state is settled */
+
+    if (!dresser_open && (my_room->state != 0 || my_room->demo_flag != 0 || my_room->msg_type != aMR_MSG_STATE_NONE ||
+        my_room->requested_msg_type != aMR_MSG_STATE_NONE || my_room->force_open_demo_flag != 0 || my_room->emu_info.request_flag != 0 ||
+        my_room->bgm_info.reserve_flag != 0 || my_room->throw_item_lock_flag != 0 || my_room->pickup_info.pickup_flag != 0 ||
+        my_room->leaf_info.exist_flag != 0 || my_room->parent_ftr.ftrID != -1)) {
+        /* picking_up_flag is deliberately NOT tested: vanilla sets it when a pickup's shrink animation ends and never clears it again (it is only read
+         * inside the pickup states), so testing it made the room permanently "not quiet" after the first furniture pickup of a visit and blocked every
+         * later in-room commit. pickup_flag covers the whole pickup (set at aMR_Furniture2ItemBag, cleared when the pickup state ends). */
+        return FALSE;
+    }
+
+    for (i = 0; i < 3; i++) {
+        if (my_room->rsv_ftr[i].exist_flag != 0) {
+            aMR_pc_quiet_why = "reserved furniture";
+            aMR_pc_quiet_a = i;
+            aMR_pc_quiet_b = my_room->rsv_ftr[i].frames;
+            aMR_pc_quiet_c = my_room->rsv_ftr[i].ftr_name;
+            return FALSE;
+        }
+    }
+
+    for (i = 0; i < l_aMR_work.list_size; i++) {
+        if (l_aMR_work.used_list[i]) {
+            const FTR_ACTOR* ftr_actor = &l_aMR_work.ftr_actor_list[i];
+
+            if (dresser_open && i == my_room->demo_ftrID) {
+                continue; /* 6p: the opened dresser itself (its open demo pose); its keep slots are read by the export */
+            }
+            if (ftr_actor->state != aFTR_STATE_STOP || ftr_actor->demo_status != 0) {
+                aMR_pc_quiet_why = "furniture actor not stopped (index / state / demo_status)";
+                aMR_pc_quiet_a = i;
+                aMR_pc_quiet_b = ftr_actor->state;
+                aMR_pc_quiet_c = ftr_actor->demo_status;
+                return FALSE;
+            }
+        }
+    }
+    aMR_pc_quiet_why = "wall / floor reserve";
+
+    if (Common_Get(clip).my_indoor_clip != NULL && Common_Get(clip).my_indoor_clip->my_indoor_actor_p != NULL) {
+        const MY_INDOOR_ACTOR* my_indoor = Common_Get(clip).my_indoor_clip->my_indoor_actor_p;
+
+        if (my_indoor->wall_reserve.reserve_flag || my_indoor->floor_reserve.reserve_flag) {
+            return FALSE;
+        }
+    }
+
+    return TRUE;
+}
+
+/* `out` = a copy of the save's house `house` with the LIVE floor replaced by what the teardown would write now: for every used actor the logic of
+ * aMR_KeepItem2Fg (drawer / music-box contents back into the upper layers at the actor's origin cell), ftr_switch rebuilt like aMR_SaveSwitchData and
+ * haniwa_step like aMR_SaveHaniwaStepData (tempo_beat stays the save's: the audio state is not read). Nothing live is modified. FALSE = not a live room of
+ * that house (nothing written to *floor_out). */
+int aMR_pc_export_home(mHm_hs_c* out, int house, int* floor_out) {
+    MY_ROOM_ACTOR* my_room;
+    int idx;
+    int floor_no;
+    int i;
+    int l;
+    int ut_x;
+    int ut_z;
+    mHm_lyr_c* lyr;
+
+    if (out == NULL || !aMR_pc_live_house(&my_room, &idx, &floor_no) || idx != house) {
+        return FALSE;
+    }
+
+    memcpy(out, &Save_Get(homes[idx]), sizeof(mHm_hs_c));
+    lyr = &out->floors[floor_no].layer_main;
+
+    /* ftr_switch (aMR_SaveSwitchData): zero, then OR the switch bit of the furniture standing on each furniture cell of layers 0 / 1 */
+    for (l = mCoBG_LAYER0; l < mCoBG_LAYER2; l++) {
+        lyr[l].ftr_switch = 0;
+        for (ut_z = aMR_MIN_BOUND; ut_z <= aMR_MAX_BOUND; ut_z++) {
+            for (ut_x = aMR_MIN_BOUND; ut_x <= aMR_MAX_BOUND; ut_x++) {
+                if (ITEM_IS_FTR(lyr[l].items[ut_z][ut_x])) {
+                    mActor_name_t name;
+                    int ftr_id;
+
+                    if (aMR_UnitNum2FtrItemNoFtrID(&name, &ftr_id, ut_x, ut_z, l)) {
+                        if (l_aMR_work.ftr_actor_list[ftr_id].switch_bit) {
+                            lyr[l].ftr_switch |= 1ull << ((ut_x - 1 + (ut_z - 1) * 8) & 0x3F);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /* haniwa_step (aMR_SaveHaniwaStepData) */
+    for (i = 0; i < l_aMR_work.list_size; i++) {
+        if (l_aMR_work.used_list[i]) {
+            const FTR_ACTOR* ftr_actor = &l_aMR_work.ftr_actor_list[i];
+
+            if (ftr_actor->name < FTR_NUM && ftr_actor->layer >= 0 && ftr_actor->layer < mHm_LAYER_NUM) {
+                aFTR_PROFILE* profile = aMR_GetFurnitureProfile(ftr_actor->name);
+
+                if (profile != NULL && aFTR_CHECK_INTERACTION(profile->interaction_type, aFTR_INTERACTION_TYPE_HANIWA) &&
+                    mFI_Wpos2UtNum_inBlock(&ut_x, &ut_z, ftr_actor->position) && aMR_BOUNDS_OK(ut_x, ut_z)) {
+                    u32* step_data = lyr[ftr_actor->layer].haniwa_step;
+                    int shift = (ut_x - 1) * 4;
+                    int row = ut_z - 1;
+
+                    step_data[row] &= ~(0xFu << shift);
+                    step_data[row] |= ((u32)ftr_actor->haniwa_step & 0xF) << shift;
+                }
+            }
+        }
+    }
+
+    /* aMR_KeepItem2Fg for every used actor, against the COPY (the actor is not touched) */
+    for (i = 0; i < l_aMR_work.list_size; i++) {
+        if (l_aMR_work.used_list[i]) {
+            const FTR_ACTOR* ftr_actor = &l_aMR_work.ftr_actor_list[i];
+            int item_idx = 0;
+
+            for (l = ftr_actor->layer + 1; l < mCoBG_LAYER_NUM && item_idx < aFTR_KEEP_ITEM_COUNT; l++) {
+                if (ftr_actor->items[item_idx] != EMPTY_NO) {
+                    if (aMR_Wpos2PlaceNumber(&ut_x, &ut_z, ftr_actor->position, ftr_actor->shape_type) && ut_x >= 0 && ut_z >= 0) {
+                        lyr[l].items[ut_z][ut_x] = ftr_actor->items[item_idx];
+                    }
+                }
+
+                item_idx++;
+            }
+        }
+    }
+
+    *floor_out = floor_no;
+    return TRUE;
+}
+
+/* Destroys every furniture actor WITHOUT writing its contents back (the caller's save write replaces the floor wholesale: a write-back first would put the old
+ * drawer contents into the new layers = duplicates), rebuilds the actor set exactly like My_Room_Actor_ct does, with `cb(ctx)` writing the new house into the save in
+ * between. Heap, banks, camera and player are untouched. Returns 1 when the callback ran (the room now shows the new layout), 0 when the room was not in a state to
+ * be rebuilt (nothing done, the callback NOT called). The caller has already checked the player / scene / submenu terms. */
+int aMR_pc_live_reload(GAME* game, int (*cb)(void*), void* ctx) {
+    MY_ROOM_ACTOR* my_room;
+    ACTOR* actorx;
+    GAME_PLAY* play = (GAME_PLAY*)game;
+    int idx;
+    int floor_no;
+    int i;
+
+    if (game == NULL || cb == NULL || !aMR_pc_room_quiet() || !aMR_pc_live_house(&my_room, &idx, &floor_no)) {
+        return 0;
+    }
+
+    actorx = (ACTOR*)my_room;
+
+    /* (1) the destroy half of aMR_AllFurnitureDestruct, minus aMR_KeepItem2Fg */
+    sAdo_RhythmAllStop();
+    for (i = 0; i < l_aMR_work.list_size; i++) {
+        if (l_aMR_work.used_list[i]) {
+            FTR_ACTOR* ftr_actor = &l_aMR_work.ftr_actor_list[i];
+            aFTR_PROFILE* profile = aMR_GetFurnitureProfile(ftr_actor->name);
+
+            mCoBG_CrossOffMoveBg(ftr_actor->move_bg_idx);
+            aMR_MiniDiskCommonDt(ftr_actor, actorx);
+            aMR_RadioCommonDt(ftr_actor, actorx);
+            aMR_MinusWeight(actorx, ftr_actor);
+
+            if (profile != NULL && profile->vtable != NULL && profile->vtable->dt_proc != NULL) {
+                profile->vtable->dt_proc(ftr_actor, aMR_FtrNo2BankAddress(ftr_actor->name));
+            }
+
+            l_aMR_work.used_list[i] = FALSE;
+        }
+    }
+
+    my_room->bgm_info.active_flag = FALSE;
+    my_room->bgm_info.active_ftr_actor = NULL;
+    my_room->bgm_info.reserved_ftr_actor = NULL;
+
+    /* (2) the same fresh state My_Room_Actor_ct starts from */
+    aMR_InitFurnitureWork();
+    aMR_InitFurnitureTable(l_aMR_work.ftr_actor_list, l_aMR_work.list_size);
+    aMR_InitFurnitureActorExistTable();
+    aMR_InitHaniwaOnTable(actorx);
+    aMR_InitFurnitureBankTable();
+
+    /* (3) the new house goes into the save: nothing of the old actors exists any more */
+    (void)cb(ctx);
+    aMR_GetSavedWaltzTempo(my_room);
+
+    /* (4) the tail of My_Room_Actor_ct */
+    aMR_MakeFurnitureActor(actorx, play, mCoBG_LAYER0);
+    aMR_MakeFurnitureActor(actorx, play, mCoBG_LAYER1);
+    my_room->parent_ftr.ftrID = -1;
+    aMR_MakeItemDataInFurniture();
+    aMR_DeleteMusicWhichMusicBoxDontHave();
+    my_room->bgm_info.reserve_flag = FALSE;
+    my_room->bgm_info.md_no = -1;
+    my_room->bgm_info.last_md_no = -1;
+    my_room->bgm_info.timer = 0;
+    aMR_ClearSwitchSaveData(my_room);
+    aMR_OneMDFurnitureSwitchOn();
+    return 1;
+}
+
+/* ---- museum fossil room live refresh (multiplayer only; worker 3 for worker 6's blocker) ----
+ * The fossil skeletons are furniture actors built from the room FG that mMmd_MakeMuseumDisplayData writes at scene init (a donated fossil = its skeleton
+ * furniture, else the vanilla placeholder item). A donation made by ANOTHER player while this player stands in the room changes Save.museum_display (the
+ * host's commit / the client's TOWN_SVC_STATE mirror) but not the room. When the fossil bits change, the room is quiet and the player idle, ONLY the changed
+ * exhibit cells are rebuilt: the old actor of such a cell is cleared from the FG and destroyed (no write-back: museum furniture holds nothing), the new FG value
+ * of that cell is written, and the WHOLE actor set is rebuilt from the FG exactly like aMR_pc_live_reload / My_Room_Actor_ct do (same fixed bank slots: the
+ * furniture banks are a fixed table re-filled by the profile's dma_proc into aMR_BankNo2BankAddress slots; no heap / bank-pool allocation; a type that finds no
+ * free slot is skipped exactly like at scene init). Single player never runs it (pc_net_game_role() == NONE). */
+static u32 l_pc_fossil_base;
+static int l_pc_fossil_base_valid = FALSE;
+
+static u32 aMR_pc_fossil_sig(void) {
+    u32 sig = 0;
+    int i;
+
+    for (i = 0; i < mMmd_FOSSIL_NUM; i++) {
+        if (mMmd_FossilInfo(i)) {
+            sig |= 1u << i;
+        }
+    }
+    return sig;
+}
+
+static int aMR_pc_museum_quiet(MY_ROOM_ACTOR* my_room, GAME_PLAY* play) {
+    PLAYER_ACTOR* pl;
+    int i;
+    int mi;
+
+    if (play->fb_fade_type != FADE_TYPE_NONE || play->fb_wipe_mode != WIPE_MODE_NONE || play->submenu.process_status != mSM_PROCESS_WAIT ||
+        play->submenu.menu_type != mSM_OVL_NONE || mDemo_CheckDemo() != FALSE || !mMsg_Check_MainHide(mMsg_Get_base_window_p())) {
+        return FALSE;
+    }
+    if (my_room->state != 0 || my_room->demo_flag != 0 || my_room->msg_type != aMR_MSG_STATE_NONE || my_room->requested_msg_type != aMR_MSG_STATE_NONE ||
+        my_room->pickup_info.pickup_flag != 0 || my_room->parent_ftr.ftrID != -1) {
+        return FALSE;
+    }
+    for (i = 0; i < l_aMR_work.list_size; i++) {
+        if (l_aMR_work.used_list[i] && (l_aMR_work.ftr_actor_list[i].state != aFTR_STATE_STOP || l_aMR_work.ftr_actor_list[i].demo_status != 0)) {
+            return FALSE;
+        }
+    }
+    pl = GET_PLAYER_ACTOR(play);
+    if (pl == NULL || pl->requested_main_index_changed) {
+        return FALSE;
+    }
+    mi = (int)pl->now_main_index;
+    return mi == mPlayer_INDEX_WAIT || mi == mPlayer_INDEX_WALK || mi == mPlayer_INDEX_RUN || mi == mPlayer_INDEX_DASH;
+}
+
+static void aMR_pc_museum_fossil_tick(ACTOR* actorx, GAME* game) {
+    static mActor_name_t before[UT_Z_NUM * UT_X_NUM];
+    static mActor_name_t after[UT_Z_NUM * UT_X_NUM];
+    MY_ROOM_ACTOR* my_room = (MY_ROOM_ACTOR*)actorx;
+    GAME_PLAY* play = (GAME_PLAY*)game;
+    mActor_name_t* fg;
+    u32 sig;
+    int i;
+    int c;
+    int changed = 0;
+
+    if (Save_Get(scene_no) != SCENE_MUSEUM_ROOM_FOSSIL || pc_net_game_role() == PC_NETGAME_ROLE_NONE) {
+        l_pc_fossil_base_valid = FALSE;
+        return;
+    }
+    sig = aMR_pc_fossil_sig();
+    if (!l_pc_fossil_base_valid) {
+        l_pc_fossil_base = sig; /* the room was built from these bits */
+        l_pc_fossil_base_valid = TRUE;
+        return;
+    }
+    if (sig == l_pc_fossil_base || !aMR_pc_museum_quiet(my_room, play)) {
+        return;
+    }
+    fg = aMR_GetLayerTopFg(mCoBG_LAYER0);
+    if (fg == NULL || fg != mFI_BkNumtoUtFGTop(0, 0)) {
+        return; /* the room FG is not the block the museum display data writes */
+    }
+    /* the new exhibit cells, computed on the live FG and then put back (nothing visible changes until the rebuild) */
+    memcpy(before, fg, sizeof(before));
+    mMmd_MakeMuseumDisplayData();
+    memcpy(after, fg, sizeof(after));
+    memcpy(fg, before, sizeof(before));
+    for (c = 0; c < UT_Z_NUM * UT_X_NUM; c++) {
+        changed += before[c] != after[c];
+    }
+    l_pc_fossil_base = sig;
+    if (changed == 0) {
+        return;
+    }
+    /* destroy: every actor (the set is rebuilt from the FG below); the footprint of an actor whose origin cell changes is cleared first */
+    sAdo_RhythmAllStop();
+    for (i = 0; i < l_aMR_work.list_size; i++) {
+        if (l_aMR_work.used_list[i]) {
+            FTR_ACTOR* ftr_actor = &l_aMR_work.ftr_actor_list[i];
+            aFTR_PROFILE* profile = aMR_GetFurnitureProfile(ftr_actor->name);
+            int ut_x;
+            int ut_z;
+
+            if (aMR_Wpos2PlaceNumber(&ut_x, &ut_z, ftr_actor->position, ftr_actor->shape_type) && ut_x >= 0 && ut_z >= 0 && ut_x < UT_X_NUM && ut_z < UT_Z_NUM &&
+                before[ut_x + ut_z * UT_X_NUM] != after[ut_x + ut_z * UT_X_NUM]) {
+                (void)aMR_SetFurniture2FG(ftr_actor, ftr_actor->position, FALSE);
+            }
+            mCoBG_CrossOffMoveBg(ftr_actor->move_bg_idx);
+            aMR_MiniDiskCommonDt(ftr_actor, actorx);
+            aMR_RadioCommonDt(ftr_actor, actorx);
+            aMR_MinusWeight(actorx, ftr_actor);
+            if (profile != NULL && profile->vtable != NULL && profile->vtable->dt_proc != NULL) {
+                profile->vtable->dt_proc(ftr_actor, aMR_FtrNo2BankAddress(ftr_actor->name));
+            }
+            l_aMR_work.used_list[i] = FALSE;
+        }
+    }
+    my_room->bgm_info.active_flag = FALSE;
+    my_room->bgm_info.active_ftr_actor = NULL;
+    my_room->bgm_info.reserved_ftr_actor = NULL;
+    aMR_InitFurnitureWork();
+    aMR_InitFurnitureTable(l_aMR_work.ftr_actor_list, l_aMR_work.list_size);
+    aMR_InitFurnitureActorExistTable();
+    aMR_InitHaniwaOnTable(actorx);
+    aMR_InitFurnitureBankTable();
+    for (c = 0; c < UT_Z_NUM * UT_X_NUM; c++) {
+        if (before[c] != after[c]) {
+            fg[c] = after[c];
+        }
+    }
+    aMR_MakeFurnitureActor(actorx, play, mCoBG_LAYER0);
+    aMR_MakeFurnitureActor(actorx, play, mCoBG_LAYER1);
+    my_room->parent_ftr.ftrID = -1;
+    aMR_MakeItemDataInFurniture();
+    my_room->bgm_info.reserve_flag = FALSE;
+    my_room->bgm_info.md_no = -1;
+    my_room->bgm_info.last_md_no = -1;
+    my_room->bgm_info.timer = 0;
+    aMR_ClearSwitchSaveData(my_room);
+    printf("[NET][MUSEUM] fossil room: the exhibits were rebuilt live (%d changed cell(s), fossil bits 0x%07X)\n", changed, (unsigned)sig);
+}
+
+/* TEST-ONLY fidelity check (--house-test-fidelity): the export taken just before the teardown vs the owner-writable bytes the save holds right after it.
+ * Compared: the cells of the 4 layers + ftr_switch + wall_floor of the live floor (what the teardown writes); haniwa_step is reported separately (the teardown does
+ * not write it, aMR_SaveWaltzTempo2 does earlier on the way out). */
+static mHm_hs_c l_pc_fidelity_snap;
+static int l_pc_fidelity_floor = -1;
+static int l_pc_fidelity_idx = -1;
+
+static void aMR_pc_fidelity_before(void) {
+    int floor_no = -1;
+    int idx = -1;
+    MY_ROOM_ACTOR* my_room;
+
+    l_pc_fidelity_floor = -1;
+    if (g_pc_house_test_fidelity && aMR_pc_live_house(&my_room, &idx, &floor_no) && aMR_pc_export_home(&l_pc_fidelity_snap, idx, &floor_no)) {
+        l_pc_fidelity_floor = floor_no;
+        l_pc_fidelity_idx = idx;
+    }
+}
+
+static void aMR_pc_fidelity_after(void) {
+    if (g_pc_house_test_fidelity && l_pc_fidelity_floor >= 0) {
+        const mHm_flr_c* a = &l_pc_fidelity_snap.floors[l_pc_fidelity_floor];
+        const mHm_flr_c* b = &Save_Get(homes[l_pc_fidelity_idx]).floors[l_pc_fidelity_floor];
+        int l;
+        int bad_cells = 0;
+        int bad_switch = 0;
+        int bad_haniwa = 0;
+        int bad_wf = memcmp(&a->wall_floor, &b->wall_floor, sizeof(a->wall_floor)) != 0;
+
+        for (l = 0; l < mHm_LAYER_NUM; l++) {
+            const mHm_lyr_c* la = &a->layer_main + l;
+            const mHm_lyr_c* lb = &b->layer_main + l;
+
+            bad_cells += memcmp(la->items, lb->items, sizeof(la->items)) != 0;
+            bad_switch += la->ftr_switch != lb->ftr_switch;
+            bad_haniwa += memcmp(la->haniwa_step, lb->haniwa_step, sizeof(la->haniwa_step)) != 0;
+        }
+
+        printf("[NET][HOUSE][TEST-ONLY] fidelity house %d floor %d: %s (cells differing layers %d, ftr_switch differing layers %d, wall_floor %s; haniwa_step differing layers %d)\n",
+               l_pc_fidelity_idx, l_pc_fidelity_floor, (bad_cells == 0 && bad_switch == 0 && !bad_wf) ? "MATCH" : "MISMATCH", bad_cells, bad_switch,
+               bad_wf ? "DIFFERS" : "same", bad_haniwa);
+        l_pc_fidelity_floor = -1;
+    }
+}
+#else
+#define aMR_pc_fidelity_before() ((void)0)
+#define aMR_pc_fidelity_after() ((void)0)
+#endif /* TARGET_PC */
+
 static void My_Room_Actor_dt(ACTOR* actorx, GAME* game) {
     MY_ROOM_ACTOR* my_room = (MY_ROOM_ACTOR*)actorx;
 
+    aMR_pc_fidelity_before();
     aMR_SaveSwitchData(my_room);
     aMR_AllFurnitureDestruct(actorx, game);
+    aMR_pc_fidelity_after();
     aMR_FreeHeapArea(actorx);
     aMR_GokiInfoDt();
     aMR_CLIP = NULL;
@@ -2368,3 +2898,191 @@ extern void aMR_SameFurnitureSwitchOFF(u16 ftr_name) {
         used++;
     }
 }
+
+#ifdef TARGET_PC
+/* ===== OUTDOOR FURNITURE (C1, pc/src/pc_ofurn_draw.c): ONE furniture model drawn WITHOUT the My_Room actor =====
+ * The catalog draws every furniture with its profile, a private FTR_ACTOR and a private dma bank (m_catalog_ovl.c mCL_furniture_init / mCL_furniture_draw); these four
+ * functions do the same for a piece placed OUTDOORS: ct = the profile's dma_proc into the caller's bank + the rig + the vtable ct_proc (the catalog's calls), draw = a trimmed
+ * aMR_DrawOneFurniture (light, texture, palette, kankyo map, the registered model, the skeleton, the vtable draw_proc with NO room actor -- the catalog passes NULL too),
+ * dt = the vtable dt_proc. NEVER the move_proc (the furniture behaviour: my_room_clip, music, drawers, sitting), never l_aMR_work, never the room's banks.
+ * Profiles whose vtable has a dt_proc (the 10 structure models that zelda_malloc a palette in ct) are drawn WITHOUT their vtable (aMR_PC_StandaloneDrawable() == 0 when
+ * nothing else is drawable: the caller then keeps the vanilla leaf). */
+#include "pc_outdoor_furniture.h"
+_Static_assert(aFTR_SHAPE_TYPEA == PC_OFURN_SHAPE_1X1, "PC_OFURN_SHAPE_1X1 must equal aFTR_SHAPE_TYPEA");
+
+static aFTR_PROFILE* aMR_PC_ProfileOfItem(int item) {
+    int idx;
+    if (!ITEM_IS_FTR((mActor_name_t)item)) {
+        return NULL;
+    }
+    idx = mRmTp_FtrItemNo2FtrIdx((mActor_name_t)item);
+    if (idx < 0 || idx >= FTR_NUM || furniture_quality[idx] == NULL) {
+        return NULL;
+    }
+    return furniture_quality[idx];
+}
+
+/* C2 fix: C1 ran a vtable only when it had NO dt_proc, to keep the 10 structure models (whose ct_proc zelda_mallocs a palette) away. But 123 vtables carry an EMPTY
+ * dt_proc -- among them every dresser / wardrobe / closet (their model is the skeleton their ct_proc builds) -- so those pieces had nothing drawable and stayed LEAVES
+ * outdoors ("I can't place down dressers"). Every vtable is used now and aMR_PC_StandaloneDt runs the dt_proc, so a ct_proc allocation is always freed (the 18
+ * non-empty dt_procs: zelda_free(pal_p), switch_bit copies, a haniwa sAdo_RhythmStop of a rhythm that was never started). */
+static int aMR_PC_UseVtable(const aFTR_PROFILE* profile) {
+    return profile->vtable != NULL;
+}
+
+int aMR_PC_FtrItemShape(int item) {
+    aFTR_PROFILE* profile = aMR_PC_ProfileOfItem(item);
+    return profile != NULL ? (int)profile->shape : -1;
+}
+
+int aMR_PC_StandaloneDrawable(int item) {
+    aFTR_PROFILE* profile = aMR_PC_ProfileOfItem(item);
+    if (profile == NULL) {
+        return 0;
+    }
+    return profile->opaque0 != NULL || profile->opaque1 != NULL || profile->translucent0 != NULL || profile->translucent1 != NULL || profile->rig != NULL ||
+           (aMR_PC_UseVtable(profile) && profile->vtable->draw_proc != NULL);
+}
+
+/* bank: >= 0x800 bytes owned by the caller (aMR_FTR_BANK_SIZE); pos: the tile centre on the ground. 1 = constructed. */
+int aMR_PC_StandaloneCt(FTR_ACTOR* ftr_actor, int item, const xyz_t* pos, u8* bank) {
+    aFTR_PROFILE* profile = aMR_PC_ProfileOfItem(item);
+    const int angle = FTR_GET_ROTATION((mActor_name_t)item);
+    if (profile == NULL || ftr_actor == NULL || bank == NULL || pos == NULL) {
+        return 0;
+    }
+    bzero(ftr_actor, sizeof(FTR_ACTOR));
+    bzero(bank, aMR_FTR_BANK_SIZE);
+    ftr_actor->ctr_type = aFTR_CTR_TYPE_GAME_PLAY;
+    ftr_actor->name = (u16)mRmTp_FtrItemNo2FtrIdx((mActor_name_t)item);
+    ftr_actor->state = aFTR_STATE_STOP;
+    ftr_actor->layer = mCoBG_LAYER0;
+    ftr_actor->angle_y = aMR_angle_table[angle];
+    ftr_actor->angle_y_target = ftr_actor->angle_y;
+    ftr_actor->s_angle_y = RAD2SHORT_ANGLE2(DEG2RAD(ftr_actor->angle_y));
+    /* C2: a 2x1 piece's current shape is its rotation's TYPEB_* (aMR_SetFurnitureType); pos is the model position of the footprint (pc_ofurn_fp_model_pos) */
+    ftr_actor->shape_type = profile->shape == aFTR_SHAPE_TYPEB_0 ? l_typeB0_table[angle] : profile->shape;
+    ftr_actor->original_shape_type = profile->shape;
+    ftr_actor->position = *pos;
+    ftr_actor->last_position = *pos;
+    ftr_actor->scale.x = ftr_actor->scale.y = ftr_actor->scale.z = 1.0f;
+    ftr_actor->collision_scale = 1.0f;
+    ftr_actor->switch_bit = TRUE;
+    ftr_actor->haniwa_step = -1;
+    if (aFTR_CHECK_INTERACTION(profile->interaction_type, aFTR_INTERACTION_TYPE_TOGGLE) ||
+        aFTR_CHECK_INTERACTION(profile->interaction_type, aFTR_INTERACTION_TYPE_START_DISABLED)) {
+        ftr_actor->switch_bit = FALSE; /* the placed-flag default of aMR_SetSwitchStepData */
+    }
+    ftr_actor->move_bg_idx = -1;
+    if (profile->vtable != NULL && profile->vtable->dma_proc != NULL) {
+        profile->vtable->dma_proc((mActor_name_t)item, bank); /* data only (textures / palettes into the bank), like the catalog */
+    }
+    if (profile->rig != NULL) {
+        cKF_SkeletonInfo_R_ct(&ftr_actor->keyframe, profile->rig->skeleton, profile->rig->animation, ftr_actor->joint, ftr_actor->morph);
+        cKF_SkeletonInfo_R_init_standard_repeat(&ftr_actor->keyframe, profile->rig->animation, NULL);
+        cKF_SkeletonInfo_R_play(&ftr_actor->keyframe);
+        ftr_actor->keyframe.frame_control.speed = 0.5f;
+    }
+    if (aMR_PC_UseVtable(profile) && profile->vtable->ct_proc != NULL) {
+        profile->vtable->ct_proc(ftr_actor, bank);
+    }
+    return 1;
+}
+
+/* the presentation tick: the skeleton / texture animation only (what the catalog advances); never a move_proc */
+void aMR_PC_StandaloneAnimate(FTR_ACTOR* ftr_actor) {
+    aFTR_PROFILE* profile = ftr_actor != NULL ? aMR_GetFurnitureProfile(ftr_actor->name) : NULL;
+    if (profile == NULL) {
+        return;
+    }
+    if (ftr_actor->keyframe.skeleton != NULL && ftr_actor->keyframe.animation != NULL) {
+        cKF_SkeletonInfo_R_play(&ftr_actor->keyframe);
+    }
+}
+
+void aMR_PC_StandaloneDraw(FTR_ACTOR* ftr_actor, GAME* game, u8* bank) {
+    GAME_PLAY* play = (GAME_PLAY*)game;
+    aFTR_PROFILE* profile;
+    xyz_t ftr_scale;
+    f32 scale;
+    int alpha_edge;
+    if (ftr_actor == NULL || game == NULL || bank == NULL) {
+        return;
+    }
+    profile = aMR_GetFurnitureProfile(ftr_actor->name);
+    if (profile == NULL || profile == &iam_dummy) {
+        return;
+    }
+    ftr_scale = ftr_actor->scale;
+    scale = profile->scale;
+    alpha_edge = aMR_GetAlphaEdge(ftr_actor->name);
+
+    OPEN_DISP(game->graph);
+    gDPSetTexEdgeAlpha(NEXT_POLY_OPA_DISP, alpha_edge);
+    gDPSetTexEdgeAlpha(NEXT_POLY_XLU_DISP, alpha_edge);
+    if (aMR_DrawDolphinMode(ftr_actor->name)) {
+        gDPSetTextureAdjustMode(NEXT_POLY_OPA_DISP, G_TA_DOLPHIN);
+        gDPSetTextureAdjustMode(NEXT_POLY_XLU_DISP, G_TA_DOLPHIN);
+    }
+    CLOSE_DISP(game->graph);
+
+    _texture_z_light_fog_prim_xlu(game->graph);
+    _texture_z_light_fog_prim(game->graph);
+    aMR_FurnitureLightSet(ftr_actor, play);
+    aMR_LoadTexture(profile, game);
+    aMR_LoadPallet(profile, game);
+    aMR_SetKankyoMapping(ftr_actor, play);
+
+    Matrix_translate(ftr_actor->position.x, ftr_actor->position.y, ftr_actor->position.z, MTX_LOAD);
+    Matrix_RotateY(ftr_actor->s_angle_y, MTX_MULT);
+    Matrix_translate(ftr_actor->base_position.x, ftr_actor->base_position.y, ftr_actor->base_position.z, MTX_MULT);
+    Matrix_scale(ftr_scale.x, ftr_scale.y, ftr_scale.z, MTX_MULT);
+    Matrix_scale(scale, scale, scale, MTX_MULT);
+
+    aMR_SetLoopTextureAnime(ftr_actor, profile, game);
+    aMR_DrawRegistModel(profile, game);
+    aMR_DrawSkelShape(ftr_actor, profile, game);
+    if (aMR_PC_UseVtable(profile) && profile->vtable->draw_proc != NULL) {
+        OPEN_DISP(game->graph);
+        gSPMatrix(NEXT_POLY_OPA_DISP, _Matrix_to_Mtx_new(game->graph), G_MTX_NOPUSH | G_MTX_LOAD | G_MTX_MODELVIEW);
+        gSPMatrix(NEXT_POLY_XLU_DISP, _Matrix_to_Mtx_new(game->graph), G_MTX_NOPUSH | G_MTX_LOAD | G_MTX_MODELVIEW);
+        CLOSE_DISP(game->graph);
+        profile->vtable->draw_proc(ftr_actor, NULL, game, bank); /* NULL room actor: exactly the catalog's call */
+    }
+
+    OPEN_DISP(game->graph);
+    gDPSetTexEdgeAlpha(NEXT_POLY_OPA_DISP, 144);
+    gDPSetTexEdgeAlpha(NEXT_POLY_XLU_DISP, 144);
+    gDPSetTextureAdjustMode(NEXT_POLY_OPA_DISP, G_TA_N64);
+    gDPSetTextureAdjustMode(NEXT_POLY_XLU_DISP, G_TA_N64);
+    CLOSE_DISP(game->graph);
+}
+
+void aMR_PC_StandaloneDt(FTR_ACTOR* ftr_actor, u8* bank) {
+    aFTR_PROFILE* profile = ftr_actor != NULL ? aMR_GetFurnitureProfile(ftr_actor->name) : NULL;
+    if (profile == NULL) {
+        return;
+    }
+    if (aMR_PC_UseVtable(profile) && profile->vtable->dt_proc != NULL && bank != NULL) {
+        profile->vtable->dt_proc(ftr_actor, bank); /* C2: balances the ct_proc we ran (e.g. the structure models' zelda_malloc'd palette) */
+    }
+    bzero(ftr_actor, sizeof(FTR_ACTOR));
+}
+
+int aMR_PC_StandaloneBankSize(void) {
+    return aMR_FTR_BANK_SIZE;
+}
+
+/* C3: the furniture leaf icon of an item (what the room's place effect eEC_EFFECT_KAGU_HAPPA shows, aMR_SetReserveFurniture) */
+int aMR_PC_ItemIconNo(int item) {
+    return aMR_ItemNo2IconNo((mActor_name_t)item);
+}
+
+int aMR_PC_StandaloneMoveBgType(int item) {
+    aFTR_PROFILE* profile = aMR_PC_ProfileOfItem(item);
+    if (profile == NULL || aFTR_CHECK_INTERACTION(profile->interaction_type, aFTR_INTERACTION_TYPE_NO_COLLISION)) {
+        return -1; /* no collision (vanilla: NO_COLLISION furniture is walkable in a room too) */
+    }
+    return (int)profile->move_bg_type;
+}
+#endif /* TARGET_PC (outdoor furniture) */

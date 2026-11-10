@@ -20,6 +20,9 @@
 #include "m_submenu.h"
 #include "m_field_info.h"
 #include "m_common_data.h"
+#ifdef TARGET_PC
+#include "pc_net_game.h"
+#endif
 
 extern cKF_Skeleton_R_c cKF_bs_r_hnw;
 extern cKF_Animation_R_c cKF_ba_r_hnw_move;
@@ -68,11 +71,21 @@ static void aHNW_actor_ct(ACTOR* actor, GAME* game) {
     haniwa->common_actor_class.anime.anime_no = 2;
     haniwa->house_idx = actor->npc_id - ACTOR_PROP_HANIWA0;
     actor->talk_distance = 43.0f;
+#ifdef TARGET_PC
+    { mActor_name_t* fgp = mFI_GetUnitFG(actor->world.position); pc_net_game_gyroid_diag("ct", NULL, actor, actor->npc_id, actor->world.position.x, actor->world.position.z, actor->block_x, actor->block_z, fgp != NULL ? (unsigned)*fgp : 0xFFFEu); }
+#endif
 }
 
 static void aHNW_actor_dt(ACTOR* actor, GAME* game) {
     HANIWA_ACTOR* haniwa = (HANIWA_ACTOR*)actor;
 
+#ifdef TARGET_PC
+    { mActor_name_t* fgp = mFI_GetUnitFG(actor->world.position); pc_net_game_gyroid_diag("dt", NULL, actor, actor->npc_id, actor->world.position.x, actor->world.position.z, actor->block_x, actor->block_z, fgp != NULL ? (unsigned)*fgp : 0xFFFEu); }
+    {
+        extern void pc_room_gyroid_gone(void* actor); /* roommates (pc_room_ui.c): forget this actor (an armed move-in conversation of this gyroid ends) */
+        pc_room_gyroid_gone(actor);
+    }
+#endif
     if (haniwa->playing_save_bgm) {
         mBGMPsComp_delete_ps_demo(BGM_ENTER_HOUSE, 0x168);
     }
@@ -84,10 +97,14 @@ static void aHNW_actor_dt(ACTOR* actor, GAME* game) {
 #include "../src/actor/ac_haniwa_move.c_inc"
 
 static void aHNW_actor_draw(ACTOR* actor, GAME* game) {
+#ifdef PC_LOW_ADDRESS_64
+    extern Gfx hnw_tex_model[]; /* defined in src/data/pc_split/ac_haniwa.c (static GBI pointer, compiled as C++) */
+#else
     static Gfx hnw_tex_model[] = {
         gsDPLoadTLUT_Dolphin(15, 16, 1, hnw_face),
         gsSPEndDisplayList(),
     };
+#endif
 
     HANIWA_ACTOR* haniwa = (HANIWA_ACTOR*)actor;
     cKF_SkeletonInfo_R_c* keyframe = &haniwa->common_actor_class.anime.keyframe;

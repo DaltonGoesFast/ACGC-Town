@@ -1,6 +1,6 @@
 #!/bin/bash
 # build_pc.sh - Build the Animal Crossing PC port
-# Run from MSYS2 MINGW32 shell
+# Run from MSYS2 MINGW32 (32-bit i686) or UCRT64
 #
 # Prerequisites:
 #   pacman -S mingw-w64-i686-gcc mingw-w64-i686-cmake mingw-w64-i686-SDL2
@@ -12,9 +12,10 @@
 
 set -e
 
-if [ "$MSYSTEM" != "MINGW32" ]; then
-    echo "Error: Must run from MSYS2 MINGW32 shell (not MINGW64 or MSYS)"
-    echo "Open 'MSYS2 MINGW32' from your Start menu, then run this script again."
+# MINGW32 is the 32-bit i686 shell (the save layout). UCRT64 is also accepted.
+if [ "$MSYSTEM" != "MINGW32" ] && [ "$MSYSTEM" != "UCRT64" ]; then
+    echo "Error: Must run from MSYS2 MINGW32 (not MINGW64 or MSYS) or UCRT64."
+    echo "Open 'MSYS2 MINGW32' from your Start menu for the 32-bit build, then run this script again."
     exit 1
 fi
 

@@ -1,4 +1,7 @@
 #include "m_actor.h"
+#ifdef TARGET_PC
+#include "pc_lowaddr.h"
+#endif
 
 #include "m_play.h"
 #include "m_player_lib.h"
@@ -20,6 +23,30 @@
 #include "m_common_data.h"
 #ifdef TARGET_PC
 #include "pc_platform.h"
+#include "pc_host_observer.h" /* --host-observer: pc_host_observer_active() -- see Actor_pc_observer_npc_player_dist() */
+extern int pc_net_game_observer_npc_target(float x, float z, float max_dist, float* out_x, float* out_y, float* out_z); /* pc_net_game.c */
+
+/* --host-observer (dedicated server): the "player" is a hidden, input-less observer standing still at its acre. Measuring the villagers' player distance /
+ * angle to it made the villagers around it greet / chase / force-call an empty spot (and every talk demo is refused for the observer, m_demo.c), so they
+ * never idled normally. A villager (or other NPC) measures to the NEAREST REAL remote player instead (one acre at most), or sees no player at all. */
+static void Actor_pc_observer_npc_player_dist(ACTOR* actor) {
+    float tx, ty, tz;
+    if (pc_net_game_observer_npc_target(actor->world.position.x, actor->world.position.z, mFI_BK_WORLDSIZE_X_F, &tx, &ty, &tz)) {
+        xyz_t t;
+        t.x = tx;
+        t.y = ty;
+        t.z = tz;
+        actor->player_distance_xz = search_position_distanceXZ(&actor->world.position, &t);
+        actor->player_distance_y = ty - actor->world.position.y;
+        actor->player_distance = actor->player_distance_xz * actor->player_distance_xz + actor->player_distance_y * actor->player_distance_y;
+        actor->player_angle_y = search_position_angleY(&actor->world.position, &t);
+    } else {
+        actor->player_distance_xz = 10000.0f; /* nobody near: far away, straight ahead (no turn-to-player) */
+        actor->player_distance_y = 0.0f;
+        actor->player_distance = actor->player_distance_xz * actor->player_distance_xz;
+        actor->player_angle_y = actor->world.angle.y;
+    }
+}
 #endif
 
 #ifdef MUST_MATCH
@@ -111,10 +138,27 @@ extern void Shape_Info_init(ACTOR* actor, f32 ofs_y, mActor_shadow_proc shadow_p
     actor->shape_info.unk_2D = 0;
 }
 
+#ifdef TARGET_PC
+/* Submenu world tick (multiplayer HOST only, see m_play.c Game_play_pc_submenu_world_tick): non-zero ONLY while the host runs
+ * the villager move procs with a submenu open. While set no actor may be created (Actor_info_make_actor -> NULL, the vanilla
+ * "bank/heap not ready" failure every caller already handles and retries) and no exchange bank may be allocated
+ * (mSc_secure_exchange_keep_bank -> NULL). Actor_delete only marks (mv/dw = NULL) and the unlink/free happens in
+ * Actor_info_call_actor, which does not run while the submenu is open: deletes are deferred by construction. Always 0 in
+ * single player / on a client. */
+int g_pc_submenu_world_tick = 0;
+unsigned g_pc_submenu_tick_refused_make = 0;
+unsigned g_pc_submenu_tick_deferred_delete = 0;
+#endif
+
 extern void Actor_delete(ACTOR* actor) {
     if (actor == NULL) {
         return;
     }
+#ifdef TARGET_PC
+    if (g_pc_submenu_world_tick && actor->mv_proc != NULL) {
+        g_pc_submenu_tick_deferred_delete++;
+    }
+#endif
 
     actor->mv_proc = NULL;
     actor->dw_proc = NULL;
@@ -494,6 +538,11 @@ extern void Actor_info_call_actor(GAME_PLAY* play, Actor_info* actor_info) {
                                              actor->player_distance_y * actor->player_distance_y;
                     actor->player_angle_y =
                         search_position_angleY(&actor->world.position, &player_actor->actor_class.world.position);
+#ifdef TARGET_PC
+                    if (actor->part == ACTOR_PART_NPC && pc_host_observer_active()) {
+                        Actor_pc_observer_npc_player_dist(actor);
+                    }
+#endif
                     actor->state_bitfield &= ~ACTOR_STATE_24;
 
                     if ((actor->state_bitfield & (ACTOR_STATE_NO_MOVE_WHILE_CULLED | ACTOR_STATE_NO_CULL)) ||
@@ -628,6 +677,9 @@ extern void Actor_get_overlay_area(ACTOR_DLFTBL* dlftbl, int unused, size_t allo
     } else {
         dlftbl->alloc_buf = (u8*)zelda_malloc(alloc_size);
     }
+#ifdef TARGET_PC
+    PC_LOWADDR_ASSERT("actor overlay buffer", dlftbl->alloc_buf);
+#endif
 }
 
 static int Actor_data_bank_regist_check_npc(int* bank_id, ACTOR_PROFILE* profile, ACTOR_DLFTBL* dlftbl, GAME_PLAY* play,
@@ -686,6 +738,9 @@ static int Actor_malloc_actor_class(ACTOR** actor_pp, ACTOR_PROFILE* profile, AC
         }
     }
 
+#ifdef TARGET_PC
+    PC_LOWADDR_ASSERT("actor allocation", *actor_pp);
+#endif
     if (*actor_pp == NULL) {
         actor_free_check(dlftbl, id);
         return FALSE;
@@ -740,6 +795,12 @@ extern ACTOR* Actor_info_make_actor(Actor_info* actor_info, GAME* game, s16 prof
     if (actor_info->total_num > mAc_MAX_ACTORS) {
         return NULL;
     }
+#ifdef TARGET_PC
+    if (g_pc_submenu_world_tick) {
+        g_pc_submenu_tick_refused_make++;
+        return NULL; /* submenu world tick: creation deferred (the caller retries after the menu closes) */
+    }
+#endif
 
     profile = dlftbl->profile;
 #ifdef TARGET_PC
@@ -765,6 +826,55 @@ extern ACTOR* Actor_info_make_actor(Actor_info* actor_info, GAME* game, s16 prof
 
     return actor;
 }
+
+#ifdef TARGET_PC
+/* pc_actor_make_from_profile: PC-only. Identical to Actor_info_make_actor()'s body, except the
+ * caller supplies an ACTOR_PROFILE/ACTOR_DLFTBL pair directly instead of a profile_no index
+ * into the decomp's fixed actor_dlftbls[] table. Actor_info_make_actor() cannot be reused
+ * as-is for this: it does `dlftbl = actor_dlftbls + profile_no`, an unchecked pointer offset
+ * into that fixed-size array, so there is no in-range profile_no that means "a PC-only actor
+ * type the original game never had a table entry for." This exists so PC-only actor kinds
+ * (e.g. a Stage 2 multiplayer remote-player placeholder) can still go through the real
+ * allocation/init/link/construct pipeline byte-for-byte, without adding a new entry to
+ * mAc_PROFILE_* / actor_dlftbls[] (which would touch decomp-accuracy-sensitive data shared by
+ * every real actor type) and without duplicating that pipeline's logic.
+ *
+ * block_x/block_z/move_actor_list_idx/npc_info_idx/data_bank_idx are hardcoded to -1, matching
+ * how the local PLAYER_ACTOR, demo actors and control actors are already spawned by
+ * Actor_info_ct() above -- i.e. "not tied to the block/field-persistence system", which is
+ * also a prerequisite for reliably avoiding Actor_delete_check()'s block-distance deletion
+ * (the caller must additionally set ACTOR_STATE_NO_MOVE_WHILE_CULLED |
+ * ACTOR_STATE_NO_DRAW_WHILE_CULLED in the profile's initial_flags_state for that; this
+ * function does not add or check any flags itself). */
+extern ACTOR* pc_actor_make_from_profile(Actor_info* actor_info, GAME* game, ACTOR_PROFILE* profile,
+                                         ACTOR_DLFTBL* dlftbl, f32 x, f32 y, f32 z, s16 rot_x, s16 rot_y, s16 rot_z,
+                                         mActor_name_t name_id, s16 arg) {
+    GAME_PLAY* play = (GAME_PLAY*)game;
+    ACTOR* actor;
+    int data_bank_idx = -1;
+
+    if (actor_info->total_num > mAc_MAX_ACTORS) {
+        return NULL;
+    }
+    if (profile == NULL || dlftbl == NULL || profile->class_size == 0) {
+        return NULL;
+    }
+    if (Actor_data_bank_regist_check(&data_bank_idx, profile, dlftbl, play, name_id) == FALSE) {
+        return NULL;
+    }
+    if (Actor_malloc_actor_class(&actor, profile, dlftbl, "", name_id) == FALSE) {
+        return NULL;
+    }
+
+    dlftbl->num_actors++;
+    Actor_init_actor_class(actor, profile, dlftbl, play, data_bank_idx, x, y, z, rot_x, rot_y, rot_z, -1, -1, -1,
+                           name_id, arg);
+    Actor_info_part_new(actor_info, actor, profile->part);
+    Actor_ct(actor, game);
+
+    return actor;
+}
+#endif
 
 extern ACTOR* Actor_info_make_child_actor(Actor_info* actor_info, ACTOR* parent_actor, GAME* game, s16 profile, f32 x,
                                           f32 y, f32 z, s16 rot_x, s16 rot_y, s16 rot_z, s16 move_actor_list_idx,

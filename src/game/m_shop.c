@@ -14,6 +14,8 @@
 
 #ifdef TARGET_PC
 #include "pc_settings.h"
+#include "pc_net_game.h" /* Stage 0 safe degrade: pc_net_game_role() */
+#include "pc_shop_upgrade.h" /* multiplayer: the announced 5-minute shop upgrade closure (host state / client mirror) */
 #endif
 
 extern mActor_name_t* mSP_ftr_list[];
@@ -1253,7 +1255,22 @@ extern void mSP_SetRenewalChiraswhi_AppoDay() {
     }
 }
 
+#ifdef TARGET_PC
+/* Set only while mSP_ShopGameStartCt() seeds a brand-new town's first lineup (see below). */
+static int s_shop_first_lineup = 0;
+#endif
+
 extern void mSP_ExchangeLineUp_InGame(GAME* game) {
+#ifdef TARGET_PC
+    /* Stage 0 safe degrade: Save_t.shop is host-owned shared town state and is NOT replicated (protocol v7), so a
+     * network CLIENT must not re-roll the daily lineup with its own RNG (every start-data-init caller runs at save-load
+     * time, before the link is READY, hence the role test rather than pc_net_game_world_is_host_authoritative()).
+     * A client with a loaded town keeps the stock stored in its own save copy; a brand-new town's first lineup is
+     * seeded by mSP_ShopGameStartCt() (s_shop_first_lineup). Host/solo: unchanged. */
+    if (pc_net_game_role() == PC_NETGAME_ROLE_CLIENT && !s_shop_first_lineup) {
+        return;
+    }
+#endif
     if (mSP_CheckExchangeDay2()) {
         if (mSP_CheckExchangeMonth()) {
             mSP_LotteryLineUp_GameAlloc(game);
@@ -1295,6 +1312,17 @@ extern int mSP_SetNewVisitor() {
 
     return FALSE;
 }
+
+#ifdef TARGET_PC
+/* Multiplayer HOST: mSP_SetNewVisitor for a remote foreign-town shopper (a guest's applied purchase, pc_net_game.c). Idempotent: 1 = newly set, 0 = was already set. */
+int mSP_PC_SetVisitorRemote(void) {
+    if (Save_Get(shop).visitor_flag != FALSE) {
+        return 0;
+    }
+    Save_Get(shop).visitor_flag = TRUE;
+    return 1;
+}
+#endif
 
 extern u32 mSP_GetSalesSum() {
     return Save_Get(shop).sales_sum;
@@ -1531,7 +1559,15 @@ static void mSP_DecideGoodsCommonList() {
 extern void mSP_ShopGameStartCt(GAME* game) {
     mSP_DecideGoodsCommonList();
     mSP_InitShopSaveData();
+#ifdef TARGET_PC
+    /* A brand-new town has no stock at all (InitShopSaveData empties it) and nothing replicates Save_t.shop, so a
+     * network CLIENT must still seed its very first lineup here; every later re-roll stays gated. */
+    s_shop_first_lineup = 1;
+#endif
     mSP_ExchangeLineUp_InGame(game);
+#ifdef TARGET_PC
+    s_shop_first_lineup = 0;
+#endif
 }
 
 extern mActor_name_t mSP_GetNowShopBgNum() {
@@ -1737,6 +1773,17 @@ extern lbRTC_hour_t mSP_GetShopCloseTime_Bgm() {
 }
 
 extern int mSP_InRenewal() {
+#ifdef TARGET_PC
+    /* Multiplayer shop upgrade: the announced closure (host: its own state, client: the host's mirrored service 6). 0 in single player / feature off / an old host. */
+    if (pc_shop_upgrade_closed()) {
+        return TRUE;
+    }
+    /* Stage 0 safe degrade: a client no longer runs aSL_RenewShop, so it would never leave the "in renewal" window if
+     * its save copy had mEv_SAVED_RENEWSHOP set; report "not in renewal" so its shop is never closed forever. */
+    if (pc_net_game_role() == PC_NETGAME_ROLE_CLIENT) {
+        return FALSE;
+    }
+#endif
     if (mEv_CheckEvent(mEv_SAVED_RENEWSHOP) == TRUE) {
         lbRTC_time_c renew_time = Save_Get(shop).renewal_time;
         lbRTC_time_c* rtc_time = Common_GetPointer(time.rtc_time);
@@ -1760,9 +1807,23 @@ extern int mSP_ShopOpen() {
     lbRTC_time_c rtc_time = Common_Get(time.rtc_time);
     lbRTC_hour_t now_hour;
 
+#ifdef TARGET_PC
+    /* Multiplayer shop upgrade: closed for EVERYBODY while the announced 5-minute upgrade runs -- before the first-job override (a player doing the chores would otherwise
+     * walk in and be shown out again by the shop interior) and before the sale-event branch (which would otherwise ignore a renewal). 0 in single player / feature off. */
+    if (pc_shop_upgrade_closed()) {
+        return mSP_SHOP_STATUS_RENEW;
+    }
+#endif
     if (mEv_CheckFirstJob()) {
         return mSP_SHOP_STATUS_OPEN; // shop is forcefully open during chores
     }
+
+#ifdef TARGET_PC
+    /* Nook's manual restock (host-authoritative, mirrored to clients): the shop is closed while it runs. */
+    if (pc_net_game_shop_restocking()) {
+        return mSP_SHOP_STATUS_RESTOCK;
+    }
+#endif
 
     if (mEv_CheckEvent(mEv_SPNPC_SHOP) == TRUE) {
         lbRTC_time_c bargin_time = Save_Get(event_save_data).special.event.bargin.start_time;
@@ -1776,6 +1837,7 @@ extern int mSP_ShopOpen() {
             lbRTC_Sub_hh(&start_time_pre, 1);
             lbRTC_Add_hh(&end_time_post, 1);
 
+#ifndef TARGET_PC /* PC: Nook's shop is open 24/7 (the in-game clock no longer opens / closes it) */
             if (now_hour >= mTM_FIELD_RENEW_HOUR && now_hour < mSP_GetShopOpenTime()) {
                 return mSP_SHOP_STATUS_PRE;
             }
@@ -1783,6 +1845,7 @@ extern int mSP_ShopOpen() {
             if (now_hour < mTM_FIELD_RENEW_HOUR || now_hour >= mSP_GetShopCloseTime()) {
                 return mSP_SHOP_STATUS_END;
             }
+#endif
 
             if (lbRTC_IsOverTime(&start_time_pre, &rtc_time) == lbRTC_LESS) {
                 return mSP_SHOP_STATUS_OPEN;
@@ -1809,6 +1872,14 @@ extern int mSP_ShopOpen() {
     if (mSP_InRenewal() != FALSE) {
         return mSP_SHOP_STATUS_RENEW;
     }
+
+#ifdef TARGET_PC
+    /* PC: Nook's shop is open 24/7 regardless of the in-game clock. Kept: the shop-upgrade construction (RENEW above), the first-job chores (forced open above), the
+     * restock (above) and the end-of-month raffle day, whose door / raffle flow is built on the clock. */
+    if (mSP_CheckFukubikiDay() == FALSE) {
+        return mSP_SHOP_STATUS_OPEN;
+    }
+#endif
 
     if (now_hour >= mSP_GetShopOpenTime() && now_hour < mSP_GetShopCloseTime()) {
         return mSP_SHOP_STATUS_OPEN;
@@ -2542,7 +2613,7 @@ extern void mSP_SelectRandomItemToAGB() {
 extern const char* mSP_ShopStatus2String(int status) {
     static char dummy[] = "hahaha";
 
-    static char* str_table[mSP_SHOP_STATUS_NUM] = { "Pre", "End", "Opn", "Rnw", "PreEv", "EndEv", "OpnEv" };
+    static char* str_table[mSP_SHOP_STATUS_NUM] = { "Pre", "End", "Opn", "Rnw", "PreEv", "EndEv", "OpnEv", "Rstk" };
 
     if (status >= 0 && status < mSP_SHOP_STATUS_NUM) {
         return str_table[status];

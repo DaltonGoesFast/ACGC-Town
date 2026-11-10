@@ -13,6 +13,12 @@
 #include "m_name_table.h"
 #include "m_collision_bg.h"
 #include "m_random_field.h"
+#ifdef TARGET_PC
+#include "pc_log.h"           /* T1: train lifecycle diagnostics */
+#include "pc_arrival_logic.h" /* T2: title-demo-1 -> other edge decision (pure, natively tested) */
+#include "pc_remote_arrival_logic.h" /* T4: remote-arrival train guard (pure, natively tested) */
+#include "pc_arrival_train.h" /* synced arrival train: the host's timeline drives the local train (pure replica + the pc_arrtrain_* API) */
+#endif
 
 #define mTRC_RTC_TIME_SECONDS(rtc_time) \
     (rtc_time->sec + (rtc_time->min + rtc_time->hour * mTM_MINUTES_IN_HOUR) * mTM_SECONDS_IN_MINUTE)
@@ -420,6 +426,28 @@ static void mTRC_trainControl(GAME_PLAY* play, int state) {
     Common_Set(train_position, pos);
 }
 
+#ifdef TARGET_PC
+/* one line per train: spawned, or (vanilla) not spawned because the train is outside the player's area (aTRC_area_check; actors only exist
+ * near the station acre). Re-armed when the train is no longer in the FG field / flag state, i.e. per train. */
+static int s_pc_spawn_logged = 0; /* re-armed per train: action NONE, and every synced train start (mTRC_pc_sync_tick) */
+static void mTRC_pc_spawn_diag(int spawned, const GAME_PLAY* play, f32 x) {
+    int s_logged = s_pc_spawn_logged;
+    if (spawned) {
+        if (!s_logged) {
+            s_logged = 1;
+            PC_LOG(PCL_GENERAL, "[TRAIN] actor spawned (train x=%.0f; player block x,z = %d,%d)\n", x, play->block_table.block_x, play->block_table.block_z);
+        }
+    } else if (!s_logged && Common_Get(train_action) != 0) {
+        s_logged = 1;
+        PC_LOG(PCL_GENERAL, "[TRAIN] actor not in area (train x=%.0f; player block x,z = %d,%d)\n", x, play->block_table.block_x, play->block_table.block_z);
+    }
+    if (Common_Get(train_action) == 0) {
+        s_logged = 0;
+    }
+    s_pc_spawn_logged = s_logged;
+}
+#endif
+
 static void mTRC_trainSet(GAME_PLAY* play) {
     ACTOR* train_actor;
     ACTOR* caboose_actor;
@@ -472,6 +500,9 @@ static void mTRC_trainSet(GAME_PLAY* play) {
             }
 
             Common_Set(train_flag, FALSE);
+#ifdef TARGET_PC
+            mTRC_pc_spawn_diag(1, play, x + 250.0f);
+#endif
 
             train_actor->block_x = -1;
             train_actor->block_z = -1;
@@ -481,6 +512,11 @@ static void mTRC_trainSet(GAME_PLAY* play) {
             caboose_actor->block_z = -1;
             caboose_actor->parent_actor = train_actor;
         }
+#ifdef TARGET_PC
+        else {
+            mTRC_pc_spawn_diag(0, play, x);
+        }
+#endif
     }
 }
 
@@ -499,17 +535,295 @@ extern void mTRC_init(GAME* game) {
     Common_Set(train_flag, FALSE);
 }
 
+#ifdef TARGET_PC
+/* T1 (diagnostics only, no behaviour change): one PC_LOG(GENERAL) line per CHANGE of the train control state, so a resident / guest
+ * run log shows the train lifecycle (action 0 none, 1 spawn, 2 slowdown, 3 stop, 4 signal stopped, 5 wait stopped, 6 signal starting,
+ * 7 pull out, 8 speed up; "now" / "start" are RTC seconds of the day). */
+static void mTRC_pc_diag(const char* where) {
+    static int s_valid = FALSE;
+    static u8 s_action, s_ctl, s_last, s_coming, s_signal;
+    static int s_demo;
+    u8 action = Common_Get(train_action);
+    u8 ctl = Common_Get(train_control_state);
+    u8 last = Common_Get(train_last_control_state);
+    u8 coming = Common_Get(train_coming_flag);
+    u8 signal = Common_Get(train_signal);
+    int demo = mEv_CheckTitleDemo();
+
+    if (s_valid && s_action == action && s_ctl == ctl && s_last == last && s_coming == coming && s_signal == signal &&
+        s_demo == demo) {
+        return;
+    }
+
+    s_valid = TRUE;
+    s_action = action;
+    s_ctl = ctl;
+    s_last = last;
+    s_coming = coming;
+    s_signal = signal;
+    s_demo = demo;
+    PC_LOG(PCL_GENERAL, "[TRAIN] %s: action=%u control=%u last_control=%u coming_flag=%u signal=%u title_demo=%d start_timer=%u now=%u x=%.0f\n",
+           where, (unsigned)action, (unsigned)ctl, (unsigned)last, (unsigned)coming, (unsigned)signal, demo,
+           (unsigned)Common_Get(train_start_timer), (unsigned)mTRC_RTC_TIME_SECONDS(Common_GetPointer(time.rtc_time)),
+           (double)Common_Get(train_position).x);
+}
+
+/* T2: the title-demo train leak. START1's train is parked by mTRC_mati_init(); the bootstraps bind a player from the title scene, which
+ * runs on during the outgoing wipe and re-parks the train after mSDI_StartInitAfter -> mTRC_init. In the town the parked train never
+ * leaves (WAIT_STOPPED needs control != last, or control == 0). Re-initialise it once on the edge "title demo 1 -> anything else",
+ * keeping the arrival demo's coming_flag == 3. Vanilla flows are untouched: the player-select / train interior (pre-game draw types)
+ * skip it, they re-init through mSDI_StartDataInit anyway. */
+static void mTRC_pc_title_edge(GAME* game) {
+    static int s_was_start1 = 0;
+    int demo = mEv_CheckTitleDemo();
+    int pre_game = Common_Get(field_draw_type) == FIELD_DRAW_TYPE_TRAIN || Common_Get(field_draw_type) == FIELD_DRAW_TYPE_PLAYER_SELECT;
+    int was = s_was_start1;
+
+    if (pcarr_trc_title_edge(&s_was_start1, demo, mEv_TITLEDEMO_START1, pre_game)) {
+        unsigned coming = pcarr_trc_coming_after_reinit(Common_Get(train_coming_flag), 3u);
+
+        PC_LOG(PCL_GENERAL, "[TRAIN] title demo 1 -> %d: re-init (was action=%u control=%u last=%u coming_flag=%u, keep coming_flag=%u)\n", demo,
+               (unsigned)Common_Get(train_action), (unsigned)Common_Get(train_control_state),
+               (unsigned)Common_Get(train_last_control_state), (unsigned)Common_Get(train_coming_flag), coming);
+        mTRC_init(game);
+        Common_Set(train_coming_flag, (u8)coming);
+    } else if (was && !s_was_start1) {
+        PC_LOG(PCL_GENERAL, "[TRAIN] title demo 1 -> %d: pre-game scene, vanilla flow (no re-init)\n", demo);
+    }
+}
+
+/* T4: a remote puppet just entered the 'standing in the train' state (the vanilla ride-off demo of an arriving player, seen on the wire as
+ * main index DEMO_STANDING_TRAIN) in the town. Start the vanilla arrival train on THIS process the way the arriving client's demo does
+ * (ac_ride_off_demo_move.c_inc aROD_first_set: train_coming_flag = 3; mTRC_schedule -> mTRC_demo_init puts the train at x 2037, it slows,
+ * stops, waits about 20 s of RTC time and leaves). Every process runs its own train (nothing about it is synced), so this is a local
+ * presentation only; it is called ONLY through the pure guard pcarr_remote_arrival_train_decide() (no train of its own, no title demo,
+ * no local arrival / boarding, no pending request) and the caller latches once per standing period. No passenger is forced: the
+ * train's arg0 / arg1 are set only by the ride-off demo / station master, never here.
+ * puppet_in_local_town: the puppet's announced scene is the town field this process shows (checked by the caller, which owns the slot).
+ * Returns the guard reason (PCARR_REMOTE_TRAIN_OK = 0 when the train was started); the caller re-polls on transient reasons. */
+extern int mTRC_pc_remote_arrival(GAME* game, int peer, int puppet_in_local_town) {
+    GAME_PLAY* play = (GAME_PLAY*)game;
+    PLAYER_ACTOR* player = get_player_actor_withoutCheck(play);
+    int local_demo = FALSE;
+    int main_index;
+    int why;
+
+    if (pc_arrtrain_peer_is_passenger(peer)) {
+        /* synced arrival train: this arrival is on the host's timeline, the local train already follows it (mTRC_pc_sync_tick): never a second, local one */
+        PC_LOG(PCL_GENERAL, "[TRAIN] remote arrival of player %d: on the host's synced arrival timeline (no separate local train)\n", peer);
+        return PCARR_REMOTE_TRAIN_LATCHED;
+    }
+    if (player != NULL) {
+        main_index = mPlib_get_player_actor_main_index(game);
+        local_demo = main_index == mPlayer_INDEX_DEMO_STANDING_TRAIN || main_index == mPlayer_INDEX_DEMO_GETOFF_TRAIN ||
+                     main_index == mPlayer_INDEX_DEMO_GETON_TRAIN || main_index == mPlayer_INDEX_DEMO_GETON_TRAIN_WAIT ||
+                     Actor_info_name_search(&play->actor_info, mAc_PROFILE_RIDE_OFF_DEMO, ACTOR_PART_CONTROL) != NULL ||
+                     /* the intro demo actor lives the whole first job (m_actor.c, ac_intro_demo.c); it means 'local arrival' only while the
+                      * first intro runs (mEv_CheckFirstIntro is cleared in aID_retire_rcn_guide_wait) */
+                     pcarr_local_intro_arriving(Actor_info_name_search(&play->actor_info, mAc_PROFILE_INTRO_DEMO, ACTOR_PART_CONTROL) != NULL,
+                                                mEv_CheckFirstIntro() != FALSE);
+    }
+
+    why = pcarr_remote_arrival_train_decide(0, puppet_in_local_town, play->scene_id == SCENE_FG && Common_Get(field_type) == mFI_FIELDTYPE2_FG,
+                                            player != NULL, mEv_CheckTitleDemo() != mEv_TITLEDEMO_NONE,
+                                            Common_Get(field_draw_type) == FIELD_DRAW_TYPE_TRAIN ||
+                                                Common_Get(field_draw_type) == FIELD_DRAW_TYPE_PLAYER_SELECT,
+                                            local_demo, (unsigned)Common_Get(train_coming_flag), (unsigned)Common_Get(train_action));
+    if (why != PCARR_REMOTE_TRAIN_OK) {
+        PC_LOG(PCL_GENERAL, "[TRAIN] remote arrival of player %d: NOT calling a local train (guard reason %d; action=%u coming_flag=%u)\n", peer, why,
+               (unsigned)Common_Get(train_action), (unsigned)Common_Get(train_coming_flag));
+        return 0;
+    }
+
+    Common_Set(train_coming_flag, 3);
+    PC_LOG(PCL_GENERAL, "[TRAIN] remote arrival of player %d: starting the local arrival train (coming_flag=3)\n", peer);
+    return 1;
+}
+#endif
+
+#ifdef TARGET_PC
+static float s_pc_passenger_dx = 0.0f;
+
+/* Shared train arrival: see m_train_control.h. Called once from the ride-off demo (aROD_train_birth_wait) after the vanilla arrival request (train_coming_flag = 3 ->
+ * mTRC_demo_init) ran. The train actors are pure views of these Common fields, so moving them here moves the (local) train; nothing else about the train is touched. */
+extern void mTRC_pc_join_arrival(int join_class, float train_x) {
+    xyz_t pos = Common_Get(train_position);
+
+    if (join_class == PCARR_JOIN_RIDING) {
+        pos.x = train_x; /* still in BEGIN_SLOWDOWN: the vanilla slowdown / stop carries on from there */
+        Common_Set(train_position, pos);
+        s_pc_passenger_dx = PCARR_JOIN_PASSENGER_DX;
+    } else if (join_class == PCARR_JOIN_STOPPED) {
+        /* the same state mTRC_trainControl reaches after SIGNAL_STOPPED: stopped at the station, doors open (action 5), leaving after the usual ~20 s of RTC time */
+        pos.x = PCARR_TRAIN_STOP_X;
+        Common_Set(train_position, pos);
+        Common_Set(train_speed, 0.0f);
+        Common_Set(train_signal, TRUE);
+        Common_Set(train_timer, 0);
+        Common_Set(train_action, mTRC_ACTION_WAIT_STOPPED);
+        Common_Set(train_start_timer, mTRC_RTC_TIME_SECONDS(Common_GetPointer(time.rtc_time)) + 20);
+        s_pc_passenger_dx = PCARR_JOIN_PASSENGER_DX;
+    } else {
+        s_pc_passenger_dx = 0.0f;
+    }
+    PC_LOG(PCL_GENERAL, "[TRAIN] shared arrival: local train moved to the joined phase (class %d, train x %.0f, action %u, passenger dx %.0f)\n", join_class, (double)pos.x,
+           (unsigned)Common_Get(train_action), (double)s_pc_passenger_dx);
+}
+
+extern float mTRC_pc_passenger_dx(void) {
+    return s_pc_passenger_dx;
+}
+
+/* ---- synced arrival train (pc_arrival_train.h; message 105; kill switch AC_MP_TRAIN_SYNC=0) ----
+ * The host's arrival timeline drives THIS process's vanilla train: the presented train is started (mTRC_demo_init) at the timeline's start and
+ * fast-forwarded to its age with the pure replica of mTRC_trainControl, held at the station (WAIT_STOPPED: start_timer kept in the future) until the
+ * host says depart, then released through the vanilla departure (start_timer = now). The local passenger's caboose spot follows its seat
+ * (one spot back per passenger still aboard ahead of it, moving up when one gets off). Nothing else of the train is touched; without an active
+ * timeline (solo, an old host, the kill switch) nothing here runs. */
+extern void mTRC_pc_train_params(PCATTrainParams* out) {
+    out->slow_speed = mTRC_SLOW_SPEED;
+    out->fast_speed = mTRC_FAST_SPEED;
+    out->slow_rate = mTRC_SLOW_RATE;
+    out->stop_rate = mTRC_STOP_RATE;
+    out->start_rate = mTRC_START_RATE;
+    out->speedup_rate = mTRC_SPEEDUP_RATE;
+}
+
+static u16 s_pcat_started_id = 0; /* the timeline train this process started (or skipped) */
+static int s_pcat_driving = FALSE; /* the local train is that timeline train */
+static int s_pcat_released = FALSE;
+static int s_pcat_last_local_idx = -1;
+
+/* the local player is leaving by train (Porter's boarding flow owns the train): never take it over */
+static int mTRC_pc_local_boarding(GAME_PLAY* play) {
+    int mi = mPlib_get_player_actor_main_index((GAME*)play);
+    return mi == mPlayer_INDEX_DEMO_GETON_TRAIN || mi == mPlayer_INDEX_DEMO_GETON_TRAIN_WAIT || Common_Get(train_coming_flag) == 2 ||
+           (Common_Get(train_action) != mTRC_ACTION_NONE && Common_Get(train_control_state) != 0);
+}
+
+/* the local player arrives by a train that is NOT this timeline train (the first-job intro, a ride-off demo on the previous path): its own train is left alone */
+static int mTRC_pc_local_other_arrival(GAME_PLAY* play, const PCATView* v) {
+    if (v->local_idx >= 0) {
+        return FALSE;
+    }
+    return Actor_info_name_search(&play->actor_info, mAc_PROFILE_RIDE_OFF_DEMO, ACTOR_PART_CONTROL) != NULL ||
+           pcarr_local_intro_arriving(Actor_info_name_search(&play->actor_info, mAc_PROFILE_INTRO_DEMO, ACTOR_PART_CONTROL) != NULL, mEv_CheckFirstIntro() != FALSE);
+}
+
+static void mTRC_pc_sync_tick(GAME_PLAY* play) {
+    PCATView v;
+    u32 now_sec = mTRC_RTC_TIME_SECONDS(Common_GetPointer(time.rtc_time));
+    int active = mEv_CheckTitleDemo() == mEv_TITLEDEMO_NONE && pc_arrtrain_view(&v); /* never on a title demo (mTRC_go_process lets START1 through) */
+
+    if (s_pcat_driving && (!active || !v.has_train || v.id != s_pcat_started_id)) {
+        /* the train left the timeline (retired, the host is gone): the vanilla rules finish it (a stopped train leaves now) */
+        s_pcat_driving = FALSE;
+        s_pc_passenger_dx = 0.0f;
+        if (Common_Get(train_action) == mTRC_ACTION_WAIT_STOPPED && !s_pcat_released) { /* still held by us (released: a stopped train now is another, vanilla one) */
+            Common_Set(train_start_timer, now_sec);
+        }
+        PC_LOG(PCL_GENERAL, "[TRAIN][SYNC] synced train %u is no longer on the timeline: the local train finishes by the vanilla rules (action %u)\n", (unsigned)s_pcat_started_id,
+               (unsigned)Common_Get(train_action));
+    }
+    if (!active || !v.has_train) {
+        return;
+    }
+    if (v.id != s_pcat_started_id) {
+        PCATTrainParams p;
+        PCATTrainSim s;
+        xyz_t pos;
+        unsigned frames;
+
+        if (!v.started || play->scene_id != SCENE_FG || Common_Get(field_type) != mFI_FIELDTYPE2_FG || mTRC_pc_local_boarding(play) || mTRC_pc_local_other_arrival(play, &v)) {
+            return; /* not yet / not here: retried every frame */
+        }
+        s_pcat_started_id = v.id;
+        if (v.depart_set) {
+            PC_LOG(PCL_GENERAL, "[TRAIN][SYNC] synced train %u is already departing: not shown here\n", (unsigned)v.id);
+            return;
+        }
+        mTRC_pc_train_params(&p);
+        frames = pcat_ms_to_frames(v.age_ms);
+        pcat_sim_at(&s, &p, frames);
+        mTRC_demo_init();
+        Common_Set(train_coming_flag, 0);
+        Common_Set(train_action, (u8)s.action);
+        Common_Set(train_speed, s.speed);
+        Common_Set(train_timer, (u8)s.timer);
+        Common_Set(train_signal, (u8)(s.action >= mTRC_ACTION_SIGNAL_STOPPED ? TRUE : FALSE));
+        pos = Common_Get(train_position);
+        pos.x = s.x;
+        Common_Set(train_position, pos);
+        s_pcat_driving = TRUE;
+        s_pcat_released = FALSE;
+        s_pc_spawn_logged = 0; /* one spawn / not-in-area diag line for this train */
+        s_pc_passenger_dx = v.local_idx >= 0 ? pcat_seat_dx_states(v.pstate, v.n, v.local_idx) : 0.0f;
+        s_pcat_last_local_idx = v.local_idx;
+        PC_LOG(PCL_GENERAL, "[TRAIN][SYNC] synced train %u started here: age %d ms -> %u frames fast-forwarded, action %u x %.0f%s (seat %d, passenger dx %.0f)\n", (unsigned)v.id,
+               (int)v.age_ms, frames, (unsigned)s.action, (double)s.x, frames > 0 ? "" : " (from the start)", v.local_idx, (double)s_pc_passenger_dx);
+    }
+    if (!s_pcat_driving) {
+        return;
+    }
+    if (Common_Get(train_action) == mTRC_ACTION_WAIT_STOPPED && Common_Get(train_control_state) == Common_Get(train_last_control_state)) {
+        if (v.depart_set && v.depart_age_ms >= 0) {
+            if (!s_pcat_released) {
+                s_pcat_released = TRUE;
+                Common_Set(train_start_timer, now_sec); /* the vanilla departure: signal off, pull out */
+                PC_LOG(PCL_GENERAL, "[TRAIN][SYNC] synced train %u departs (the host's depart, %d ms ago)\n", (unsigned)v.id, (int)v.depart_age_ms);
+            }
+        } else {
+            Common_Set(train_start_timer, now_sec + 60); /* held at the station until the host's depart */
+        }
+    }
+    if (v.local_idx >= 0 && s_pcat_last_local_idx < 0) {
+        s_pc_passenger_dx = pcat_seat_dx_states(v.pstate, v.n, v.local_idx); /* a seat taken on a train already shown here: straight to it */
+    }
+    s_pcat_last_local_idx = v.local_idx;
+    if (v.local_idx >= 0) {
+        s_pc_passenger_dx = pcat_dx_approach(s_pc_passenger_dx, pcat_seat_dx_states(v.pstate, v.n, v.local_idx), play->game.graph->dt_num_60fps_frames);
+    }
+}
+
+/* the local passenger of a synced train may step off: its turn (every passenger ahead welcomed / gone) and it reached the door spot. 1 = also when not synced. */
+extern int mTRC_pc_local_may_get_off(void) {
+    PCATView v;
+    if (!s_pcat_driving || !pc_arrtrain_view(&v) || !v.has_train || v.id != s_pcat_started_id || v.local_idx < 0) {
+        return TRUE;
+    }
+    return pcat_may_get_off_states(v.pstate, v.n, v.local_idx) && s_pc_passenger_dx > -0.5f;
+}
+
+/* the local train is the synced timeline train (the ride-off demo then never requests its own one) */
+extern int mTRC_pc_synced_driving(void) {
+    return s_pcat_driving;
+}
+#endif
+
 extern void mTRC_move(GAME* game) {
     GAME_PLAY* play = (GAME_PLAY*)game;
     PLAYER_ACTOR* player = get_player_actor_withoutCheck(play);
     int state;
     Common_Set(train_approaching_flag, FALSE);
 
+#ifdef TARGET_PC
+    mTRC_pc_title_edge(game);
+#endif
+
     if (!mTRC_go_process() || player == NULL) {
+#ifdef TARGET_PC
+        mTRC_pc_diag("idle");
+#endif
         return;
     }
 
+#ifdef TARGET_PC
+    mTRC_pc_sync_tick(play); /* synced arrival train: inert without the host's timeline */
+#endif
     state = mTRC_schedule(play);
     mTRC_trainControl(play, state);
     mTRC_trainSet(play);
+#ifdef TARGET_PC
+    mTRC_pc_diag("move");
+#endif
 }

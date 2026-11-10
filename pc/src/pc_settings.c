@@ -1,5 +1,7 @@
 /* pc_settings.c - runtime settings loaded from settings.ini */
 #include "pc_settings.h"
+#include "pc_guest_admit.h"
+#include "pc_net.h" /* PC_NET_RESERVED_PEER_ID, pc_peer_capacity_max (the max_peers range) */
 #include "pc_platform.h"
 #include "m_player_lib.h"
 #include "ac_birth_control.h"
@@ -16,11 +18,45 @@ PCSettings g_pc_settings = {
     .disable_resetti = 0,
     .disable_shop_visitor_req = 0,
     .borderless_acres = 1,
+    .fast_text = 1,
+    .show_acre = 1,
+    .touch_controls = -1,
     .nes_aspect = 1,
     .master_volume = 100,
     .stick_deadzone = 12,
     .cstick_deadzone = 12,
+    .max_guests = 4,
+    .max_peers = 8,
+    .guest_memory_mb = 256,
+    .interest_management = 1,
+    .allow_new_guests = 1,
+    .resident_tokens = 0,
+    .show_ping = 0,
+    .emotes = 1,
+    .handover_anim = 1,
+    .work_v2 = 1,
+    .shop_nook_sync = 1,
+    .client_log = 0,
+    .town_serve = -1, /* -1 = AUTO: on for a --dedicated host (sanitized), off otherwise; an explicit off/on/full in settings.ini or --town-serve wins */
+    .personal_sync = -1,
+    .ofurn_place = 1,
+    .ofurn_leaf_drop = 1,
+    .ofurn_max_town = 512,
+    .ofurn_max_acre = 128,
+    .menu_world_live = 1,
+    .npc_fallback = 1,
+    .npc_relay = 1,
+    .chat = 1,
+    .bulk_sell = 1,
+    .roommates = 1,
 };
+
+int g_pc_max_guests_override = 0;
+int g_pc_max_peers_override = 0;
+int g_pc_town_serve_override = -1;
+int g_pc_personal_sync_override = -1;
+int g_pc_allow_new_guests_override = -1;
+int g_pc_resident_tokens_override = -1;
 
 static const char* SETTINGS_FILE = "settings.ini";
 
@@ -59,8 +95,32 @@ static const char* DEFAULT_SETTINGS =
     "# Borderless acres: 0 = original acre transitions (faster, draws less), 1 = continuous movement/camera\n"
     "borderless_acres = 1\n"
     "\n"
+    "# Dialogue reveal: 0 = normal (B latches the fast reveal for that message), 1 = always the fast reveal (local only)\n"
+    "fast_text = 1\n"
+    "\n"
+    "# Outdoor acre label under the clock (A1 Grass, and so on): 0 = off, 1 = on (local HUD only)\n"
+    "show_acre = 1\n"
+    "\n"
+    "# Touch overlay (tap or click to walk, on-screen A / B / Tool / Emote): auto, on, or off. auto is on only when a touchscreen is present\n"
+    "touch_controls = auto\n"
+    "\n"
     "# NES emulator aspect ratio: 0 = stretch to fullscreen, 1 = 4:3 pillarbox\n"
     "nes_aspect = 1\n"
+    "\n"
+    "# Multiplayer client: show the round-trip time to the host (ms) in the top-right corner while connected: 0 = off, 1 = on (F4 toggles it while playing)\n"
+    "show_ping = 0\n"
+    "\n"
+    "# Emote wheel: hold F (keybindings.ini Emote) or D-pad Up on a controller, point at an emote, release: 0 = off, 1 = on (default)\n"
+    "emotes = 1\n"
+    "\n"
+    "# Multiplayer hand-over animations (Nook's Work Mode, villagers giving / taking items): 0 = off (the item just changes pockets), 1 = on (default)\n"
+    "handover_anim = 1\n"
+    "\n"
+    "# Multiplayer Nook Work Mode v2 (Check job, urgent jobs, quitting returns the item, villager tips, deliveries paid at the villager): 0 = the previous Work Mode, 1 = on (default)\n"
+    "work_v2 = 1\n"
+    "\n"
+    "# Multiplayer shops: 1 (default) = Nook (and Timmy / Tommy) follow the player of the shop who is nearest to them, the same on every game; 0 = each game's Nook follows its own player\n"
+    "shop_nook_sync = 1\n"
     "\n"
     "[Audio]\n"
     "# Master output volume as a percentage (0-100)\n"
@@ -69,7 +129,56 @@ static const char* DEFAULT_SETTINGS =
     "[Input]\n"
     "# Gamepad stick deadzones as a percentage (0-40)\n"
     "stick_deadzone = 12\n"
-    "cstick_deadzone = 12\n";
+    "cstick_deadzone = 12\n"
+    "\n"
+    "[Network]\n"
+    "# Host only: most guests (visitors with their own character, never residents) connected at once (1-254, default 4; a guest also needs a network peer, see max_peers)\n"
+    "max_guests = 4\n"
+    "\n"
+    "# Host only: most simultaneous network peers (residents + guests + visitors still connecting) the transport accepts (1-254, default 8). Memory grows with it (about 130 KB per peer that has connected).\n"
+    "max_peers = 8\n"
+    "\n"
+    "# Host only: memory budget of the guest store in MB (1-1048576, default 256, about 28 KB per stored guest). Guests are stored one file each and there is no fixed number of them; when the budget is used up the oldest unconfirmed idle guest is replaced and a new guest is refused only if there is none.\n"
+    "guest_memory_mb = 256\n"
+    "\n"
+    "# Host only: 1 (default) = the host relays other players' movement at a lower rate to players who are far away or in another scene (never to zero), 0 = full rate to everyone\n"
+    "interest_management = 1\n"
+    "\n"
+    "# 1 (default) = a villager the host is not simulating (far from the host) walks on this game's own villager AI instead of standing still, 0 = it waits for the host\n"
+    "npc_fallback = 1\n"
+    "\n"
+    "# 1 (default) = such a villager is relayed through the host so every player near it sees the same villager, 0 = off\n"
+    "npc_relay = 1\n"
+    "\n"
+    "# 1 (default) = the multiplayer text chat: press T (keybindings.ini Chat) to type, Enter sends, a bubble shows above you (host: 0 turns it off for everyone)\n"
+    "chat = 1\n"
+    "\n"
+    "# Host only: 1 = a visitor with a NEW character may join as a guest (default), 0 = only guests this host already knows (a new guest key is refused as 'server full')\n"
+    "allow_new_guests = 1\n"
+    "\n"
+    "# Host only: resident credentials: off (default: nothing is minted or checked), tofu (a resident's first claim mints its token), required (like tofu, but a resident without\n"
+    "# a credential is refused until the operator runs resident-arm). Needs a client of this version; see docs/multiplayer-guest-roadmap.md\n"
+    "resident_tokens = off\n"
+    "\n"
+    "# Host only: serve this town's save to clients that start with --town-fetch: auto (default: on for a --dedicated host, off otherwise), 0 = off, 1 = on (a SANITIZED copy: other residents' pockets / mail / diary / designs / villager letters blanked), 2 = full (the whole file, every resident's private data: friends / LAN only). off / on / full are accepted too.\n"
+    "town_serve = auto\n"
+    "\n"
+    "# Host only: personal data sync (each resident's diary, authenticated by the resident binding): auto (default: on only while town_serve is not off), on, off\n"
+    "personal_sync = auto\n"
+    "\n"
+    "# Host and client: 1 (default) = in a multiplayer session the world keeps running behind the inventory, the other menus and the Esc menu (other players, villagers, bugs, fish, weather, effects); 0 = the menu freezes the world like single player\n"
+    "menu_world_live = 1\n"
+    "\n"
+    "# Host only: outdoor furniture (C1). outdoor_furniture_place: 1 (default) = residents may PLACE furniture outside (the real model, rotated, solid), 0 = off. outdoor_furniture_leaf_drop: 1 (default) = anyone may still DROP furniture as a leaf (vanilla), 0 = the host refuses furniture leaf drops outside\n"
+    "outdoor_furniture_place = 1\n"
+    "outdoor_furniture_leaf_drop = 1\n"
+    "# Host only: technical SAFETY ceilings of placed furniture (they only protect the renderer / collision / save; not a gameplay limit): per town (1-1024, default 512) and per acre (1-256, default 128)\n"
+    "outdoor_furniture_max_town = 512\n"
+    "outdoor_furniture_max_acre = 128\n"
+    "\n"
+    "[Debug]\n"
+    "# 1 = write this game's log (connection / join trace, [JOIN] lines) to client_log.txt next to AnimalCrossing.exe (appended, rotated at 4 MB) so it can be sent for a bug report; 0 = off (default)\n"
+    "client_log = 0\n";
 
 static const char* skip_ws(const char* s) {
     while (*s == ' ' || *s == '\t') s++;
@@ -112,6 +221,26 @@ static void apply_setting(const char* key, const char* value) {
         if (val == 0 || val == 1) g_pc_settings.disable_shop_visitor_req = val;
     } else if (strcmp(key, "borderless_acres") == 0) {
         if (val == 0 || val == 1) g_pc_settings.borderless_acres = val;
+    } else if (strcmp(key, "fast_text") == 0) {
+        if (val == 0 || val == 1) g_pc_settings.fast_text = val;
+    } else if (strcmp(key, "show_acre") == 0) {
+        if (val == 0 || val == 1) g_pc_settings.show_acre = val;
+    } else if (strcmp(key, "touch_controls") == 0) {
+        if (strcmp(value, "on") == 0 || strcmp(value, "1") == 0) g_pc_settings.touch_controls = 1;
+        else if (strcmp(value, "off") == 0 || strcmp(value, "0") == 0) g_pc_settings.touch_controls = 0;
+        else if (strcmp(value, "auto") == 0 || strcmp(value, "-1") == 0) g_pc_settings.touch_controls = -1;
+    } else if (strcmp(key, "emotes") == 0) {
+        if (val == 0 || val == 1) g_pc_settings.emotes = val;
+    } else if (strcmp(key, "handover_anim") == 0) {
+        if (val == 0 || val == 1) g_pc_settings.handover_anim = val;
+    } else if (strcmp(key, "work_v2") == 0) {
+        if (val == 0 || val == 1) g_pc_settings.work_v2 = val;
+    } else if (strcmp(key, "shop_nook_sync") == 0) {
+        if (val == 0 || val == 1) g_pc_settings.shop_nook_sync = val;
+    } else if (strcmp(key, "show_ping") == 0) {
+        if (val == 0 || val == 1) g_pc_settings.show_ping = val;
+    } else if (strcmp(key, "client_log") == 0) {
+        if (val == 0 || val == 1) g_pc_settings.client_log = val;
     } else if (strcmp(key, "nes_aspect") == 0) {
         if (val == 0 || val == 1) g_pc_settings.nes_aspect = val;
     } else if (strcmp(key, "master_volume") == 0) {
@@ -120,6 +249,51 @@ static void apply_setting(const char* key, const char* value) {
         if (val >= 0 && val <= 40) g_pc_settings.stick_deadzone = val;
     } else if (strcmp(key, "cstick_deadzone") == 0) {
         if (val >= 0 && val <= 40) g_pc_settings.cstick_deadzone = val;
+    } else if (strcmp(key, "max_guests") == 0) {
+        { int mg; if (pc_guest_admit_parse(value, &mg)) g_pc_settings.max_guests = mg; } /* strict 1..254: malformed / out of range = ignored (default kept) */
+    } else if (strcmp(key, "interest_management") == 0) {
+        if (val == 0 || val == 1) g_pc_settings.interest_management = val;
+    } else if (strcmp(key, "npc_fallback") == 0) {
+        if (val == 0 || val == 1) g_pc_settings.npc_fallback = val;
+    } else if (strcmp(key, "npc_relay") == 0) {
+        if (val == 0 || val == 1) g_pc_settings.npc_relay = val;
+    } else if (strcmp(key, "chat") == 0) {
+        if (val == 0 || val == 1) g_pc_settings.chat = val;
+    } else if (strcmp(key, "guest_memory_mb") == 0) {
+        if (val >= 1 && val <= 1048576) g_pc_settings.guest_memory_mb = val;
+    } else if (strcmp(key, "max_peers") == 0) {
+        if (val >= 1 && val <= pc_peer_capacity_max(PC_NET_RESERVED_PEER_ID)) g_pc_settings.max_peers = val;
+    } else if (strcmp(key, "allow_new_guests") == 0) {
+        if (val == 0 || val == 1) g_pc_settings.allow_new_guests = val;
+    } else if (strcmp(key, "resident_tokens") == 0) {
+        if (strcmp(value, "off") == 0 || strcmp(value, "0") == 0) g_pc_settings.resident_tokens = 0;
+        else if (strcmp(value, "tofu") == 0) g_pc_settings.resident_tokens = 1;
+        else if (strcmp(value, "required") == 0) g_pc_settings.resident_tokens = 2;
+    } else if (strcmp(key, "town_serve") == 0) {
+        /* M-G: 0 = off, 1 = on (a SANITIZED copy), 2 = full (the whole file); the words off / on / full are accepted too */
+        if (strcmp(value, "auto") == 0) g_pc_settings.town_serve = -1;
+        else if (strcmp(value, "off") == 0) g_pc_settings.town_serve = 0;
+        else if (strcmp(value, "on") == 0) g_pc_settings.town_serve = 1;
+        else if (strcmp(value, "full") == 0) g_pc_settings.town_serve = 2;
+        else if (val >= 0 && val <= 2) g_pc_settings.town_serve = val;
+    } else if (strcmp(key, "personal_sync") == 0) {
+        if (strcmp(value, "auto") == 0) g_pc_settings.personal_sync = -1;
+        else if (strcmp(value, "on") == 0 || strcmp(value, "1") == 0) g_pc_settings.personal_sync = 1;
+        else if (strcmp(value, "off") == 0 || strcmp(value, "0") == 0) g_pc_settings.personal_sync = 0;
+    } else if (strcmp(key, "menu_world_live") == 0) {
+        if (val == 0 || val == 1) g_pc_settings.menu_world_live = val;
+    } else if (strcmp(key, "bulk_sell") == 0) {
+        if (val == 0 || val == 1) g_pc_settings.bulk_sell = val;
+    } else if (strcmp(key, "roommates") == 0) {
+        if (val == 0 || val == 1) g_pc_settings.roommates = val;
+    } else if (strcmp(key, "outdoor_furniture_place") == 0) {
+        if (val == 0 || val == 1) g_pc_settings.ofurn_place = val;
+    } else if (strcmp(key, "outdoor_furniture_leaf_drop") == 0) {
+        if (val == 0 || val == 1) g_pc_settings.ofurn_leaf_drop = val;
+    } else if (strcmp(key, "outdoor_furniture_max_town") == 0) {
+        if (val >= 1 && val <= 1024) g_pc_settings.ofurn_max_town = val;
+    } else if (strcmp(key, "outdoor_furniture_max_acre") == 0) {
+        if (val >= 1 && val <= 256) g_pc_settings.ofurn_max_acre = val;
     }
 }
 
@@ -197,8 +371,32 @@ void pc_settings_save(void) {
     fprintf(f, "# Borderless acres: 0 = original acre transitions (faster, draws less), 1 = continuous movement/camera\n");
     fprintf(f, "borderless_acres = %d\n", g_pc_settings.borderless_acres);
     fprintf(f, "\n");
+    fprintf(f, "# Dialogue reveal: 0 = normal (B latches the fast reveal for that message), 1 = always the fast reveal (local only)\n");
+    fprintf(f, "fast_text = %d\n", g_pc_settings.fast_text);
+    fprintf(f, "\n");
+    fprintf(f, "# Outdoor acre label under the clock (A1 Grass, and so on): 0 = off, 1 = on (local HUD only)\n");
+    fprintf(f, "show_acre = %d\n", g_pc_settings.show_acre);
+    fprintf(f, "\n");
+    fprintf(f, "# Touch overlay (tap or click to walk, on-screen A / B / Tool / Emote): auto, on, or off. auto is on only when a touchscreen is present\n");
+    fprintf(f, "touch_controls = %s\n", g_pc_settings.touch_controls < 0 ? "auto" : g_pc_settings.touch_controls ? "on" : "off");
+    fprintf(f, "\n");
     fprintf(f, "# NES emulator aspect ratio: 0 = stretch to fullscreen, 1 = 4:3 pillarbox\n");
     fprintf(f, "nes_aspect = %d\n", g_pc_settings.nes_aspect);
+    fprintf(f, "\n");
+    fprintf(f, "# Multiplayer client: show the round-trip time to the host (ms) in the top-right corner while connected: 0 = off, 1 = on (F4 toggles it while playing)\n");
+    fprintf(f, "show_ping = %d\n", g_pc_settings.show_ping);
+    fprintf(f, "\n");
+    fprintf(f, "# Emote wheel: hold F (keybindings.ini Emote) or D-pad Up on a controller, point at an emote, release: 0 = off, 1 = on (default)\n");
+    fprintf(f, "emotes = %d\n", g_pc_settings.emotes);
+    fprintf(f, "\n");
+    fprintf(f, "# Multiplayer hand-over animations (Nook's Work Mode, villagers giving / taking items): 0 = off (the item just changes pockets), 1 = on (default)\n");
+    fprintf(f, "handover_anim = %d\n", g_pc_settings.handover_anim);
+    fprintf(f, "\n");
+    fprintf(f, "# Multiplayer Nook Work Mode v2 (Check job, urgent jobs, quitting returns the item, villager tips, deliveries paid at the villager): 0 = the previous Work Mode, 1 = on (default)\n");
+    fprintf(f, "work_v2 = %d\n", g_pc_settings.work_v2);
+    fprintf(f, "\n");
+    fprintf(f, "# Multiplayer shops: 1 (default) = Nook (and Timmy / Tommy) follow the player of the shop who is nearest to them, the same on every game; 0 = each game's Nook follows its own player\n");
+    fprintf(f, "shop_nook_sync = %d\n", g_pc_settings.shop_nook_sync);
     fprintf(f, "\n");
     fprintf(f, "[Audio]\n");
     fprintf(f, "# Master output volume as a percentage (0-100)\n");
@@ -208,6 +406,58 @@ void pc_settings_save(void) {
     fprintf(f, "# Gamepad stick deadzones as a percentage (0-40)\n");
     fprintf(f, "stick_deadzone = %d\n", g_pc_settings.stick_deadzone);
     fprintf(f, "cstick_deadzone = %d\n", g_pc_settings.cstick_deadzone);
+    fprintf(f, "\n");
+    fprintf(f, "[Network]\n");
+    fprintf(f, "# Host only: most guests (visitors with their own character, never residents) connected at once (1-8)\n");
+    fprintf(f, "max_guests = %d\n", g_pc_settings.max_guests);
+    fprintf(f, "\n");
+    fprintf(f, "# Host only: most simultaneous network peers (residents + guests + visitors still connecting) the transport accepts (1-254, default 8). Memory grows with it (about 130 KB per peer that has connected).\n");
+    fprintf(f, "max_peers = %d\n", g_pc_settings.max_peers);
+    fprintf(f, "\n");
+    fprintf(f, "# Host only: memory budget of the guest store in MB (1-1048576, default 256, about 28 KB per stored guest). Guests are stored one file each and there is no fixed number of them; when the budget is used up the oldest unconfirmed idle guest is replaced and a new guest is refused only if there is none.\n");
+    fprintf(f, "guest_memory_mb = %d\n", g_pc_settings.guest_memory_mb);
+    fprintf(f, "interest_management = %d\n", g_pc_settings.interest_management);
+    fprintf(f, "\n");
+    fprintf(f, "# 1 (default) = a villager the host is not simulating (far from the host) walks on this game's own villager AI instead of standing still, 0 = it waits for the host\n");
+    fprintf(f, "npc_fallback = %d\n", g_pc_settings.npc_fallback);
+    fprintf(f, "\n");
+    fprintf(f, "# 1 (default) = such a villager is relayed through the host so every player near it sees the same villager, 0 = off\n");
+    fprintf(f, "npc_relay = %d\n", g_pc_settings.npc_relay);
+    fprintf(f, "\n");
+    fprintf(f, "# 1 (default) = the multiplayer text chat: press T (keybindings.ini Chat) to type, Enter sends, a bubble shows above you (host: 0 turns it off for everyone)\n");
+    fprintf(f, "chat = %d\n", g_pc_settings.chat);
+    fprintf(f, "\n");
+    fprintf(f, "# Host only: 1 = a visitor with a NEW character may join as a guest (default), 0 = only guests this host already knows (a new guest key is refused as 'server full')\n");
+    fprintf(f, "allow_new_guests = %d\n", g_pc_settings.allow_new_guests);
+    fprintf(f, "\n");
+    fprintf(f, "# Host only: resident credentials: off (default: nothing is minted or checked), tofu (a resident's first claim mints its token), required (like tofu, but a resident without\n");
+    fprintf(f, "# a credential is refused until the operator runs resident-arm). Needs a client of this version; see docs/multiplayer-guest-roadmap.md\n");
+    fprintf(f, "resident_tokens = %s\n", g_pc_settings.resident_tokens == 2 ? "required" : g_pc_settings.resident_tokens == 1 ? "tofu" : "off");
+    fprintf(f, "\n");
+    fprintf(f, "# Host only: serve this town's save to clients that start with --town-fetch: auto (default: on for a --dedicated host, off otherwise), 0 = off, 1 = on (a SANITIZED copy: other residents' pockets / mail / diary / designs / villager letters blanked), 2 = full (the whole file, every resident's private data: friends / LAN only). off / on / full are accepted too.\n");
+    if (g_pc_settings.town_serve < 0) fprintf(f, "town_serve = auto\n"); else fprintf(f, "town_serve = %d\n", g_pc_settings.town_serve);
+    fprintf(f, "\n");
+    fprintf(f, "# Host only: personal data sync (each resident's diary, authenticated by the resident binding): auto (default: on only while town_serve is not off), on, off\n");
+    fprintf(f, "personal_sync = %s\n", g_pc_settings.personal_sync < 0 ? "auto" : g_pc_settings.personal_sync ? "on" : "off");
+    fprintf(f, "\n");
+    fprintf(f, "# Host and client: 1 (default) = in a multiplayer session the world keeps running behind the inventory, the other menus and the Esc menu; 0 = the menu freezes the world like single player\n");
+    fprintf(f, "menu_world_live = %d\n", g_pc_settings.menu_world_live);
+    fprintf(f, "\n");
+    fprintf(f, "# Host and client: 1 (default) = in a multiplayer session Nook's \"I want to sell\" opens the sell basket (put several mixed items in, Nook quotes the count and the total); 0 = the vanilla picker\n");
+    fprintf(f, "bulk_sell = %d\n", g_pc_settings.bulk_sell);
+    fprintf(f, "\n");
+    fprintf(f, "# Host only: 1 (default) = roommates: a guest may ask a resident to move in at the resident's gyroid placed outside (it shares the house); 0 = off\n");
+    fprintf(f, "roommates = %d\n", g_pc_settings.roommates);
+    fprintf(f, "\n");
+    fprintf(f, "# Host only: outdoor furniture (C1): Place (residents: the real model, rotated, solid) on/off, the vanilla leaf Drop of furniture on/off, and the technical SAFETY ceilings (not a gameplay limit)\n");
+    fprintf(f, "outdoor_furniture_place = %d\n", g_pc_settings.ofurn_place);
+    fprintf(f, "outdoor_furniture_leaf_drop = %d\n", g_pc_settings.ofurn_leaf_drop);
+    fprintf(f, "outdoor_furniture_max_town = %d\n", g_pc_settings.ofurn_max_town);
+    fprintf(f, "outdoor_furniture_max_acre = %d\n", g_pc_settings.ofurn_max_acre);
+    fprintf(f, "\n");
+    fprintf(f, "[Debug]\n");
+    fprintf(f, "# 1 = write this game's log (connection / join trace, [JOIN] lines) to client_log.txt next to AnimalCrossing.exe (appended, rotated at 4 MB) so it can be sent for a bug report; 0 = off (default)\n");
+    fprintf(f, "client_log = %d\n", g_pc_settings.client_log);
     fclose(f);
     printf("[Settings] Saved %s\n", SETTINGS_FILE);
 }

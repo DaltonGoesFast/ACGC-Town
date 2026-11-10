@@ -18,6 +18,10 @@
 #include "m_fishrecord.h"
 #include "m_event.h"
 #include "m_common_data.h"
+#ifdef TARGET_PC
+#include "pc_net_game.h" /* World Ecology Stage 1, Item 3: pc_net_game_world_is_host_authoritative() --
+                           * see mNtc_check_treasure()'s host-authority gate below. */
+#endif
 
 #define lbRTC_TIME_TO_U32(t) ((u32)(((t)->year << 16) + ((t)->month << 8) + (t)->day))
 
@@ -250,6 +254,9 @@ extern void mNtc_notice_write(mNtc_board_post_c* new_post) {
         /* space available, write to lowest unused slot */
         mem_copy((u8*)(Save_Get(noticeboard) + write_num), (u8*)new_post, sizeof(mNtc_board_post_c));
     }
+#ifdef TARGET_PC
+    pc_net_game_pages_dirty(); /* notice board latency: the town page sync uploads / pushes the change on the next frame (no periodic-scan wait) */
+#endif
 }
 
 static int mNtc_set_landname_string(u8* buf) {
@@ -307,6 +314,23 @@ static void mNtc_check_treasure() {
     int b_z;
     f32 rng;
     int list_type;
+
+#ifdef TARGET_PC
+    /* World Ecology Stage 1, Item 3: this function is void, RNG-bearing (fqrand()/RANDOM()), and
+     * Save-mutating (treasure_buried_time, treasure_checked_time is read but not written here --
+     * see mNtc_notice_write()'s own caller for that -- plus mFI_SetTreasure()'s Save.fg/Save.deposit
+     * writes, already covered by field-authority sync). A network CLIENT independently calling this
+     * would roll its own local RNG (divergent from the host's) and, if its own scene happened to be
+     * SCENE_FG, write into Save.fg/deposit locally via mFI_SetTreasure() -- a real duplication/
+     * divergence risk -- and would also drift treasure_buried_time/treasure_checked_time away from
+     * the host's copy (those two fields are read only inside this same function, so the drift is
+     * otherwise harmless, but skipping the whole function keeps this client's copy simply frozen
+     * rather than silently diverging). Host and single-player are unaffected -- the host still buries
+     * treasure normally. */
+    if (pc_net_game_role() == PC_NETGAME_ROLE_CLIENT) {
+        return;
+    }
+#endif
 
     treasure_buried_time = Save_GetPointer(treasure_buried_time);
     treasure_checked_time = Save_GetPointer(treasure_checked_time);
@@ -403,6 +427,14 @@ static void mNtc_check_treasure() {
     int b_z;
     f32 rng;
     int list_type;
+
+#ifdef TARGET_PC
+    /* World Ecology Stage 1, Item 3: see the other region variant's copy of this same guard above
+     * (mNtc_check_treasure(), the #if VERSION != VER_GAFE01_00 branch) for the full rationale. */
+    if (pc_net_game_role() == PC_NETGAME_ROLE_CLIENT) {
+        return;
+    }
+#endif
 
     treasure_buried_time = Save_GetPointer(treasure_buried_time);
     treasure_checked_time = Save_GetPointer(treasure_checked_time);

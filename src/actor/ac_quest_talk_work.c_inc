@@ -1,0 +1,194 @@
+#ifdef TARGET_PC
+/* Nook Work Mode, the VILLAGER side of the errands (Nook's talk is in ac_npc_shop_common.c).
+ * A villager the character's current job points at (pc_net_game_work_villager_pending) takes this talk kind instead of the normal one: the villager's usual hello plays, and while it
+ * is on screen the matching work transaction is sent to the HOST (op 5 = the villager hands over the item of a FETCH job; op 6 = the parcel of a DELIVER job is handed to its
+ * recipient, Nook pays at REPORT; Work v2 op 10 = the parcel handed over COMPLETES the job: the host removes it and pays Nook's reward + the villager's tip in one step).
+ * When the host answers, the continue message of the hello becomes the matching generated row pair (pc_nook_house.c): ROW 1 ("Nook sent you for <item>? Here you go!" /
+ * "<item> from Tom Nook? For me?") and ROW 2 (the goodbye / the tip / Nook's pay). Nothing here decides anything: the pocket / wallet change is the host's post-image
+ * (pcnetgame_txn_apply_work) and a refusal shows "I do not know what this is about".
+ * Hand-over animations (pc_handover.h, ON by default): the vanilla hand-over of an APPLIED op plays WHILE ROW 1 IS READ: the row is selected, and once it is on screen
+ * (pc_nook_wk2_serial changed) op 5 = the villager hands the item to the player (the quest manager's own "npc takeout" demo order -> aNPC_ACT_TRANS -> the player's RECIEVE
+ * states), op 6 / 10 = the player hands the parcel over (mPlib_request_main_give_type1 -> GIVE / GIVE_WAIT -> the villager's aNPC_ACT_GET), then an old-style ITEM tip comes
+ * back the same way as op 5; row 1 waits at its end (locked, as in vanilla) until the hand-over is over, then row 2 follows. Presentation only: the pockets already hold the
+ * host's post-image; a refusal plays nothing; a hand-over that does not start / end in time is abandoned (the message is unlocked). */
+enum {
+    aQMgr_WORK_STEP_START,
+    aQMgr_WORK_STEP_BEGIN,
+    aQMgr_WORK_STEP_PENDING,
+    aQMgr_WORK_STEP_FINISH,
+    aQMgr_WORK_STEP_HAND,
+    aQMgr_WORK_STEP_ROWWAIT /* row 1 was selected: once it is on screen the hand-over starts (it plays while the row is read) */
+};
+
+static int l_work_op;
+static int l_work_npc;
+static PCWorkView l_work_view;
+static int l_work_ho_n, l_work_ho_idx, l_work_ho_started, l_work_ho_ordered;
+static int l_work_ho_kind[2], l_work_ho_item[2];
+static PCHoWait l_work_ho_wait;
+static unsigned l_work_serial0;
+
+static int aQMgr_talk_common_set_npc_takeout(mActor_name_t item); /* ac_quest_manager.c */
+static int aQMgr_set_npc_putaway(void);                           /* ac_quest_manager.c */
+
+static void aQMgr_work_show(QUEST_MANAGER_ACTOR* manager, int ok) {
+    PCWorkView nv;
+    unsigned char it[16];
+    int art = 0, row1, row2;
+    if (!ok) {
+        pc_nook_house_set_work_view(&l_work_view, NULL);
+        mMsg_Set_continue_msg_num(mMsg_Get_base_window_p(), pc_nook_msg_id(PC_NOOK_MSG_WORK_V_FAIL));
+        manager->sub_talk_state = aQMgr_TALK_SUB_STATE_WAIT;
+        manager->talk_step = aQMgr_WORK_STEP_FINISH;
+        printf("[NET][WORK] villager talk: npc 0x%04X op %d refused -> row %d\n", l_work_npc, l_work_op, PC_NOOK_MSG_WORK_V_FAIL);
+        return;
+    }
+    if (pc_net_game_work_view(&nv)) {
+        l_work_view.tip_kind = nv.tip_kind; /* the payout the host decided (v2: the tip of this delivery; the reward incl. an urgent bonus) */
+        l_work_view.tip_value = nv.tip_value;
+        l_work_view.reward = nv.reward;
+    }
+    row1 = l_work_op == PC_WORK_OP_VILLAGER_GIVE ? PC_WK2_V_VGIVE : PC_WK2_V_VRECV;
+    row2 = l_work_op == PC_WORK_OP_VILLAGER_GIVE ? PC_WK2_V_VGIVE_BYE : l_work_op == PC_WORK_OP_VILLAGER_COMPLETE ? PC_WK2_V_VDONE : PC_WK2_V_VRECV_TIP;
+    pc_nook_house_set_work_view(&l_work_view, NULL);
+    pc_net_game_work_item_name(l_work_op == PC_WORK_OP_VILLAGER_GIVE ? l_work_view.obj_item : l_work_view.carried_item, it, &art);
+    pc_nook_house_set_work_item(it, art);
+    pc_nook_house_set_wk2(row1, row2);
+    l_work_serial0 = pc_nook_wk2_serial();
+    mMsg_Set_continue_msg_num(mMsg_Get_base_window_p(), pc_nook_msg_id(PC_NOOK_MSG_WK2));
+    printf("[NET][WORK] villager talk: npc 0x%04X op %d APPLIED -> rows %d / %d\n", l_work_npc, l_work_op, row1, row2);
+    if (l_work_op == PC_WORK_OP_VILLAGER_COMPLETE) {
+        char note[96];
+        snprintf(note, sizeof(note), "Delivery done! Tom Nook's pay %u Bells + tip %u Bells.", l_work_view.reward, l_work_view.tip_value);
+        pc_net_game_work_notice(note);
+    }
+    l_work_ho_n = pc_handover_enabled() ? pc_ho_work_plan(l_work_op, ok, l_work_view.obj_item, l_work_view.carried_item, l_work_view.tip_kind, (int)l_work_view.tip_value,
+                                                          l_work_ho_kind, l_work_ho_item)
+                                        : 0;
+    l_work_ho_idx = 0;
+    l_work_ho_started = FALSE;
+    manager->sub_talk_state = aQMgr_TALK_SUB_STATE_NO_WAIT;
+    manager->talk_step = aQMgr_WORK_STEP_ROWWAIT; /* the hand-over (if any) starts once row 1 is on screen: aQMgr_WORK_STEP_HAND, mMsg_Set_LockContinue */
+}
+
+/* one frame of the Work Mode hand-over(s); TRUE = all of them are over */
+static int aQMgr_work_hand(void) {
+    aHOI_Clip_c* hoi = CLIP(handOverItem_clip);
+    int kind = l_work_ho_kind[l_work_ho_idx];
+    mActor_name_t item = (mActor_name_t)l_work_ho_item[l_work_ho_idx];
+    int r;
+
+    if (hoi == NULL) {
+        mMsg_Unset_LockContinue(mMsg_Get_base_window_p());
+        return TRUE;
+    }
+    if (!l_work_ho_started) {
+        if (hoi->master_actor != NULL) {
+            return FALSE; /* a previous hand-over is still finishing */
+        }
+        if (kind == PC_HO_KIND_NPC_GIVES) {
+            aQMgr_talk_common_set_npc_takeout(item); /* the vanilla order: the villager takes the item out and holds it to the player (aNPC_ACT_TRANS) */
+        } else {
+            mPlib_request_main_give_type1(gamePT, item, aHOI_REQUEST_PUTAWAY, FALSE, FALSE); /* the player holds the parcel out (GIVE) */
+        }
+        pc_ho_wait_start(&l_work_ho_wait);
+        l_work_ho_started = TRUE;
+        l_work_ho_ordered = FALSE;
+        printf("[NET][HANDOVER] work villager talk: npc 0x%04X hand-over %d/%d %s item 0x%04X started\n", l_work_npc, l_work_ho_idx + 1, l_work_ho_n,
+               kind == PC_HO_KIND_NPC_GIVES ? "villager -> player" : "player -> villager", (unsigned)item);
+    }
+    mMsg_Set_LockContinue(mMsg_Get_base_window_p());
+    if (kind == PC_HO_KIND_NPC_TAKES && !l_work_ho_ordered && hoi->request_mode == aHOI_REQUEST_TRANS_WAIT) {
+        l_work_ho_ordered = aQMgr_set_npc_putaway(); /* the player holds it out: the villager takes it (the vanilla order: aNPC_ACT_GET) */
+    }
+    r = pc_ho_wait_tick(&l_work_ho_wait, hoi->master_actor != NULL, mPlib_check_player_actor_main_index_RecieveMove(gamePT),
+                        (float)gamePT->graph->dt_num_60fps_frames);
+    if (r == PC_HO_WAIT_RUNNING) {
+        return FALSE;
+    }
+    printf("[NET][HANDOVER] work villager talk: npc 0x%04X hand-over %d/%d %s\n", l_work_npc, l_work_ho_idx + 1, l_work_ho_n,
+           r == PC_HO_WAIT_DONE ? "done" : "TIMEOUT (abandoned, the message is unlocked)");
+    if (r == PC_HO_WAIT_TIMEOUT) {
+        mDemo_Set_OrderValue(mDemo_ORDER_NPC0, 3, 0); /* an order nobody took */
+    }
+    l_work_ho_started = FALSE;
+    if (++l_work_ho_idx < l_work_ho_n && r == PC_HO_WAIT_DONE) {
+        return FALSE;
+    }
+    mMsg_Unset_LockContinue(mMsg_Get_base_window_p());
+    return TRUE;
+}
+
+/* row 1 is over (its hand-over done, or none): row 2 follows it, then the talk ends with row 2 */
+static void aQMgr_work_next_row(QUEST_MANAGER_ACTOR* manager) {
+    mMsg_Set_continue_msg_num(mMsg_Get_base_window_p(), pc_nook_msg_id(PC_NOOK_MSG_WK2_NEXT));
+    manager->talk_step = aQMgr_WORK_STEP_FINISH;
+    manager->sub_talk_state = aQMgr_TALK_SUB_STATE_WAIT;
+}
+
+extern void aQMgr_talk_work_init(QUEST_MANAGER_ACTOR* manager) {
+    int r;
+    switch (manager->talk_step) {
+        case aQMgr_WORK_STEP_START: {
+            ACTOR* client = *manager->client;
+            Animal_c* animal = (client != NULL && client->part == ACTOR_PART_NPC) ? ((NPC_ACTOR*)client)->npc_info.animal : NULL;
+            l_work_op = 0;
+            l_work_npc = animal != NULL ? (int)animal->id.npc_id : 0;
+            l_work_ho_n = 0;
+            if (animal == NULL || !pc_net_game_work_villager_pending(l_work_npc, &l_work_op) || !pc_net_game_work_view(&l_work_view)) {
+                (*manager->talk_common_proc)(manager, aQMgr_TALK_COMMON_CHANGE_TALK_NORMAL); /* nothing to do any more: the villager's normal talk */
+                manager->sub_talk_state = aQMgr_TALK_SUB_STATE_WAIT;
+                break;
+            }
+            manager->talk_step = aQMgr_WORK_STEP_BEGIN;
+            manager->sub_talk_state = aQMgr_TALK_SUB_STATE_NO_WAIT; /* the request goes out while the hello is on screen */
+            break;
+        }
+        case aQMgr_WORK_STEP_BEGIN:
+            r = pc_net_game_work_begin_op(l_work_op, l_work_npc);
+            if (r < 0) {
+                manager->sub_talk_state = aQMgr_TALK_SUB_STATE_NO_WAIT; /* another transaction is unresolved: next frame */
+            } else if (r == 0) {
+                aQMgr_work_show(manager, FALSE);
+            } else if (r == 3) {
+                aQMgr_work_show(manager, TRUE); /* the host's own player: done at once */
+            } else {
+                manager->talk_step = aQMgr_WORK_STEP_PENDING;
+                manager->sub_talk_state = aQMgr_TALK_SUB_STATE_NO_WAIT;
+            }
+            break;
+        case aQMgr_WORK_STEP_PENDING:
+            r = pc_net_game_ts_poll();
+            if (r == PC_NETGAME_TS_OP_PENDING) {
+                manager->sub_talk_state = aQMgr_TALK_SUB_STATE_NO_WAIT;
+            } else {
+                aQMgr_work_show(manager, r == PC_NETGAME_TS_OP_APPLIED);
+            }
+            break;
+        case aQMgr_WORK_STEP_ROWWAIT:
+            if (pc_nook_wk2_serial() == l_work_serial0) {
+                manager->sub_talk_state = aQMgr_TALK_SUB_STATE_NO_WAIT; /* the hello is still being read */
+            } else if (l_work_ho_n > 0) {
+                printf("[NET][HANDOVER] work villager talk: npc 0x%04X row 1 is on screen: the hand-over starts while it is read\n", l_work_npc);
+                mMsg_Set_LockContinue(mMsg_Get_base_window_p()); /* row 1 waits at its end until the hand-over is over (vanilla: aHOI_birth_proc locks it too) */
+                manager->talk_step = aQMgr_WORK_STEP_HAND;
+                manager->sub_talk_state = aQMgr_TALK_SUB_STATE_NO_WAIT;
+            } else {
+                aQMgr_work_next_row(manager);
+            }
+            break;
+        case aQMgr_WORK_STEP_HAND:
+            if (aQMgr_work_hand()) {
+                aQMgr_work_next_row(manager); /* row 2 continues after row 1 as before */
+            } else {
+                manager->sub_talk_state = aQMgr_TALK_SUB_STATE_NO_WAIT;
+            }
+            break;
+        default: /* FINISH: the generated row ends the conversation by itself */
+            (*manager->talk_common_proc)(manager, aQMgr_TALK_COMMON_CLEAR_TALK_INFO);
+            manager->sub_talk_state = aQMgr_TALK_SUB_STATE_WAIT;
+            break;
+    }
+    manager->talk_state = aQMgr_TALK_STATE_SUB;
+}
+#endif

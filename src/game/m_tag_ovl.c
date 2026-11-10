@@ -27,6 +27,22 @@
 #include "m_roll_lib.h"
 #include "m_house.h"
 
+#ifdef TARGET_PC
+#include "pc_net_game.h" /* Stage 5B-1: pc_net_game_role()/pc_net_game_request_drop()/
+                           * pc_net_game_is_droppable_item() -- see mTG_field_put_proc's seam. */
+#include <stdio.h>
+#include "pc_dresser_ui.h"
+extern int g_pc_verbose; /* the dresser-mode cursor diagnostic prints only with --verbose */ /* dresser storage: the DRESSER MODE of the gyroid overlay (never the save's gyroid) */
+#include "pc_guest_mail.h" /* guest mailbox: pc_ui_mailbox() = THE mailbox of the overlay (the guest copy for a guest, else now_home's; NULL-guarded) */
+#include "pc_outdoor_furniture.h" /* outdoor furniture C1: the "Place" tag (mTG_TYPE_76 on PC) and the leaf-drop policy */
+#include "pc_sell_ui.h" /* Nook bulk sell basket: the basket mode of the dresser screen (5 x 3 grid, Add to Basket / Take Back, refusal notice) */
+#include "pc_sell_logic.h" /* Nook bulk sell basket: PC_SELL_TABLE_COLS / PC_SELL_BASKET_COLS (the cursor table with the Sell button column) */
+#define mTG_MAILBOX() pc_ui_mailbox()
+#define mTG_MAILBOX_USABLE() pc_ui_mailbox_usable()
+#else
+#define mTG_MAILBOX() (Common_Get(now_home)->mailbox)
+#endif
+
 static void mTG_mark_main_CLR(Submenu* submenu, const mSM_MenuInfo_c* menu_info);
 
 enum {
@@ -151,6 +167,33 @@ static mTG_tag_data_table_c mTG_table_data[] = {
     { 2, 4, mTG_gba_nw_col_pos, mTG_gba_nw_line_pos },                     /* mTG_TABLE_CARD_NW */
 };
 
+#ifdef TARGET_PC
+/* dresser mode (U3, docs/dresser-storage-redesign-plan.md): the gyroid table becomes ONE 9 x 3 grid of all 27 dresser slots, drawn where the gyroid portrait,
+ * dialogue box and 4-slot strip were. The gyroid window is ENLARGED in dresser mode (pc_dresser_layout: 9-slice, window x -144..108, y 2..118, inner
+ * rectangle x -120..84, y 26..94 inside the 24-unit orange border ring). Cell pitch 22, centres x = -18 + 22 (c - 4), y = 82 / 60 / 38.
+ * 6s: the icons / hand use the cell centres AS THEY ARE, like vanilla (mTG_haniwa_col_pos {-35,-11,13,37} / line 46 are the gyroid strip's cell centres):
+ * the icon draw's x * 0.975 (mSM_set_dl_item) is the same mapping the window gets on screen. The 6c..6r values were x / 0.975 ({-109,-86,-64,-41,-18,4,
+ * 27,49,72}), which pushed every icon outward by 2.5 % of x: -2.7 units in column 0 .. +1.8 in column 8. */
+static s16 mTG_pc_dresser_col_pos[9] = { -106, -84, -62, -40, -18, 4, 26, 48, 70 };
+static s16 mTG_pc_dresser_line_pos[3] = { 82, 60, 38 }; /* = pc_dresser_layout_row_y(): the enlarged window's inner rectangle y 26..94 */
+static mTG_tag_data_table_c mTG_pc_dresser_table = { 9, 3, mTG_pc_dresser_col_pos, mTG_pc_dresser_line_pos };
+/* Nook bulk sell basket: the SAME window / rows, a 5 x 3 grid in the LEFT five columns (one cell per pocket); the right part of the window is the "Sell" button
+ * with the count / total (m_haniwa_ovl.c mHW_pc_basket_summary): cursor column 5 (PC_SELL_BUTTON_COL, every row) = the button (x 42 = the button panel's centre).
+ * Table index = col + row * 6; pc_sell_ui_table_cell() maps it to the basket cell. */
+static s16 mTG_pc_basket_col_pos[PC_SELL_TABLE_COLS] = { -106, -84, -62, -40, -18, 42 };
+static mTG_tag_data_table_c mTG_pc_basket_table = { PC_SELL_TABLE_COLS, 3, mTG_pc_basket_col_pos, mTG_pc_dresser_line_pos };
+
+static mTG_tag_data_table_c* mTG_pc_table(int table) {
+    if (table == mTG_TABLE_HANIWA && pc_dresser_ui_basket()) {
+        return &mTG_pc_basket_table;
+    }
+    if (table == mTG_TABLE_HANIWA && pc_dresser_ui_active()) {
+        return &mTG_pc_dresser_table;
+    }
+    return &mTG_table_data[table];
+}
+#endif
+
 static u8 str_omikuji[7] = "fortune";
 static u8 str_happy_room[7] = "the HRA";
 static u8 postoffice_str[15] = "the post office";
@@ -234,6 +277,19 @@ static mTG_tag_word_c mTG_tag_word_itadaku = {
     "Take it         ",
     &mTG_get_proc,
 };
+
+#ifdef TARGET_PC
+static void mTG_pc_dresser_grab_proc(Submenu* submenu, mSM_MenuInfo_c* menu_info);
+static mTG_tag_word_c mTG_tag_word_pc_grab = { /* 6r (B): dresser mode: grab a stored item / a pocket item and place it on any cell or pocket */
+    "Grab            ",
+    &mTG_pc_dresser_grab_proc,
+};
+static void mTG_pc_ofurn_place_proc(Submenu* submenu, mSM_MenuInfo_c* menu_info);
+static mTG_tag_word_c mTG_tag_word_pc_place = { /* outdoor furniture C1: place the furniture in front of the player (the real model, rotated, solid) */
+    "Place           ",
+    &mTG_pc_ofurn_place_proc,
+};
+#endif
 
 static mTG_tag_word_c mTG_tag_word_dump_item = {
     "Yes             ",
@@ -618,6 +674,16 @@ static mTG_tag_word_c* mTG_field_default_bury[] = {
     &mTG_tag_word_yameru,
 };
 
+#ifdef TARGET_PC
+/* outdoor furniture C1: a furniture item in the town field of a multiplayer session where this player may Place (mTG_TYPE_76, an unused vanilla slot) */
+static mTG_tag_word_c* mTG_pc_field_ftr[] = {
+    &mTG_tag_word_tukamu,
+    &mTG_tag_word_pc_place,
+    &mTG_tag_word_zimennioku,
+    &mTG_tag_word_yameru,
+};
+#endif
+
 static mTG_tag_word_c* mTG_field_letter[] = {
     &mTG_tag_word_tukamu,
     &mTG_tag_word_tegamiwokaku,
@@ -873,6 +939,36 @@ static mTG_tag_word_c* mTG_haniwa_get_item[] = {
     &mTG_tag_word_itadaku,
     &mTG_tag_word_yameru,
 };
+
+#ifdef TARGET_PC
+static mTG_tag_word_c* mTG_pc_dresser_get_item[] = { /* 6r (B): the dresser screen's cell tag: Take it / Grab / Quit */
+    &mTG_tag_word_itadaku,
+    &mTG_tag_word_pc_grab,
+    &mTG_tag_word_yameru,
+};
+static mTG_tag_word_c* mTG_pc_dresser_putin_item[] = { /* 6r (B): a pocket item in the dresser screen: Put Away / Grab / Quit */
+    &mTG_tag_word_korewoireru,
+    &mTG_tag_word_pc_grab,
+    &mTG_tag_word_yameru,
+};
+/* Nook bulk sell basket: the same procs (mTG_putin_proc / mTG_get_proc -> pc_dresser_ui_put / _take -> the local staging of pc_sell_ui.c), basket words, no Grab */
+static mTG_tag_word_c mTG_tag_word_pc_basket_in = {
+    "Add to Basket   ",
+    &mTG_putin_proc,
+};
+static mTG_tag_word_c mTG_tag_word_pc_basket_out = {
+    "Take Back       ",
+    &mTG_get_proc,
+};
+static mTG_tag_word_c* mTG_pc_basket_putin_item[] = { /* a sellable pocket item in the basket screen */
+    &mTG_tag_word_pc_basket_in,
+    &mTG_tag_word_yameru,
+};
+static mTG_tag_word_c* mTG_pc_basket_get_item[] = { /* a basket cell */
+    &mTG_tag_word_pc_basket_out,
+    &mTG_tag_word_yameru,
+};
+#endif
 
 static mTG_tag_word_c* mTG_haniwa_price[] = {
     &mTG_tag_word_okane,
@@ -1138,7 +1234,11 @@ static mTG_tag_data_c mTG_label_table[] = {
     { mTG_field_balloon, ARRAY_COUNT(mTG_field_balloon) },                   /* mTG_TYPE_FIELD_BALLOON */
     { mTG_tag_nw_select_change, ARRAY_COUNT(mTG_tag_nw_select_change) },     /* mTG_TYPE_TAG_NW_SELECT_CHANGE */
     { mTG_tag_nw_select_put, ARRAY_COUNT(mTG_tag_nw_select_put) },           /* mTG_TYPE_TAG_NW_SELECT_PUT */
+#ifdef TARGET_PC
+    { mTG_pc_field_ftr, ARRAY_COUNT(mTG_pc_field_ftr) },                     /* mTG_TYPE_76 (unused in vanilla): PC outdoor furniture Grab / Place / Drop / Quit */
+#else
     { NULL, 0 },                                                             /* mTG_TYPE_76 */
+#endif
     { mTG_tag_password_item, ARRAY_COUNT(mTG_tag_password_item) },           /* mTG_TYPE_TAG_PASSWORD_ITEM */
 };
 
@@ -1176,7 +1276,11 @@ static f32 mTG_set_hand_pos_offset(Submenu* submenu, int table) {
 }
 
 static void mTG_set_hand_pos(Submenu* submenu, f32* pos, int table, int idx) {
+#ifdef TARGET_PC
+    mTG_tag_data_table_c* data_p = mTG_pc_table(table);
+#else
     mTG_tag_data_table_c* data_p = &mTG_table_data[table];
+#endif
     f32 ofs = mTG_set_hand_pos_offset(submenu, table);
     int col = idx % data_p->col_num;
     int row;
@@ -1446,7 +1550,11 @@ static void mTG_set_tag_win_scale_p(mTG_tag_c* tag, int win_type, f32 x, f32 y) 
 }
 
 static int mTG_get_table_idx(mTG_tag_c* tag) {
+#ifdef TARGET_PC
+    int idx = tag->tag_col + tag->tag_row * mTG_pc_table(tag->table)->col_num;
+#else
     int idx = tag->tag_col + tag->tag_row * mTG_table_data[tag->table].col_num;
+#endif
 
     if (idx >= 0) {
         return idx;
@@ -1603,7 +1711,12 @@ static Mail_c* mTG_get_mail_pointer(Submenu* submenu, mHD_Ovl_c* hand_ovl) {
         case mTG_TABLE_CPMAIL:
             return &cpmail_ovl->card_mail->mail[page][idx];
         case mTG_TABLE_MBOX:
-            return &Common_Get(now_home)->mailbox[idx];
+#ifdef TARGET_PC
+            if (mTG_MAILBOX() == NULL) {
+                return NULL; /* guest mailbox: no mailbox at all (NULL now_home and not a guest client): never pointer math on NULL; unreachable through the UI (the overlay only opens on a mailbox) */
+            }
+#endif
+            return &mTG_MAILBOX()[idx];
         default:
             return &Now_Private->mail[idx];
     }
@@ -1886,6 +1999,9 @@ static void mTG_init_tag_data_item_win_sub_mail_item(Submenu* submenu, mTG_tag_c
         &mTG_init_tag_data_item_win_sub_mail_item_postoffice, &mTG_init_tag_data_item_win_sub_mail_item_sp_npc,
     };
     static u8 present_str[7] = "Present";
+#ifdef TARGET_PC
+    static u8 delivery_item_str[13] = "Delivery Item";
+#endif
 
     f32 scale = 0.875f;
     int win_type = mTG_WIN_TYPE_ITEM;
@@ -1944,6 +2060,12 @@ static void mTG_init_tag_data_item_win_sub_mail_item(Submenu* submenu, mTG_tag_c
     if (tag->str2_type == mTG_QSTR_TYPE_NONE) {
         if (itemCond == mPr_ITEM_COND_PRESENT) {
             mem_copy(tag->str0, present_str, sizeof(present_str));
+#ifdef TARGET_PC
+        } else if (itemCond == mPr_ITEM_COND_QUEST && tag->table == mTG_TABLE_ITEM && !(ITEM_NAME_GET_TYPE(itemNo) == NAME_TYPE_ITEM1 && ITEM_NAME_GET_CAT(itemNo) == ITEM1_CAT_MONEY)) {
+            /* a QUEST item with no recipient / sender entry (the Work Mode parcel / fetched item, a first-job item): the vanilla "Delivery for X from Y" text above is untouched; Nook's
+             * debt money keeps its own name */
+            mem_copy(tag->str0, delivery_item_str, sizeof(delivery_item_str));
+#endif
         } else if (itemNo >= ITM_MY_ORG_UMBRELLA0 && itemNo <= ITM_MY_ORG_UMBRELLA7) {
             mem_copy(tag->str0, Now_Private->my_org[(itemNo - ITM_MY_ORG_UMBRELLA0) & 7].name,
                      mNW_ORIGINAL_DESIGN_NAME_LEN);
@@ -2030,11 +2152,22 @@ static void mTG_init_tag_data_set_itemNo(mActor_name_t* itemNo, Mail_c** mail_pp
         case mTG_TABLE_ITEM:
             *itemNo = Now_Private->inventory.pockets[idx];
             *itemCond = mPr_GET_ITEM_COND(Now_Private->inventory.item_conditions, idx);
+#ifdef TARGET_PC
+            if (pc_dresser_ui_basket() && pc_sell_ui_pocket_hidden(idx)) {
+                *itemNo = EMPTY_NO; /* Nook bulk sell basket: the pocket is shown in its basket cell (no name tag on the now empty-looking pocket) */
+            }
+#endif
             break;
         case mTG_TABLE_PLAYER:
             *itemNo = Now_Private->equipment;
             break;
         case mTG_TABLE_HANIWA:
+#ifdef TARGET_PC
+            if (pc_dresser_ui_active()) {
+                *itemNo = (mActor_name_t)pc_dresser_ui_slot_item(idx); /* dresser mode: the dresser page's item name */
+                break;
+            }
+#endif
             *itemNo = Save_Get(homes[submenu->overlay->menu_info[mSM_OVL_HANIWA].data1]).haniwa.items[idx].item;
             break;
         case mTG_TABLE_COLLECT: {
@@ -2496,7 +2629,11 @@ static void mTG_init_tag_data(Submenu* submenu, int table, int type, f32 base_x,
 
 static void mTG_chg_tag_func(Submenu* submenu, int table, int type, int idx, f32 base_x, f32 base_y) {
     mTG_Ovl_c* tag_ovl = submenu->overlay->tag_ovl;
+#ifdef TARGET_PC
+    mTG_tag_data_table_c* data_table = mTG_pc_table(table);
+#else
     mTG_tag_data_table_c* data_table = &mTG_table_data[table];
+#endif
     int idx_x;
     int idx_y;
 
@@ -2892,6 +3029,26 @@ static int mTG_common_throw_put_field(GAME_PLAY* play, mActor_name_t item, xyz_t
     return res;
 }
 
+#ifdef TARGET_PC
+/* Host-local guard for the vanilla (host / single-player) field drop: FALSE iff the resolved target tile is
+ * currently RESERVED by a network client's pending pickup/drop on this host (pc_net_game_field_tile_reserved()
+ * is 0 for single-player, clients, indoors and out-of-range tiles, so this is always TRUE for them). Callers
+ * fold it into vanilla's own "can we place here" condition, so a reserved tile takes the same failure path
+ * (the mWR_WARNING_PUT_* warning window) as any other unplaceable tile and nothing is mutated. */
+static int mTG_host_put_tile_free(const xyz_t* pos_p) {
+    int ut_x;
+    int ut_z;
+
+    if (mFI_Wpos2UtNum(&ut_x, &ut_z, *pos_p)) {
+        return !pc_net_game_field_tile_reserved(ut_x, ut_z);
+    }
+
+    return TRUE;
+}
+#else
+#define mTG_host_put_tile_free(pos_p) TRUE
+#endif
+
 static int mTG_common_throw_put_room(GAME_PLAY* play, mActor_name_t item, xyz_t* pos_p, int layer, int delay_timer) {
     int ux;
     int uz;
@@ -2946,6 +3103,12 @@ static void mTG_set_catch_se(Submenu* submenu) {
 static void mTG_catch_item_from_table(Submenu* submenu, Mail_c* mail, mActor_name_t* item, int item_cond, int table,
                                       int table_idx) {
     mHD_Ovl_c* hand_ovl = submenu->overlay->hand_ovl;
+
+#ifdef TARGET_PC
+    if (pc_dresser_ui_active()) {
+        return; /* dresser mode: nothing is ever carried by the hand (every change is a host transaction) */
+    }
+#endif
 
     if (table == mTG_TABLE_PLAYER) {
         hand_ovl->info.wait_timer = 16;
@@ -3263,6 +3426,38 @@ static void mTG_sell_all_proc(Submenu* submenu, mSM_MenuInfo_c* menu_info) {
     }
 }
 
+#ifdef TARGET_PC
+/* 6r (B) "Grab" on a dresser cell or a pocket item: it is carried (the hand draws it); the next A on a cell / pocket places it (mTG_select_tag_decide_haniwa /
+ * mTG_select_tag_decide_item), B cancels (mTG_move_base). Nothing changes before the placement. */
+static void mTG_pc_dresser_grab_proc(Submenu* submenu, mSM_MenuInfo_c* menu_info) {
+    mTG_tag_c* tag = &submenu->overlay->tag_ovl->tags[0];
+
+    (void)menu_info;
+    pc_dresser_ui_note_input();
+    if (pc_dresser_ui_grab(tag->table == mTG_TABLE_ITEM, mTG_get_table_idx(tag))) {
+        sAdo_SysTrgStart(NA_SE_32);
+    } else {
+        sAdo_SysTrgStart(MONO(NA_SE_3));
+    }
+    mTG_return_tag_init(submenu, mTG_TYPE_NONE, mTG_RETURN_CLOSE);
+}
+
+/* Dresser mode of the gyroid overlay: the answer of a take / put, with the gyroid's own status lines ("Got it!" / "You don't have room."); a transaction in flight
+ * shows nothing until it resolves (m_haniwa_ovl polls it). The tag window closes like the gyroid's own take. */
+static void mTG_dresser_result(Submenu* submenu, mTG_tag_c* tag, int act) {
+    pc_dresser_ui_note_input();
+    if (act == PC_DRESSER_UI_ACT_DONE) {
+        submenu->overlay->haniwa_ovl->set_interrupt_message_proc(submenu, tag, mHW_MSG_KASIKO);
+    } else if (act == PC_DRESSER_UI_ACT_NO_ROOM || act == PC_DRESSER_UI_ACT_FULL) {
+        submenu->overlay->haniwa_ovl->set_interrupt_message_proc(submenu, tag, mHW_MSG_MOU);
+        sAdo_SysTrgStart(MONO(NA_SE_3));
+    } else if (act == PC_DRESSER_UI_ACT_REFUSED) {
+        sAdo_SysTrgStart(MONO(NA_SE_3));
+    }
+    mTG_return_tag_init(submenu, mTG_TYPE_NONE, mTG_RETURN_CLOSE);
+}
+#endif
+
 static void mTG_get_proc(Submenu* submenu, mSM_MenuInfo_c* menu_info) {
     static mActor_name_t mTG_money_name[] = { ITM_MONEY_100, ITM_MONEY_1000, ITM_MONEY_10000, ITM_MONEY_30000 };
     static u32 mTG_money_amount[] = { 100, 1000, 10000, 30000 };
@@ -3283,6 +3478,12 @@ static void mTG_get_proc(Submenu* submenu, mSM_MenuInfo_c* menu_info) {
     u32* money_amount_p;
     int change_money;
 
+#ifdef TARGET_PC
+    if (pc_dresser_ui_active()) {
+        mTG_dresser_result(submenu, tag, pc_dresser_ui_take(mTG_get_table_idx(tag))); /* the grid index 0..26 */
+        return;
+    }
+#endif
     if (idx == -1) {
         haniwa_ovl = submenu->overlay->haniwa_ovl;
 
@@ -3363,6 +3564,29 @@ static void mTG_get_proc(Submenu* submenu, mSM_MenuInfo_c* menu_info) {
     }
 }
 
+#ifdef TARGET_PC
+/* Mail milestone 2: 1 iff this is a network CLIENT and `mail` is one of the slots of its house mailbox (the host's mailbox, shadowed locally). Throwing a
+ * mailbox letter away is refused for a client (the host's letter must not vanish without the host knowing; a discard transaction is a later milestone). */
+static int mTG_client_mail_is_mailbox(const Mail_c* mail) {
+    /* G5.0: a guest (foreigner) has no home (now_home == NULL). Guest mailbox: its post office mailbox copy IS a mailbox (pc_ui_mailbox(); NULL when there is none). */
+    return pc_net_game_role() == PC_NETGAME_ROLE_CLIENT && mail != NULL && mTG_MAILBOX() != NULL &&
+           mail >= mTG_MAILBOX() && mail < mTG_MAILBOX() + HOME_MAILBOX_SIZE;
+}
+
+/* Mail milestone 2: one transfer tick of a client's mailbox letter through the host (MAIL_TAKE). 1 = applied (the letter is in Now_Private->mail[*dst_idx],
+ * the local mailbox slot is clear), 0 = pending (wait, change nothing), -1 = refused (nothing moved; stop transferring). */
+static int mTG_client_mailbox_take(int src_idx, int* dst_idx) {
+    switch (pc_net_game_mail_take_step(src_idx, dst_idx)) {
+        case PC_NETGAME_TS_OP_APPLIED:
+            return 1;
+        case PC_NETGAME_TS_OP_PENDING:
+            return 0;
+        default:
+            return -1;
+    }
+}
+#endif
+
 static void mTG_dump_mail_mark_exe_proc(Submenu* submenu, mSM_MenuInfo_c* menu_info) {
     mIV_Ovl_c* inv_ovl = submenu->overlay->inventory_ovl;
     mMB_Ovl_c* mailbox_ovl = submenu->overlay->mailbox_ovl;
@@ -3374,8 +3598,13 @@ static void mTG_dump_mail_mark_exe_proc(Submenu* submenu, mSM_MenuInfo_c* menu_i
         int i;
 
         mailbox_ovl->mark_flag = FALSE;
-        for (i = 0; i < HOME_MAILBOX_SIZE; i++) {
-            Mail_c* mail = &Common_Get(now_home)->mailbox[i];
+#ifdef TARGET_PC
+        if (pc_net_game_role() == PC_NETGAME_ROLE_CLIENT) {
+            mailbox_ovl->mark_bitfield = 0; /* mail milestone 2: throwing letters away from the (host's) mailbox is refused for a client: the marks are dropped */
+        }
+#endif
+        for (i = 0; i < HOME_MAILBOX_SIZE && mTG_MAILBOX() != NULL; i++) {
+            Mail_c* mail = &mTG_MAILBOX()[i];
 
             // clear selected mail if it has a present or is from the player (sending)
             if (mail->present != EMPTY_NO ||
@@ -3451,6 +3680,11 @@ static void mTG_mailbox_change_mail_proc(Submenu* submenu, mSM_MenuInfo_c* menu_
     int idx = mMl_chk_mail_free_space(Now_Private->mail, mPr_INVENTORY_MAIL_COUNT);
 
     inv_ovl->mail_mark_bitfield2 = 0;
+#ifdef TARGET_PC
+    if (pc_net_game_role() == PC_NETGAME_ROLE_CLIENT && !mTG_MAILBOX_USABLE()) {
+        idx = -1; /* mail milestone M0 / 2: a client takes a mailbox letter (house or guest copy) only once the HOST fed its mailbox (then through MAIL_TAKE); otherwise the vanilla "pockets full" refusal below */
+    }
+#endif
     if (idx != -1) {
         mailbox_ovl->mark_flag = 2;
         sAdo_SysTrgStart(NA_SE_MENU_EXIT);
@@ -3511,6 +3745,16 @@ static void mTG_cpmail_change_mail_proc(Submenu* submenu, mSM_MenuInfo_c* menu_i
         cpmail_cnt = (cpmail_mark_cnt - inv_mark_cnt) - inv_free_cnt;
     }
 
+#ifdef TARGET_PC
+    if (pc_net_game_role() == PC_NETGAME_ROLE_CLIENT && cpmail_mark_cnt > 0) {
+        /* Mail milestone M0 (D-2): an exchange that moves an ARCHIVE letter into a pocket slot is refused on a network client (the archive is the local
+         * machine's ARAM block, restored from the unchanged GCI next session while D3 would have uploaded the pocket copy: unbounded gift laundering).
+         * It takes the vanilla "cannot exchange" branch: the marks are cleared and nothing moves. Pocket -> archive only (no archive letter marked)
+         * stays allowed. */
+        inv_cnt = inv_mark_cnt;
+        cpmail_cnt = cpmail_mark_cnt;
+    }
+#endif
     if (inv_cnt == inv_mark_cnt && cpmail_cnt == cpmail_mark_cnt) {
         cpmail_ovl->mark_bitfield = 0;
         inv_ovl->mail_mark_bitfield2 = 0;
@@ -3569,9 +3813,22 @@ static void mTG_send_proc(Submenu* submenu, mSM_MenuInfo_c* menu_info) {
     Mail_c* mail = &Now_Private->mail[idx];
     Submenu_Item_c* item_p = submenu->item_p;
 
-    mail->content.font = mMl_FONT_RECV;
-    mMl_copy_mail(&submenu->mail, mail);
-    mMl_clear_mail(mail);
+#ifdef TARGET_PC
+    if (pc_net_game_role() == PC_NETGAME_ROLE_CLIENT && (mail->header.recipient.type == mMl_NAME_TYPE_PLAYER ||
+                                                        (mail->header.recipient.type == mMl_NAME_TYPE_MUSEUM && mail->present != EMPTY_NO && mail->present != RSV_NO))) {
+        /* worker B: a letter WITH A GIFT to the museum is a host transaction too (MUSEUM_MAIL kind 19): it stays in its slot the same way */
+        /* Mail milestone 1: a client's letter to a PLAYER is sent through a host transaction (post girl seam), and it must stay in its mail[] slot
+         * (byte-identical, send font) until the host's APPLIED removes it: a pocket that empties here would upload an empty slot while the host
+         * still has to read the letter from its mirror. The post girl dialogue works on the copy in submenu->mail (receive font, as vanilla). */
+        mMl_copy_mail(&submenu->mail, mail);
+        submenu->mail.content.font = mMl_FONT_RECV;
+    } else
+#endif
+    {
+        mail->content.font = mMl_FONT_RECV;
+        mMl_copy_mail(&submenu->mail, mail);
+        mMl_clear_mail(mail);
+    }
     item_p->slot_no = idx;
     item_p->item = ITM_QST_LETTER;
     submenu->selected_item_num = 1;
@@ -3601,6 +3858,14 @@ static void mTG_nw_carpet_proc(Submenu* submenu, mSM_MenuInfo_c* menu_info) {
     int change_org_flag = FALSE;
     int img_no;
 
+#ifdef TARGET_PC
+    /* Client inside its OWN house with the house link down / not reconciled: refused (the pocket item stays). */
+    if (pc_net_game_client_room_edit_locked()) {
+        pc_net_game_room_edit_denied();
+        mTG_open_warning_window(submenu, menu_info, mWR_WARNING_PUT_ITEM);
+        return;
+    }
+#endif
     if (tag_ovl->tags[3].tag_row == 1) {
         change_org_flag = TRUE;
     }
@@ -3646,6 +3911,14 @@ static void mTG_carpet_proc(Submenu* submenu, mSM_MenuInfo_c* menu_info) {
     mTG_tag_c* tag = &submenu->overlay->tag_ovl->tags[0];
     int idx = mTG_get_table_idx(tag);
 
+#ifdef TARGET_PC
+    /* Client inside its OWN house with the house link down / not reconciled: refused (the pocket item stays). */
+    if (pc_net_game_client_room_edit_locked()) {
+        pc_net_game_room_edit_denied();
+        mTG_open_warning_window(submenu, menu_info, mWR_WARNING_PUT_ITEM);
+        return;
+    }
+#endif
     if (CLIP(my_indoor_clip) != NULL) {
         mActor_name_t* item_p = &Now_Private->inventory.pockets[idx];
 
@@ -3673,6 +3946,14 @@ static void mTG_nw_cover_proc(Submenu* submenu, mSM_MenuInfo_c* menu_info) {
     int change_org_flag = FALSE;
     int img_no;
 
+#ifdef TARGET_PC
+    /* Client inside its OWN house with the house link down / not reconciled: refused (the pocket item stays). */
+    if (pc_net_game_client_room_edit_locked()) {
+        pc_net_game_room_edit_denied();
+        mTG_open_warning_window(submenu, menu_info, mWR_WARNING_PUT_ITEM);
+        return;
+    }
+#endif
     if (tag_ovl->tags[3].tag_row == 1) {
         change_org_flag = TRUE;
     }
@@ -3718,6 +3999,14 @@ static void mTG_cover_proc(Submenu* submenu, mSM_MenuInfo_c* menu_info) {
     mTG_tag_c* tag = &submenu->overlay->tag_ovl->tags[0];
     int idx = mTG_get_table_idx(tag);
 
+#ifdef TARGET_PC
+    /* Client inside its OWN house with the house link down / not reconciled: refused (the pocket item stays). */
+    if (pc_net_game_client_room_edit_locked()) {
+        pc_net_game_room_edit_denied();
+        mTG_open_warning_window(submenu, menu_info, mWR_WARNING_PUT_ITEM);
+        return;
+    }
+#endif
     if (CLIP(my_indoor_clip) != NULL) {
         mActor_name_t* item_p = &Now_Private->inventory.pockets[idx];
 
@@ -3741,6 +4030,21 @@ static void mTG_putin_proc(Submenu* submenu, mSM_MenuInfo_c* menu_info) {
     int idx = mTG_get_table_idx(tag);
     Submenu_Item_c* item_p = submenu->item_p;
 
+#ifdef TARGET_PC
+    if (pc_dresser_ui_active()) {
+        mTG_dresser_result(submenu, tag, pc_dresser_ui_put(idx)); /* no local pocket write: vanilla slot path or a host transaction */
+        return;
+    }
+#endif
+
+#ifdef TARGET_PC
+    /* Client inside its OWN house with the house link down / not reconciled: refused (the pocket item stays). */
+    if (pc_net_game_client_room_edit_locked()) {
+        pc_net_game_room_edit_denied();
+        mTG_open_warning_window(submenu, menu_info, mWR_WARNING_PUT_ITEM);
+        return;
+    }
+#endif
     item_p->item = Now_Private->inventory.pockets[idx];
     item_p->slot_no = idx;
     submenu->selected_item_num = 1;
@@ -3882,14 +4186,98 @@ static void mTG_plant_proc(Submenu* submenu, mSM_MenuInfo_c* menu_info) {
         inv_ovl->shovel_flag == TRUE) {
         mTG_island_check_plant_plant(plant_item);
         mTG_island_check_fruit_plant(plant_item);
+#ifdef TARGET_PC
+        /* World Ecology T3 (bugfix): same treatment as mTG_bury_proc()'s own shovel-into-hole seam
+         * below (this IS the same bury mechanic -- the shovel branch of the plant menu action, just
+         * reached via a different tag) -- see that seam's own doc for the shared reasoning, including
+         * why pocket-clear timing is deliberately deferred to pcnetgame_handle_client_bury_result()
+         * rather than cleared here at menu-action time. */
+        if (pc_net_game_role() == PC_NETGAME_ROLE_CLIENT) {
+            int ut_x, ut_z, hole_no;
+            int ok = FALSE;
+            if (mFI_Wpos2UtNum(&ut_x, &ut_z, inv_ovl->shovel_pos)) {
+                hole_no = mCoBG_GetHoleNumber(inv_ovl->shovel_pos);
+                ok = pc_net_game_request_bury(idx, (int)plant_item, ut_x, ut_z, (hole_no >= 0) ? hole_no : 0xFF);
+            }
+            if (ok) {
+                /* Request sent (or coalesced with one already in flight) -- do NOT clear the pocket
+                 * here; pcnetgame_handle_client_bury_result() clears it once the provisional accept is
+                 * confirmed and the slot is re-verified to still hold this item. item == EMPTY_NO below
+                 * only suppresses Setup_main_Putin_scoop's own local field-mutation branch for the
+                 * animation -- it never touches Now_Private. */
+                mPlib_request_main_putin_scoop_from_submenu(&inv_ovl->shovel_pos, EMPTY_NO, FALSE);
+                mTG_return_tag_init(submenu, mTG_TYPE_NONE, mTG_RETURN_CLOSE);
+                mTG_close_window(submenu, menu_info, TRUE);
+            } else {
+                /* Nothing was sent (malformed input / not in town / no save loaded / stale claimed
+                 * item) -- the pocket was never touched, so there is nothing to undo; just show the
+                 * normal "can't do that" feedback instead of closing the menu on a no-op. */
+                mTG_open_warning_window(submenu, menu_info, mWR_WARNING_PUT_PLANT);
+            }
+            return;
+        } else if (pc_net_game_role() == PC_NETGAME_ROLE_HOST) {
+            int ut_x = 0, ut_z = 0, hole_no;
+            int handled = FALSE;
+            int ut_resolved = mFI_Wpos2UtNum(&ut_x, &ut_z, inv_ovl->shovel_pos);
+            if (ut_resolved) {
+                hole_no = mCoBG_GetHoleNumber(inv_ovl->shovel_pos);
+                handled = pc_net_game_host_local_bury(idx, ut_x, ut_z, (int)plant_item, (hole_no >= 0) ? hole_no : 0xFF);
+            }
+            if (handled) {
+                mPlib_request_main_putin_scoop_from_submenu(&inv_ovl->shovel_pos, EMPTY_NO, FALSE);
+            } else if (mTG_host_put_tile_free(&inv_ovl->shovel_pos) &&
+                       (!ut_resolved || pc_net_game_host_bury_tile_is_valid(ut_x, ut_z))) {
+                /* Not a legal bury per the host's own authoritative validation, and NOT currently
+                 * reserved by a peer's in-flight drop/pickup/bury either -- fall back to vanilla's own
+                 * local mutation + pocket clear exactly as single-player would.
+                 * Bug 3 fix: also re-confirm the tile is STILL a valid hole target right here,
+                 * immediately before this vanilla mutation -- pc_net_game_host_local_bury() returning 0
+                 * is ambiguous (could be "not a hole" OR any other unrelated validation failure), and a
+                 * racing peer's BURY may have committed into this exact hole between menu-open and this
+                 * commit attempt. Without this re-check, vanilla's own placement could then fail (tile no
+                 * longer a valid hole) while the pocket is cleared unconditionally below -- a real item
+                 * loss. ut_x/ut_z here are the same coordinates mFI_Wpos2UtNum() just resolved above for
+                 * this same shovel_pos, so this call needs no extra resolution. */
+                mPlib_request_main_putin_scoop_from_submenu(&inv_ovl->shovel_pos, Now_Private->inventory.pockets[idx],
+                                                            FALSE);
+                mPr_SetPossessionItem(Now_Private, idx, EMPTY_NO, mPr_ITEM_COND_NORMAL);
+            } else {
+                /* The tile is currently reserved by a peer's in-flight action -- refuse the host's own
+                 * local bury outright rather than risk landing on top of / overwriting whatever that
+                 * peer's commit is about to write (mirrors mTG_host_put_tile_free()'s own reservation
+                 * gate for the ordinary field-drop path). Nothing is mutated; the item stays put. */
+                mTG_open_warning_window(submenu, menu_info, mWR_WARNING_PUT_PLANT);
+                return;
+            }
+            mTG_return_tag_init(submenu, mTG_TYPE_NONE, mTG_RETURN_CLOSE);
+            mTG_close_window(submenu, menu_info, TRUE);
+            return;
+        }
+#endif
         mPlib_request_main_putin_scoop_from_submenu(&inv_ovl->shovel_pos, Now_Private->inventory.pockets[idx], FALSE);
         mPr_SetPossessionItem(Now_Private, idx, EMPTY_NO, mPr_ITEM_COND_NORMAL);
         mTG_return_tag_init(submenu, mTG_TYPE_NONE, mTG_RETURN_CLOSE);
         mTG_close_window(submenu, menu_info, TRUE);
         return;
     } else {
+#ifdef TARGET_PC
+        /* M9-D G2-1: the no-shovel Plant branch below writes the sapling/flower straight into this
+         * process's own field (mTG_common_throw_put_field -> player_drop_entry_proc) and clears the
+         * pocket slot, and mTG_host_put_tile_free() is always TRUE on a client. Nothing is sent to the
+         * host, so the plant would exist only locally (erased by the next resync / FIELD_BLOCK /
+         * rejoin) and the item would be lost. A network client therefore gets the same "cannot plant
+         * here" warning as any other unplaceable tile, without consuming the pocket item; it can still
+         * plant with a shovel into a hole (the authoritative BURY path above). Host / single-player
+         * are unaffected (the check is false for them). Same client check as the Drop-All block in
+         * mTG_field_put_proc(). */
+        if (pc_net_game_role() == PC_NETGAME_ROLE_CLIENT) {
+            mTG_open_warning_window(submenu, menu_info, mWR_WARNING_PUT_PLANT);
+            return;
+        }
+#endif
         if (mTG_search_put_pos(player, &pos, TRUE, plant_item == ITM_SIGNBOARD, plant_item == ITM_SIGNBOARD, FALSE,
-                               FALSE)) {
+                               FALSE) &&
+            mTG_host_put_tile_free(&pos)) {
             mActor_name_t item = Now_Private->inventory.pockets[idx];
             mActor_name_t throw_item;
 
@@ -3904,7 +4292,7 @@ static void mTG_plant_proc(Submenu* submenu, mSM_MenuInfo_c* menu_info) {
 
             if (mTG_common_throw_put_field(play, throw_item, &pos, mCoBG_LAYER0)) {
                 mPr_SetPossessionItem(Now_Private, idx, EMPTY_NO, mPr_ITEM_COND_NORMAL);
-                pos.y = mCoBG_GetBgY_OnlyCenter_FromWpos2(pos, 0.0f);
+                pos.y =mCoBG_GetBgY_OnlyCenter_FromWpos2(pos, 0.0f);
                 sAdo_OngenTrgStart(NA_SE_2A, &pos);
                 mTG_return_tag_init(submenu, mTG_TYPE_NONE, mTG_RETURN_CLOSE);
                 mTG_close_window(submenu, menu_info, FALSE);
@@ -3942,6 +4330,17 @@ static void mTG_field_put_proc(Submenu* submenu, mSM_MenuInfo_c* menu_info) {
         int put_cnt = 0;
         int bad_famicom_cnt = 0;
 
+#ifdef TARGET_PC
+        /* Stage 5B-1: "Drop All" (multiple marked items at once) is not yet a supported network
+         * operation -- only a single-item drop is (see mTG_field_put_proc's other branch, below).
+         * Skip the loop entirely for a network client so put_cnt/bad_famicom_cnt both stay 0,
+         * which already falls through to the existing
+         * mWR_WARNING_PUT_ITEM warning below -- no new UI path needed. Never let a network client
+         * reach mTG_common_throw_put_field()/mPr_SetPossessionItem() here: both would mutate this
+         * client's own local field/inventory with no host round-trip, a real desync. Single-player
+         * and host are completely unaffected -- this loop runs exactly as before for them. */
+        if (pc_net_game_role() != PC_NETGAME_ROLE_CLIENT)
+#endif
         for (i = 0; i < mPr_POCKETS_SLOT_COUNT; i++) {
             if ((inv_ovl->item_mark_bitfield & (1 << i)) != 0) {
                 mActor_name_t item = Now_Private->inventory.pockets[i];
@@ -3949,7 +4348,7 @@ static void mTG_field_put_proc(Submenu* submenu, mSM_MenuInfo_c* menu_info) {
                 if (mTG_check_island_famicom(item)) {
                     if (mTG_search_put_pos(player, &pos, item == ITM_SIGNBOARD, FALSE, item == ITM_SIGNBOARD,
                                            item == ITM_SIGNBOARD, item == ITM_SIGNBOARD) &&
-                        mTG_common_throw_put_field(play, item, &pos, put_cnt)) {
+                        mTG_host_put_tile_free(&pos) && mTG_common_throw_put_field(play, item, &pos, put_cnt)) {
                         mPr_SetPossessionItem(Now_Private, i, EMPTY_NO, mPr_ITEM_COND_NORMAL);
                         put_cnt++;
                     }
@@ -3980,10 +4379,83 @@ static void mTG_field_put_proc(Submenu* submenu, mSM_MenuInfo_c* menu_info) {
                     mSP_SearchItemCategoryPriority(put_item, mSP_KIND_FURNITURE, mSP_LISTTYPE_SPECIALPRESENT, NULL)) &&
                    mFI_CheckInIsland()) {
             mTG_open_warning_window(submenu, menu_info, mWR_WARNING_PUT_FAMI);
-        } else {
+        }
+#ifdef TARGET_PC
+        else if (ITEM_IS_FTR(put_item) && Common_Get(field_type) == mFI_FIELDTYPE2_FG && menu_info->data0 != 13 && !pc_net_game_ofurn_leaf_drop_ok()) {
+            /* outdoor furniture C1: this host has outdoor_furniture_leaf_drop = 0 (a client: the host's announcement): furniture is not dropped as a leaf outside */
+            pc_net_game_ofurn_notice_text("Dropping furniture outside is off on this server");
+            mTG_open_warning_window(submenu, menu_info, mWR_WARNING_PUT_ITEM);
+        }
+        else if (pc_net_game_role() == PC_NETGAME_ROLE_CLIENT) {
+            /* Stage 5B-1: a network client never runs the vanilla mutation below directly -- the
+             * host is the authority on the shared field. This still lets vanilla's own,
+             * byte-for-byte-unchanged mTG_search_put_pos() resolve the target tile (reusing its
+             * self-tile/terrain/occupancy logic exactly, per the Stage 5B audit's "Client Path"),
+             * then narrows to Stage 5B-1's supported case afterward:
+             *   - menu_info->data0 == 13 is the pickup-exchange "swap" case (drop the old item AND
+             *     fill this slot with a new one, m_player_main_pickup_exchange.c_inc) -- a
+             *     different inventory effect than a plain clear-to-EMPTY_NO, and not reachable in
+             *     practice for a network client anyway (Stage 5A already forces exchange_flag off
+             *     for clients) -- excluded defensively.
+             *   - put_item must pass pc_net_game_is_droppable_item() (mirrors the host's own
+             *     authoritative classification exactly -- see pc_net_game.c).
+             * Stage 5B-2: whatever single tile mTG_search_put_pos() resolves -- the player's own
+             * current tile, or (only when that one is occupied/illegal) the first of its 8-neighbor
+             * zigzag candidates to pass (mTG_search_put_pos2(), above) -- is sent as-is. num_pos is 1
+             * (mTG_search_put_pos()'s own fixed argument), so vanilla has ALREADY collapsed the
+             * choice to exactly one concrete tile here; there is nothing left to enumerate or choose
+             * client-side. The host does not trust this choice: it independently re-runs the same
+             * search from this player's own last-synced position/facing against its own
+             * authoritative field and requires the claim to equal ITS answer (see
+             * pcnetgame_validate_and_resolve_drop(), pc_net_game.c). The arguments below are
+             * deliberately the exact non-signboard arguments vanilla's own drop call uses (see the
+             * `else` branch below with put_item != ITM_SIGNBOARD) -- the host's reproduction is
+             * specialized to exactly this argument set, so they must never drift apart. */
+            int ok = FALSE;
+
+            if ((menu_info->data0 != 13) && pc_net_game_is_droppable_item((int)put_item) &&
+                mTG_search_put_pos(player, &pos, FALSE, FALSE, FALSE, FALSE, FALSE)) {
+                int found_ux, found_uz;
+
+                if (mFI_Wpos2UtNum(&found_ux, &found_uz, pos)) {
+                    ok = pc_net_game_request_drop(idx, (int)put_item, found_ux, found_uz);
+                }
+            }
+
+            if (ok) {
+                /* Request sent (or an equivalent request was already in flight) -- do NOT clear the
+                 * pocket, do NOT call mTG_common_throw_put_field(): the host is authoritative now.
+                 * mPr_SetPossessionItem() only happens later, if/when an accepted DROP_RESULT
+                 * arrives (pcnetgame_handle_client_drop_result(), pc_net_game.c) -- see the Stage 5B
+                 * audit's "Inventory Mutation Ordering". The menu still closes immediately here,
+                 * exactly like vanilla's own success path below -- this stage does not add a
+                 * "waiting on the host" UI state; see the Stage 5B-1 implementation report for why. */
+                mTG_return_tag_init(submenu, mTG_TYPE_NONE, mTG_RETURN_CLOSE);
+                mTG_close_window(submenu, menu_info, FALSE);
+            } else {
+                mTG_open_warning_window(submenu, menu_info, mWR_WARNING_PUT_ITEM);
+            }
+        }
+#endif
+        else {
             if (mTG_search_put_pos(player, &pos, put_item == ITM_SIGNBOARD, FALSE, put_item == ITM_SIGNBOARD,
                                    put_item == ITM_SIGNBOARD, put_item == ITM_SIGNBOARD) &&
-                mTG_common_throw_put_field(play, put_item, &pos, mCoBG_LAYER0)) {
+                mTG_host_put_tile_free(&pos) && mTG_common_throw_put_field(play, put_item, &pos, mCoBG_LAYER0)) {
+#ifdef TARGET_PC
+                /* Stage 5B-3: this ordinary item drop just queued a delayed drop animation (see
+                 * bg_item_common.c_inc) -- the real field write happens several frames from now, so
+                 * arm a watch for this tile instead of announcing anything yet; the two landing
+                 * hooks in bg_item_common.c_inc fire the actual broadcast once it really lands.
+                 * Excludes signboards: those take a completely different, immediate field write
+                 * (aSIGN_set_white_sign(), inside mTG_common_throw_put_field) that never touches
+                 * the drop table at all, so arming here would watch a tile nothing was queued for. */
+                if (put_item != ITM_SIGNBOARD && pc_net_game_role() == PC_NETGAME_ROLE_HOST) {
+                    int host_ut_x, host_ut_z;
+                    if (mFI_Wpos2UtNum(&host_ut_x, &host_ut_z, pos)) {
+                        pc_net_game_arm_local_drop_landing(host_ut_x, host_ut_z);
+                    }
+                }
+#endif
                 if (menu_info->data0 == 13) {
                     mPr_SetPossessionItem(Now_Private, idx, (mActor_name_t)menu_info->data1, mPr_ITEM_COND_NORMAL);
                     mPlib_request_main_wait_from_submenu();
@@ -4004,6 +4476,32 @@ static void mTG_field_put_proc(Submenu* submenu, mSM_MenuInfo_c* menu_info) {
     }
 }
 
+#ifdef TARGET_PC
+/* outdoor furniture C1: "Place": the tile in front of the player, the piece facing the player (pc_outdoor_furniture.h). The host decides (a client: TXN_COMMIT kind 22;
+ * the pocket empties only on APPLIED); a refusal shows the vanilla "can't put that there" window plus a notice line saying why. The pickup-exchange screen (data0 13)
+ * keeps the vanilla drop. */
+static void mTG_pc_ofurn_place_proc(Submenu* submenu, mSM_MenuInfo_c* menu_info) {
+    GAME_PLAY* play = (GAME_PLAY*)gamePT;
+    ACTOR* player = GET_PLAYER_ACTOR_ACTOR(play);
+    mTG_tag_c* tag = &submenu->overlay->tag_ovl->tags[0];
+    int idx = mTG_get_table_idx(tag);
+    mActor_name_t item = Now_Private->inventory.pockets[idx];
+    int ux, uz;
+
+    if (menu_info->data0 == 13 || player == NULL) {
+        mTG_field_put_proc(submenu, menu_info);
+        return;
+    }
+    pc_ofurn_front_tile(player->world.position.x, player->world.position.z, (int)player->shape_info.rotation.y, &ux, &uz);
+    if (pc_net_game_ofurn_place(idx, (int)item, ux, uz, pc_ofurn_rot_for_facing((int)player->shape_info.rotation.y))) {
+        mTG_return_tag_init(submenu, mTG_TYPE_NONE, mTG_RETURN_CLOSE);
+        mTG_close_window(submenu, menu_info, FALSE);
+    } else {
+        mTG_open_warning_window(submenu, menu_info, mWR_WARNING_PUT_ITEM);
+    }
+}
+#endif
+
 static void mTG_room_put_proc(Submenu* submenu, mSM_MenuInfo_c* menu_info) {
     GAME_PLAY* play = (GAME_PLAY*)gamePT;
     ACTOR* player = GET_PLAYER_ACTOR_ACTOR(play);
@@ -4017,6 +4515,14 @@ static void mTG_room_put_proc(Submenu* submenu, mSM_MenuInfo_c* menu_info) {
     int ux;
     int uz;
 
+#ifdef TARGET_PC
+    /* Client inside its OWN house with the house link down / not reconciled: the game's own refusal row, pocket unchanged. */
+    if (pc_net_game_client_room_edit_locked()) {
+        pc_net_game_room_edit_denied();
+        mTG_open_warning_window(submenu, menu_info, mWR_WARNING_PUT_ITEM);
+        return;
+    }
+#endif
     idx = mTG_get_table_idx(tag);
     put_item = mRmTp_Item1ItemNo2FtrItemNo_AtPlayerRoom(Now_Private->inventory.pockets[idx], TRUE);
     inv_ovl = submenu->overlay->inventory_ovl;
@@ -4887,6 +5393,88 @@ static void mTG_bury_proc(Submenu* submenu, mSM_MenuInfo_c* menu_info) {
     if (!mFI_CheckInIsland() ||
         (!mSP_SearchItemCategoryPriority(item, mSP_KIND_FURNITURE, mSP_LISTTYPE_HOMEPAGE, NULL) &&
          !mSP_SearchItemCategoryPriority(item, mSP_KIND_FURNITURE, mSP_LISTTYPE_SPECIALPRESENT, NULL))) {
+#ifdef TARGET_PC
+        /* World Ecology T3 (bugfix): on a host-authoritative client, the real field mutation
+         * (mPlib_request_main_putin_scoop_from_submenu() with the real item eventually reaches
+         * player_drop_entry_proc() via Player_actor_setup_main_Putin_scoop() --
+         * m_player_main_putin_scoop.c_inc) is replaced by a BURY_REQUEST; the animation still plays
+         * (item == EMPTY_NO so Setup_main_Putin_scoop's own local-mutation branch is simply never
+         * entered -- see the defensive choke gate there too).
+         *
+         * Pocket-clear timing is deliberately DEFERRED to pcnetgame_handle_client_bury_result(),
+         * matching DROP's proven-safe pattern (pc_net_game_request_drop() /
+         * pcnetgame_handle_client_drop_result()) instead of vanilla's own immediate-clear-at-menu-time
+         * timing. Vanilla can never fail once this menu action closes, so its immediate clear is truly
+         * a point of no return there; the NETWORKED path can genuinely fail for reasons that have
+         * nothing to do with vanilla's own risk shape -- a lost network race, the pending request's own
+         * retry timeout expiring, an owner-stamp mismatch, or an outright host reject -- so naively
+         * matching vanilla's timing here would introduce a NEW, network-only way to lose the item with
+         * no chance of recovery. See pc_net_game_request_bury()'s own doc for the full contract.
+         *
+         * On the HOST's own local bury, pc_net_game_host_local_bury() does the ENTIRE action (field
+         * write + pocket clear) itself -- so it must NOT also fall through to the plain single-player
+         * path below, which would clear the pocket a second time and could re-enter the outcome table
+         * against a tile the host-local call already mutated. */
+        if (pc_net_game_role() == PC_NETGAME_ROLE_CLIENT) {
+            int ut_x, ut_z, hole_no;
+            int ok = FALSE;
+            if (mFI_Wpos2UtNum(&ut_x, &ut_z, inv_ovl->shovel_pos)) {
+                hole_no = mCoBG_GetHoleNumber(inv_ovl->shovel_pos);
+                ok = pc_net_game_request_bury(idx, (int)item, ut_x, ut_z, (hole_no >= 0) ? hole_no : 0xFF);
+            }
+            if (ok) {
+                /* Request sent (or coalesced with one already in flight) -- do NOT clear the pocket
+                 * here; see the doc above. */
+                mPlib_request_main_putin_scoop_from_submenu(&inv_ovl->shovel_pos, EMPTY_NO, FALSE);
+                mTG_return_tag_init(submenu, mTG_TYPE_NONE, mTG_RETURN_CLOSE);
+                mTG_close_window(submenu, menu_info, TRUE);
+            } else {
+                /* Nothing was sent (malformed input / not in town / no save loaded / stale claimed
+                 * item) -- the pocket was never touched, so there is nothing to undo; just show the
+                 * normal "can't do that" feedback instead of closing the menu on a no-op. */
+                mTG_open_warning_window(submenu, menu_info, mWR_WARNING_PUT_ITEM);
+            }
+            return;
+        } else if (pc_net_game_role() == PC_NETGAME_ROLE_HOST) {
+            int ut_x = 0, ut_z = 0, hole_no;
+            int handled = FALSE;
+            int ut_resolved = mFI_Wpos2UtNum(&ut_x, &ut_z, inv_ovl->shovel_pos);
+            if (ut_resolved) {
+                hole_no = mCoBG_GetHoleNumber(inv_ovl->shovel_pos);
+                handled = pc_net_game_host_local_bury(idx, ut_x, ut_z, (int)item, (hole_no >= 0) ? hole_no : 0xFF);
+            }
+            if (handled) {
+                /* pc_net_game_host_local_bury() already performed the ENTIRE action (field write +
+                   pocket clear) itself -- only the presentation-only animation is still needed here. */
+                mPlib_request_main_putin_scoop_from_submenu(&inv_ovl->shovel_pos, EMPTY_NO, FALSE);
+            } else if (mTG_host_put_tile_free(&inv_ovl->shovel_pos) &&
+                       (!ut_resolved || pc_net_game_host_bury_tile_is_valid(ut_x, ut_z))) {
+                /* Not a legal bury per the host's own authoritative validation (e.g. the shovel_pos
+                   tile is not actually a hole), and NOT currently reserved by a peer's in-flight
+                   drop/pickup/bury either -- fall back to vanilla's own local mutation + pocket clear
+                   exactly as single-player would, since pc_net_game_host_local_bury() performed no
+                   mutation at all in this case.
+                   Bug 3 fix: pc_net_game_host_bury_tile_is_valid() re-confirms, right before this
+                   vanilla mutation, that the tile is STILL a valid hole -- a 0 return from
+                   pc_net_game_host_local_bury() is ambiguous (any of several unrelated validation
+                   failures), and a racing peer's BURY may have committed into this exact hole between
+                   menu-open and this commit attempt; without this re-check, vanilla's own placement
+                   could fail while the pocket is still cleared unconditionally below. */
+                mPlib_request_main_putin_scoop_from_submenu(&inv_ovl->shovel_pos, item, FALSE);
+                mPr_SetPossessionItem(Now_Private, idx, EMPTY_NO, mPr_ITEM_COND_NORMAL);
+            } else {
+                /* The tile is currently reserved by a peer's in-flight action -- refuse the host's own
+                   local bury outright rather than risk landing on top of / overwriting whatever that
+                   peer's commit is about to write (mirrors mTG_host_put_tile_free()'s own reservation
+                   gate for the ordinary field-drop path). Nothing is mutated; the item stays put. */
+                mTG_open_warning_window(submenu, menu_info, mWR_WARNING_PUT_ITEM);
+                return;
+            }
+            mTG_return_tag_init(submenu, mTG_TYPE_NONE, mTG_RETURN_CLOSE);
+            mTG_close_window(submenu, menu_info, TRUE);
+            return;
+        }
+#endif
         mPlib_request_main_putin_scoop_from_submenu(&inv_ovl->shovel_pos, item, FALSE);
         mPr_SetPossessionItem(Now_Private, idx, EMPTY_NO, mPr_ITEM_COND_NORMAL);
         mTG_return_tag_init(submenu, mTG_TYPE_NONE, mTG_RETURN_CLOSE);
@@ -5028,7 +5616,39 @@ static void mTG_exchange_proc(Submenu* submenu, mSM_MenuInfo_c* menu_info) {
             }
         } else if (ITEM_IS_BALLOON(item)) {
             mPlib_request_main_release_creature_balloon_from_submenu(item, demo_gold_scoop);
-        } else {
+        }
+#ifdef TARGET_PC
+        else if (pc_net_game_role() == PC_NETGAME_ROLE_CLIENT) {
+            /* M9-D G4-2: a network client must never write the swapped-out item into its OWN local field
+             * (mTG_common_throw_put_field below): that field is not synced and is erased at the next
+             * resync, so the item would silently vanish. Send it through the authoritative drop request
+             * instead (same tile search / arguments as the mTG_field_put_proc client seam). The result is
+             * applied asynchronously (pcnetgame_handle_client_drop_result): on accept the pocket slot is
+             * cleared and the caught item takes its place; on any failure the hand item stays in the slot
+             * and the caught item is lost (logged). Either way the menu closes normally -- a warning
+             * window here could trap the player, whose only other options are more swaps. Creature
+             * releases (fish / insect / balloon) above are not field writes and are unchanged. */
+            xyz_t pos;
+            int ux = -1, uz = -1;
+
+            if (mTG_search_put_pos(player, &pos, FALSE, FALSE, FALSE, FALSE, FALSE) &&
+                !mFI_Wpos2UtNum(&ux, &uz, pos)) {
+                ux = -1;
+                uz = -1;
+            }
+            pc_net_game_exchange_request_drop((int)submenu->overlay->hand_ovl->info.item,
+                                              (int)submenu->overlay->hand_ovl->info.item_cond, ux, uz);
+
+            if (demo_gold_scoop) {
+                mPlib_request_main_demo_get_golden_item_from_submenu();
+            } else {
+                mPlib_request_main_wait_from_submenu();
+                sfx = -1;
+                mPlib_request_main_wait_from_submenu();
+            }
+        }
+#endif
+        else {
             xyz_t pos;
 
             if (!mFI_CheckInIsland() ||
@@ -5036,7 +5656,7 @@ static void mTG_exchange_proc(Submenu* submenu, mSM_MenuInfo_c* menu_info) {
                  !mSP_SearchItemCategoryPriority(item, mSP_KIND_FURNITURE, mSP_LISTTYPE_SPECIALPRESENT, NULL))) {
                 if (mTG_search_put_pos(player, &pos, item == ITM_SIGNBOARD, 0, item == ITM_SIGNBOARD, FALSE,
                                        item == ITM_SIGNBOARD) &&
-                    mTG_common_throw_put_field(play, item, &pos, mCoBG_LAYER0)) {
+                    mTG_host_put_tile_free(&pos) && mTG_common_throw_put_field(play, item, &pos, mCoBG_LAYER0)) {
                     if (demo_gold_scoop) {
                         mPlib_request_main_demo_get_golden_item_from_submenu();
                     } else {
@@ -5049,7 +5669,26 @@ static void mTG_exchange_proc(Submenu* submenu, mSM_MenuInfo_c* menu_info) {
                         (ITEM_IS_SCOOP(Now_Private->equipment) || ITEM_IS_GOLD_SCOOP(Now_Private->equipment))) {
                         mTG_island_check_plant_plant(item);
                         mTG_island_check_fruit_plant(item);
-                        mPlib_request_main_putin_scoop_from_submenu((xyz_t*)menu_info->data2, item, demo_gold_scoop);
+#ifdef TARGET_PC
+                        /* World Ecology T3: DEFENSIVE gate only -- this path (GET_SCOOP's own
+                         * full-pockets overflow-to-hole flow) is not reachable by a network client in
+                         * this build (clients never enter mPlayer_INDEX_GET_SCOOP locally -- see
+                         * pc_net_game_request_dig_buried()'s own doc), so there is no bury_seam
+                         * network request wired here yet. Added purely for correctness/future-proofing
+                         * so a host-authoritative client can never reach this real local mutation with a
+                         * nonzero item if this path ever DOES become reachable later -- matching the
+                         * defensive choke gate in Player_actor_setup_main_Putin_scoop() (belt-and-
+                         * suspenders, per this milestone's own design brief). The item is presentation-
+                         * only here; if this path is ever wired for real, it needs its own
+                         * pc_net_game_request_bury()-style call with a genuine pocket_slot_idx. */
+                        if (pc_net_game_role() == PC_NETGAME_ROLE_CLIENT) {
+                            mPlib_request_main_putin_scoop_from_submenu((xyz_t*)menu_info->data2, EMPTY_NO,
+                                                                        demo_gold_scoop);
+                        } else
+#endif
+                        {
+                            mPlib_request_main_putin_scoop_from_submenu((xyz_t*)menu_info->data2, item, demo_gold_scoop);
+                        }
                     } else if (item == ITM_SIGNBOARD) {
                         mTG_open_warning_window(submenu, menu_info, mWR_WARNING_PUT_SIGN);
                         return;
@@ -5758,9 +6397,25 @@ static int mTG_trans_mail_mark(Submenu* submenu, mSM_MenuInfo_c* menu_info, mTG_
                 }
             }
 
-            src = &Common_Get(now_home)->mailbox[src_idx];
-            mMl_copy_mail(&Now_Private->mail[dst_idx], src);
-            mMl_clear_mail(src);
+            src = &mTG_MAILBOX()[src_idx];
+#ifdef TARGET_PC
+            if (pc_net_game_role() == PC_NETGAME_ROLE_CLIENT) {
+                /* mail milestone 2: the letter moves ONLY through the host (MAIL_TAKE); the overlay just waits / animates */
+                int t = mTG_client_mailbox_take(src_idx, &dst_idx);
+                if (t == 0) {
+                    return TRUE; /* pending: nothing changes */
+                }
+                if (t < 0) {
+                    mailbox_ovl->mark_flag = 0;
+                    mailbox_ovl->mark_bitfield = 0;
+                    return TRUE; /* refused: the vanilla "stop" branch */
+                }
+            } else
+#endif
+            {
+                mMl_copy_mail(&Now_Private->mail[dst_idx], src);
+                mMl_clear_mail(src);
+            }
             tag->tag_col = src_idx % 2;
             tag->tag_row = src_idx / 2;
             mTG_set_hand_pos(submenu, tag->base_pos, tag->table, src_idx);
@@ -5788,9 +6443,24 @@ static int mTG_trans_mail(Submenu* submenu, mSM_MenuInfo_c* menu_info, mTG_tag_c
         if (dst_idx != -1) {
             int src_idx = submenu->overlay->mailbox_ovl->get_last_mail_idx_proc();
 
-            src = &Common_Get(now_home)->mailbox[src_idx];
-            mMl_copy_mail(&Now_Private->mail[dst_idx], src);
-            mMl_clear_mail(src);
+            src = &mTG_MAILBOX()[src_idx];
+#ifdef TARGET_PC
+            if (pc_net_game_role() == PC_NETGAME_ROLE_CLIENT) {
+                /* mail milestone 2: the letter moves ONLY through the host (MAIL_TAKE); the overlay just waits / animates */
+                int t = mTG_client_mailbox_take(src_idx, &dst_idx);
+                if (t == 0) {
+                    return TRUE; /* pending: nothing changes */
+                }
+                if (t < 0) {
+                    mailbox_ovl->open_flag = FALSE;
+                    return FALSE; /* refused: no more automatic transfers, back to the normal menu */
+                }
+            } else
+#endif
+            {
+                mMl_copy_mail(&Now_Private->mail[dst_idx], src);
+                mMl_clear_mail(src);
+            }
             src_idx = submenu->overlay->mailbox_ovl->get_last_mail_idx_proc();
             tag->tag_col = src_idx % 2;
             tag->tag_row = src_idx / 2;
@@ -5816,7 +6486,15 @@ static int mTG_trans_mail(Submenu* submenu, mSM_MenuInfo_c* menu_info, mTG_tag_c
 static int mTG_check_trans_mail(Submenu* submenu, mSM_MenuInfo_c* menu_info, mTG_tag_c* tag) {
     int res = FALSE;
 
-    if (mMl_count_use_mail_space(Common_Get(now_home)->mailbox, HOME_MAILBOX_SIZE) != 0) {
+    if (
+#ifdef TARGET_PC
+        mTG_MAILBOX() != NULL && /* guest mailbox: no mailbox (NULL now_home, not a guest client) is an empty one */
+#endif
+        mMl_count_use_mail_space(mTG_MAILBOX(), HOME_MAILBOX_SIZE) != 0
+#ifdef TARGET_PC
+        && (pc_net_game_role() != PC_NETGAME_ROLE_CLIENT || mTG_MAILBOX_USABLE()) /* mail milestone M0 / 2: a client's mailbox (house or guest post office copy) yields nothing until the host fed it (the empty-mailbox branch below) */
+#endif
+    ) {
         res = mTG_trans_mail(submenu, menu_info, tag);
     } else {
         submenu->overlay->mailbox_ovl->open_flag = FALSE;
@@ -5829,7 +6507,11 @@ static int mTG_check_trans_mail_mark(Submenu* submenu, mSM_MenuInfo_c* menu_info
     mMB_Ovl_c* mailbox_ovl = submenu->overlay->mailbox_ovl;
     int res = FALSE;
 
-    if (mailbox_ovl->mark_bitfield != 0) {
+    if (mailbox_ovl->mark_bitfield != 0
+#ifdef TARGET_PC
+        && (pc_net_game_role() != PC_NETGAME_ROLE_CLIENT || mTG_MAILBOX_USABLE()) /* mail milestone M0 / 2: marks are dropped, nothing is moved, until the host fed the mailbox (house or guest copy) */
+#endif
+    ) {
         res = mTG_trans_mail_mark(submenu, menu_info, tag);
     } else {
         mailbox_ovl->open_flag = FALSE;
@@ -5962,7 +6644,11 @@ static int mTG_move_cursol_base_left(mTG_tag_c* tag) {
 static int mTG_move_cursol_base_right(mTG_tag_c* tag) {
     int res;
 
+#ifdef TARGET_PC
+    if (tag->tag_col < (mTG_pc_table(tag->table)->col_num - 1)) {
+#else
     if (tag->tag_col < (mTG_table_data[tag->table].col_num - 1)) {
+#endif
         tag->tag_col++;
         res = TRUE;
     } else {
@@ -5988,7 +6674,11 @@ static int mTG_move_cursol_base_upper(mTG_tag_c* tag) {
 static int mTG_move_cursol_base_lower(mTG_tag_c* tag) {
     int res;
 
+#ifdef TARGET_PC
+    if (tag->tag_row < (mTG_pc_table(tag->table)->row_num - 1)) {
+#else
     if (tag->tag_row < (mTG_table_data[tag->table].row_num - 1)) {
+#endif
         tag->tag_row++;
         res = TRUE;
     } else {
@@ -6337,6 +7027,43 @@ static int mTG_move_cursol_between_table_music(Submenu* submenu, mTG_tag_c* tag,
 static int mTG_move_cursol_between_table_haniwa(mTG_tag_c* tag, u32 trigger) {
     int res = FALSE;
 
+#ifdef TARGET_PC
+    /* dresser mode (U3 9 x 3 grid): down from the bottom grid row -> the pockets' top row, up from the pockets' top row -> the bottom grid row, each to the
+     * nearest column by position; left / right stop at the grid edge (one page: no paging) */
+    if (pc_dresser_ui_active()) {
+        static const s16 pocket_x[5] = { -77, -53, -29, -5, 19 }; /* mTG_item_col_pos */
+        const s16* grid_x = mTG_pc_table(mTG_TABLE_HANIWA)->col_pos; /* the dresser's 9 columns / the basket's 5 + the Sell button */
+        /* up from the pockets lands on a grid column (never on the basket's Sell button: it is reached with right from column 4) */
+        const int up_cols = pc_dresser_ui_basket() ? PC_SELL_BASKET_COLS : mTG_pc_table(mTG_TABLE_HANIWA)->col_num;
+        int i;
+        int best = 0;
+
+        if ((trigger & BUTTON_CDOWN) != 0 && tag->table == mTG_TABLE_HANIWA) {
+            for (i = 1; i < 5; i++) {
+                if (ABS(pocket_x[i] - grid_x[tag->tag_col]) < ABS(pocket_x[best] - grid_x[tag->tag_col])) {
+                    best = i;
+                }
+            }
+            tag->table = mTG_TABLE_ITEM;
+            tag->tag_col = best;
+            tag->tag_row = 0;
+            return TRUE;
+        }
+        if ((trigger & BUTTON_CUP) != 0 && tag->table == mTG_TABLE_ITEM) {
+            for (i = 1; i < up_cols; i++) { /* 9 dresser columns, 5 basket columns */
+                if (ABS(grid_x[i] - pocket_x[tag->tag_col]) < ABS(grid_x[best] - pocket_x[tag->tag_col])) {
+                    best = i;
+                }
+            }
+            tag->table = mTG_TABLE_HANIWA;
+            tag->tag_col = best;
+            tag->tag_row = 2;
+            return TRUE;
+        }
+        return FALSE;
+    }
+#endif
+
     if ((trigger & BUTTON_CDOWN) != 0 && tag->table == mTG_TABLE_HANIWA) {
         if (tag->tag_col == 3) {
             tag->tag_col = 4;
@@ -6565,6 +7292,16 @@ static int mTG_move_cursol_base(Submenu* submenu, mTG_tag_c* tag, mSM_MenuInfo_c
     u32 trigger = submenu->overlay->menu_control.trigger;
     int res = FALSE;
 
+#ifdef TARGET_PC
+    if (pc_dresser_ui_active() && (trigger & (BUTTON_CLEFT | BUTTON_CDOWN | BUTTON_CUP | BUTTON_CRIGHT)) != 0) {
+        pc_dresser_ui_note_input(); /* the scripted UI test releases its press when the menu consumed it */
+    }
+    if (pc_dresser_ui_active() && trigger != 0 && g_pc_verbose) {
+        printf("[NET][DRESSER] gyroid overlay: cursor trigger 0x%08X on table %d col %d (menu %d)\n", (unsigned)trigger, (int)tag->table, (int)tag->tag_col,
+               (int)menu_info->menu_type);
+    }
+#endif
+
     if ((trigger & (BUTTON_CLEFT | BUTTON_CDOWN | BUTTON_CUP | BUTTON_CRIGHT)) != 0 ||
         (tag->table == mTG_TABLE_CATALOG &&
          (trigger & (BUTTON_DLEFT | BUTTON_DDOWN | BUTTON_DUP | BUTTON_DRIGHT | BUTTON_CLEFT | BUTTON_CDOWN |
@@ -6788,6 +7525,15 @@ static int mTG_select_tag_decide_item_normal(Submenu* submenu, mActor_name_t ite
         }
     }
 
+#ifdef TARGET_PC
+    /* outdoor furniture C1: a plain furniture item in the town field (no shovel menu) gets "Place" next to the vanilla "Drop" when this player may place (the listen
+     * host / a resident of a host that announced service 10); everyone else keeps the vanilla menu */
+    if (ret_tag_type == mTG_TYPE_FIELD_DEFAULT && (type == NAME_TYPE_FTR0 || type == NAME_TYPE_FTR1) && Common_Get(field_type) == mFI_FIELDTYPE2_FG &&
+        (item_cond & (mPr_ITEM_COND_PRESENT | mPr_ITEM_COND_QUEST)) == 0 && pc_net_game_ofurn_place_offer((int)item)) {
+        ret_tag_type = mTG_TYPE_76;
+    }
+#endif
+
     return ret_tag_type;
 }
 
@@ -6796,6 +7542,29 @@ static int mTG_select_tag_decide_item(Submenu* submenu, mSM_MenuInfo_c* menu_inf
     mActor_name_t item = Now_Private->inventory.pockets[idx];
     mIV_Ovl_c* inv_ovl = submenu->overlay->inventory_ovl;
     int ret_tag_type = mTG_TYPE_NONE;
+
+#ifdef TARGET_PC
+    if (pc_dresser_ui_active()) {
+        /* dresser mode: a pocket item offers "Put Away" / "Grab" / "Quit" (never the vanilla hand carry: a drop would write the save's gyroid); 6r (B): with
+         * a grabbed item, A on a pocket is its TARGET (empty = take / move, occupied = swap, the origin = cancel) */
+        pc_dresser_ui_note_input();
+        if (pc_dresser_ui_carry_item() != 0) {
+            const int act = pc_dresser_ui_place(1, idx);
+            sAdo_SysTrgStart(act == PC_DRESSER_UI_ACT_REFUSED ? MONO(NA_SE_3) : NA_SE_32);
+            return mTG_TYPE_NONE;
+        }
+        if (pc_dresser_ui_basket()) { /* Nook bulk sell basket: a sellable pocket offers "Add to Basket" / "Quit"; a pocket already in the basket shows nothing */
+            mTG_label_table[mTG_TYPE_PUTIN_ITEM].words = mTG_pc_basket_putin_item;
+            mTG_label_table[mTG_TYPE_PUTIN_ITEM].lines = ARRAY_COUNT(mTG_pc_basket_putin_item);
+            return (item != EMPTY_NO && pc_sell_ui_pocket_offer(idx)) ? mTG_TYPE_PUTIN_ITEM : mTG_TYPE_NONE;
+        }
+        mTG_label_table[mTG_TYPE_PUTIN_ITEM].words = mTG_pc_dresser_putin_item;
+        mTG_label_table[mTG_TYPE_PUTIN_ITEM].lines = ARRAY_COUNT(mTG_pc_dresser_putin_item);
+        return (!pc_dresser_ui_pending() && item != EMPTY_NO && pc_net_game_dresser_pocket_item(idx) != 0) ? mTG_TYPE_PUTIN_ITEM : mTG_TYPE_NONE;
+    }
+    mTG_label_table[mTG_TYPE_PUTIN_ITEM].words = mTG_putin_item; /* every other put-in screen keeps the vanilla tag */
+    mTG_label_table[mTG_TYPE_PUTIN_ITEM].lines = ARRAY_COUNT(mTG_putin_item);
+#endif
 
     if (item != EMPTY_NO) {
         if (menu_info->menu_type == mSM_OVL_INVENTORY) {
@@ -6992,8 +7761,36 @@ static int mTG_select_tag_decide_bg(Submenu* submenu, mSM_MenuInfo_c* menu_info,
 }
 
 static int mTG_select_tag_decide_haniwa(Submenu* submenu, mSM_MenuInfo_c* menu_info, mTG_tag_c* tag) {
+#ifdef TARGET_PC
+    /* dresser mode: the save's gyroid is never read (the dresser page decides, see below) */
+    mActor_name_t item = pc_dresser_ui_active() ? (mActor_name_t)EMPTY_NO : Save_Get(homes[menu_info->data1]).haniwa.items[tag->tag_col].item;
+#else
     mActor_name_t item = Save_Get(homes[menu_info->data1]).haniwa.items[tag->tag_col].item;
+#endif
     int ret_tag_type = mTG_TYPE_NONE;
+
+#ifdef TARGET_PC
+    if (pc_dresser_ui_active()) {
+        /* dresser mode: a filled cell offers "Take it" / "Grab" / "Quit"; nothing while a host transaction is in flight. 6r (B): with a grabbed item, A on a
+         * cell is its TARGET (empty = move / put, occupied = swap, the origin = cancel) */
+        pc_dresser_ui_note_input();
+        if (pc_dresser_ui_carry_item() != 0) {
+            const int act = pc_dresser_ui_place(0, mTG_get_table_idx(tag));
+            sAdo_SysTrgStart(act == PC_DRESSER_UI_ACT_REFUSED ? MONO(NA_SE_3) : NA_SE_32);
+            return mTG_TYPE_NONE;
+        }
+        if (pc_dresser_ui_basket()) { /* Nook bulk sell basket: a filled cell offers "Take Back" / "Quit" */
+            mTG_label_table[mTG_TYPE_HANIWA_GET_ITEM].words = mTG_pc_basket_get_item;
+            mTG_label_table[mTG_TYPE_HANIWA_GET_ITEM].lines = ARRAY_COUNT(mTG_pc_basket_get_item);
+            return pc_dresser_ui_slot_item(mTG_get_table_idx(tag)) != 0 ? mTG_TYPE_HANIWA_GET_ITEM : mTG_TYPE_NONE;
+        }
+        mTG_label_table[mTG_TYPE_HANIWA_GET_ITEM].words = mTG_pc_dresser_get_item;
+        mTG_label_table[mTG_TYPE_HANIWA_GET_ITEM].lines = ARRAY_COUNT(mTG_pc_dresser_get_item);
+        return (!pc_dresser_ui_pending() && pc_dresser_ui_slot_item(mTG_get_table_idx(tag)) != 0) ? mTG_TYPE_HANIWA_GET_ITEM : mTG_TYPE_NONE;
+    }
+    mTG_label_table[mTG_TYPE_HANIWA_GET_ITEM].words = mTG_haniwa_get_item; /* the vanilla gyroid keeps its own tag */
+    mTG_label_table[mTG_TYPE_HANIWA_GET_ITEM].lines = ARRAY_COUNT(mTG_haniwa_get_item);
+#endif
 
     if (item != EMPTY_NO) {
         if (menu_info->data0 == 0) {
@@ -7573,6 +8370,12 @@ static void mTG_move_decide(Submenu* submenu, mSM_MenuInfo_c* menu_info, mTG_tag
     };
 
     if (!mTG_check_move_proc(submenu, tag)) {
+#ifdef TARGET_PC
+        if (pc_dresser_ui_basket() && tag->table == mTG_TABLE_ITEM) {
+            pc_sell_ui_refuse_pocket(mTG_get_table_idx(tag)); /* Nook bulk sell basket: a greyed pocket says WHY Nook won't buy it (a notice, nothing changes) */
+            pc_dresser_ui_note_input();
+        }
+#endif
         sAdo_SysTrgStart(MONO(NA_SE_A));
         return;
     }
@@ -7687,6 +8490,32 @@ static void mTG_move_move(Submenu* submenu, mSM_MenuInfo_c* menu_info, mTG_tag_c
 static void mTG_move_base(Submenu* submenu, mSM_MenuInfo_c* menu_info, mTG_tag_c* tag) {
     u32 trigger = submenu->overlay->menu_control.trigger;
 
+#ifdef TARGET_PC
+    /* 6r (B): B while carrying a grabbed item cancels the grab only (the screen stays open; nothing moved) */
+    if (pc_dresser_ui_active() && pc_dresser_ui_carry_item() != 0 && (trigger & BUTTON_B) != 0) {
+        pc_dresser_ui_carry_cancel();
+        pc_dresser_ui_note_input();
+        sAdo_SysTrgStart(NA_SE_3);
+        return;
+    }
+    /* dresser mode: L / R do nothing (one page; vanilla L = catch into the hand, R = change window: neither applies to the dresser grid) */
+    if (pc_dresser_ui_active() && menu_info->menu_type == mSM_OVL_HANIWA && (trigger & (BUTTON_B | BUTTON_START | BUTTON_Y | BUTTON_A)) == 0 &&
+        (trigger & (BUTTON_L | BUTTON_R)) != 0) {
+        return;
+    }
+    /* Nook bulk sell basket: A on the "Sell" button (cursor column 5) or Start (Enter) = CONFIRM: the screen closes through the SAME path as B (mTG_move_cancel)
+     * but marked confirmed, so Nook quotes the basket; an empty basket blocks it (notice + the refusal sound). B / Y stay CANCEL (pc_sell_ui_close: basket cleared). */
+    if (pc_dresser_ui_basket() && (trigger & BUTTON_B) == 0 &&
+        ((trigger & BUTTON_START) != 0 || ((trigger & BUTTON_A) != 0 && tag->table == mTG_TABLE_HANIWA && pc_sell_ui_table_is_button(mTG_get_table_idx(tag))))) {
+        pc_dresser_ui_note_input();
+        if (pc_sell_ui_confirm()) {
+            mTG_move_cancel(submenu, menu_info, tag); /* the screen's own close (its sound included) */
+        } else {
+            sAdo_SysTrgStart(MONO(NA_SE_A));
+        }
+        return;
+    }
+#endif
     if (trigger & (BUTTON_B | BUTTON_START | BUTTON_Y)) {
         mTG_move_cancel(submenu, menu_info, tag);
     } else if (trigger & BUTTON_A) {
@@ -7898,6 +8727,9 @@ static void mTG_move_delete(Submenu* submenu, mTG_tag_c* tag) {
             if (inv_ovl->mail_mark_flag == 0 &&
                 ((mailbox_ovl != NULL && mailbox_ovl->mark_flag == 0) || mailbox_ovl == NULL) &&
                 ((cpmail_ovl != NULL && cpmail_ovl->mark_flag == 0) || cpmail_ovl == NULL)) {
+#ifdef TARGET_PC
+                if (!mTG_client_mail_is_mailbox(mTG_get_mail_pointer(submenu, NULL))) /* mail milestone 2: a client never throws away a mailbox letter */
+#endif
                 mMl_clear_mail(mTG_get_mail_pointer(submenu, NULL));
             } else {
                 if (inv_ovl->mail_mark_flag == 1) {
@@ -7921,7 +8753,10 @@ static void mTG_move_delete(Submenu* submenu, mTG_tag_c* tag) {
 
                         for (i = 0; i < mMB_MAIL_COUNT; i++) {
                             if ((mailbox_ovl->mark_bitfield & (1 << i)) != 0) {
-                                mMl_clear_mail(&Common_Get(now_home)->mailbox[i]);
+#ifdef TARGET_PC
+                                if (pc_net_game_role() != PC_NETGAME_ROLE_CLIENT && mTG_MAILBOX() != NULL) /* mail milestone 2: refused for a client (its marks were dropped earlier) */
+#endif
+                                mMl_clear_mail(&mTG_MAILBOX()[i]);
                             }
                         }
 
@@ -7966,8 +8801,21 @@ static void mTG_select_tag_base(Submenu* submenu, mSM_MenuInfo_c* menu_info, mTG
             sAdo_SysTrgStart(MONO(NA_SE_3));
         }
     } else if (trigger & (BUTTON_A)) {
+#ifdef TARGET_PC
+        if (pc_dresser_ui_active()) {
+            pc_dresser_ui_note_input(); /* the tag window's option was chosen */
+            if (g_pc_verbose) {
+                printf("[NET][DRESSER] tag window: A on option row %d (type %d)\n", (int)tag->tag_row, (int)tag->type);
+            }
+        }
+#endif
         mTG_label_table[tag->type].words[tag->tag_row]->move_proc(submenu, menu_info);
     } else {
+#ifdef TARGET_PC
+        if (pc_dresser_ui_active() && (trigger & (BUTTON_CDOWN | BUTTON_CUP)) != 0) {
+            pc_dresser_ui_note_input();
+        }
+#endif
         int max = mTG_label_table[tag->type].lines - 1;
 
         if (trigger & (BUTTON_CDOWN | BUTTON_CUP)) {
@@ -8063,6 +8911,15 @@ static void mTG_move_func(Submenu* submenu, mSM_MenuInfo_c* menu_info) {
     if (tag_ovl->sel_tag_idx < 0 || tag_ovl->sel_tag_idx >= mTG_TAG_NUM) {
         return;
     }
+
+#ifdef TARGET_PC
+    if (pc_dresser_ui_active() && g_pc_verbose && submenu->overlay->menu_control.trigger != 0) { /* dresser-mode input diagnostic: which gate the tag handler is in */
+        printf("[NET][DRESSER] tag move: trigger 0x%X wait %d move_flag %d act %d sel %d ret %d type %d scale %.2f row %d table %d col %d cur_menu %d menu %d\n",
+               (unsigned)submenu->overlay->menu_control.trigger, (int)hand_ovl->info.wait_timer, (int)hand_ovl->info.move_flag, (int)hand_ovl->info.act,
+               (int)tag_ovl->sel_tag_idx, (int)tag_ovl->ret_tag_idx, (int)tag->type, (double)tag->scale, (int)tag->tag_row, (int)tag->table, (int)tag->tag_col,
+               (int)submenu->current_menu_type, (int)menu_info->menu_type);
+    }
+#endif
 
     if (hand_ovl->info.wait_timer > 0 && inv_ovl != NULL) {
         static f32 wait_accum = 0.0f;

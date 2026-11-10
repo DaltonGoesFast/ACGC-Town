@@ -207,6 +207,113 @@ static int bIT_actor_hole_effect_entry(bg_item_hole_c* hole, mActor_name_t fg_it
 #include "../src/bg_item/bg_item_clip.c_inc"
 #include "../src/bg_item/bg_item_common.c_inc"
 
+#ifdef TARGET_PC
+/* World Ecology T1: see this function's own declaration (bg_item_h.h) and Check_BirthBee_common()'s
+ * own doc (m_player_common.c_inc) for why this exists. Mirrors bg_item_tree_fruit_drop()'s own
+ * TREE_BEES/CEDAR_TREE_BEES/GOLD_TREE_BEES branch (actor creation + fruit_set(HONEYCOMB, ...), in
+ * bg_item_common.c_inc) almost exactly, with drop_type passed as 0 -- matching drop_fruit()'s own
+ * literal 0 for every fruit_set() call it makes, honeycomb included; NOT the value "1" this task's own
+ * design brief mentions, which does not match anything drop_fruit() actually passes (verified against
+ * its source) and appears to be a transcription slip in that brief, not a real vanilla behavior.
+ * DELIBERATELY never calls drop_fruit()/bg_item_tree_fruit_drop() -- only fruit_set() directly -- so it
+ * can never reach drop_fruit()'s own trailing mFI_SetFG_common(dst_tree_item, ...) tree-conversion
+ * write. Under host authority that conversion write belongs solely to the host's own TREE_SHAKE commit
+ * path (pcnetgame_host_commit_tree_shake(), pc_net_game.c) -- never to this helper, which runs
+ * identically and unconditionally on every role (host AND every client) purely for the bee actor's own
+ * cosmetic honeycomb-drop animation. fruit_set(HONEYCOMB, ...) itself already writes nothing to the
+ * field for HONEYCOMB regardless (see fruit_set()'s own `drop.fg_item != HONEYCOMB` guard around its
+ * mFI_SetFG_common(RSV_NO, ...) call) -- the only thing this helper must avoid relative to vanilla's
+ * own TREE_BEES branch is that trailing drop_fruit() conversion write, which it structurally cannot
+ * reach.
+ * Returns 1 and a valid *out_drop_pos (x,z >= 0) on success; 0 with the -1 sentinel pos on transient
+ * bee-actor-allocation failure, exactly like bg_item_tree_fruit_drop()'s own TREE_BEES branch's own
+ * wait_pos retry convention -- the caller (Check_BirthBee_common()) already retries via its existing
+ * bee_spawn_timer/bee_counter loop exactly as it does for the real drop.
+ * Defined here (rather than in the shared bg_item_common.c_inc, which is #include'd into four separate
+ * translation units) so it compiles into exactly one object file despite needing external linkage --
+ * see bg_item_common.c_inc's own note at the removed definition site for why. */
+int pc_tree_birth_bee_visual(int ut_x, int ut_z, xyz_t* out_drop_pos) {
+    ACTOR* actor;
+    static xyz_t wait_pos = { -1.0f, -1.0f, -1.0f };
+    GAME_PLAY* play = (GAME_PLAY*)gamePT;
+
+    actor = Actor_info_make_actor(&play->actor_info, (GAME*)play, mAc_PROFILE_BEE, wait_pos.x, wait_pos.y,
+                                  wait_pos.z, 0, 0, 0, play->block_table.block_x, play->block_table.block_z, -1,
+                                  EMPTY_NO, 0, -1, -1);
+    if (actor != NULL) {
+        fruit_set(HONEYCOMB, ut_x, ut_z, 1, 0, out_drop_pos, actor);
+        if (out_drop_pos->x == -1.0f && out_drop_pos->y == -1.0f && out_drop_pos->z == -1.0f) {
+            Actor_delete(actor);
+            return 0;
+        }
+        {
+            /* pc_bee_sync.h: report this shaker's bee to the other players in the scene (presentation only; inert in single player) */
+            extern void pc_bee_sync_local_spawn(void* actor, float x, float y, float z);
+            pc_bee_sync_local_spawn(actor, out_drop_pos->x, out_drop_pos->y, out_drop_pos->z);
+        }
+        return 1;
+    }
+    xyz_t_move(out_drop_pos, &wait_pos);
+    return 0;
+}
+#endif
+
+#ifdef TARGET_PC
+/* Multiplayer, PRESENTATION ONLY (PC_NETGAME_MSG_TREE_DROP receiver): the falling-item animation of one shaken-tree drop, with flag 0x4 set so the
+ * landing NEVER calls mFI_SetFG_common() (and entry never writes RSV_NO): the authoritative tile is only ever written by the host / tile sync.
+ * Mirrors fruit_set()'s normal-drop arc (same start offsets / speeds); the item actor simply disappears after its bounce. Returns TRUE if spawned. */
+int pc_bg_item_present_tree_drop(mActor_name_t fg_item, int tree_ut_x, int tree_ut_z, int drop_ut_x, int drop_ut_z, int index) {
+    static const xyz_t pos_part[3] = { { -22.5f, 65.0f, 17.5f }, { 22.5f, 72.0f, 12.5f }, { -2.5f, 97.5f, 7.5f } };
+    bg_item_drop_c drop;
+    xyz_t tree_wpos, drop_pos, fruit_pos;
+    f32 dist_xz;
+
+    if (bIT_CLIP == NULL || bIT_CLIP->bg_item_common_p == NULL || fg_item == EMPTY_NO || fg_item == HONEYCOMB) {
+        return FALSE;
+    }
+    if (index < 0 || index > 2) {
+        index = 0;
+    }
+    mFI_UtNum2CenterWpos(&tree_wpos, tree_ut_x, tree_ut_z);
+    tree_wpos.y = mCoBG_GetBgY_OnlyCenter_FromWpos2(tree_wpos, -1.0f);
+    mFI_UtNum2CenterWpos(&drop_pos, drop_ut_x, drop_ut_z);
+    drop_pos.y = mCoBG_GetBgY_OnlyCenter_FromWpos2(drop_pos, -1.0f);
+    xyz_t_add(&pos_part[index], &tree_wpos, &fruit_pos);
+
+    bzero(&drop, sizeof(drop));
+    drop.actorx_p = NULL;
+    drop.fg_item = fg_item;
+    xyz_t_move(&drop.position, &fruit_pos);
+    xyz_t_move(&drop.target_position, &drop_pos);
+    drop.flags = (ITEM_IS_FTR(fg_item) ? 0x200 : 0x100) | 0x4; /* 0x4: NEVER write the tile on landing */
+    drop.layer = 0;
+    drop._7C = 0.25f;
+    if (drop.flags & 0x200) {
+        drop._8A = 1;
+        drop.drop_speed = 26;
+        drop.acceleration_y = 0.15f;
+        drop._6E = 0;
+    } else {
+        drop.drop_speed = 14 + index * 4;
+        drop._8A = 1 + index * 4;
+        drop.acceleration_y = -1.2f;
+        drop._6E = 1;
+    }
+    drop.wait_counter = 0;
+    dist_xz = search_position_distanceXZ(&drop.target_position, &drop.position);
+    func_calc_spec_drop_time(dist_xz, drop.target_position.y - drop.position.y, drop.drop_speed, drop.acceleration_y,
+                             &drop.velocity_xz, &drop.velocity_y);
+    {
+        extern int g_pc_verbose;
+        const int spawned = bIT_actor_drop_entry_main(&bIT_CLIP->bg_item_common_p->fruit_drop_info, &drop) ? TRUE : FALSE;
+        if (g_pc_verbose) {
+            printf("[NET][TREE] tree drop present item 0x%04X tree(%d,%d) drop(%d,%d) idx %d spawned=%d\n", (unsigned)fg_item, tree_ut_x, tree_ut_z, drop_ut_x, drop_ut_z, index, spawned);
+        }
+        return spawned;
+    }
+}
+#endif
+
 extern u16 obj_g_hole_pal[];
 extern u16 obj_b_hole_pal[];
 

@@ -94,6 +94,11 @@ extern void mMmd_SetInsect(int insect_no);
 extern void mMmd_SetFish(int fish_no);
 extern int mMmd_GetDisplayInfo(mActor_name_t item);
 extern int mMmd_RequestMuseumDisplay(mActor_name_t item);
+#ifdef TARGET_PC
+extern int mMmd_PC_RequestMuseumDisplayDonor(mActor_name_t item, int donor); /* host-only MUSEUM_DONATE commit (pc_net_game.c) */
+extern int mMmd_PC_ExhibitDonor(int exhibit);               /* worker B: nibble of exhibit 0..119 (fossil, art, insect, fish), -1 = none */
+extern int mMmd_PC_SetExhibitDonor(int exhibit, int donor); /* worker B: host-only (guest promotion re-attribution) */
+#endif
 extern void mMmd_MakeMuseumDisplayData();
 extern void mMmd_DeletePresentedByPlayer(u8 player_no);
 extern int mMmd_CountDisplayedFossil();

@@ -5,8 +5,15 @@ typedef signed   char          s8;
 typedef unsigned char          u8;
 typedef signed   short int     s16;
 typedef unsigned short int     u16;
+/* GameCube long is 32-bit. Windows LLP64 keeps that. Linux LP64 long is 64-bit, so s32/u32
+ * are int there or every file-format struct grows. */
+#if defined(__LP64__)
+typedef signed   int           s32;
+typedef unsigned int           u32;
+#else
 typedef signed   long          s32;
 typedef unsigned long          u32;
+#endif
 typedef signed   long long int s64;
 typedef unsigned long long int u64;
 

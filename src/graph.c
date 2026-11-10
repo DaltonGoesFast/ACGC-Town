@@ -30,8 +30,18 @@
 #include "pc_diag.h"
 #include "pc_platform.h"
 #include "pc_pause_menu.h"
+#include "pc_tool_wheel.h"
+#include "pc_emote_wheel.h"
+#include "pc_chat.h"
 #include "pc_profiler.h"
-extern int g_pc_running;
+/* Local extern matching the atomic_int definition in pc/src/pc_main.c (see pc_platform.h for the
+ * full rationale). This TARGET_PC-only block above already includes pc_platform.h (for other PC
+ * helpers used below), whose own extern already brings g_pc_running into scope with this exact
+ * type; this declaration is a harmless, identically-typed redeclaration kept for clarity at the
+ * actual read sites below and to match this project's established convention elsewhere of giving
+ * Nintendo-side files their own local extern for PC globals they read. */
+#include <stdatomic.h>
+extern atomic_int g_pc_running;
 #endif
 
 GRAPH graph_class;
@@ -192,8 +202,11 @@ static void graph_task_set00(GRAPH* this) {
             PC_DIAG(3, "graph_task_set00: emu64_taskstart(Gfx_list05=%p)\n", (void*)this->Gfx_list05);
 #ifdef TARGET_PC
             {
+                extern int g_pc_dedicated; /* --dedicated: the display list is never interpreted (nothing is drawn); see pc_dedicated.h */
                 Uint64 pc_prof_t = pc_profiler_begin_timer();
-                emu64_taskstart(this->Gfx_list05); /* work data */
+                if (!g_pc_dedicated) {
+                    emu64_taskstart(this->Gfx_list05); /* work data */
+                }
                 pc_profiler_add_time(PC_PROF_TIMER_EMU64, pc_prof_t);
             }
 #else
@@ -387,6 +400,10 @@ static void graph_main(GRAPH* this, GAME* game) {
     PC_DIAG(10, "graph_main: game_main returned, frame_counter=%d\n", this->frame_counter);
 #ifdef TARGET_PC
     pc_pause_menu_draw(game);
+    pc_tool_wheel_draw(game); /* PC radial tool menu (local UI only) */
+    pc_emote_wheel_draw(game); /* PC emote wheel (local UI; the emote itself is shown to the others, pc_emote.h) */
+    pc_chat_draw(game);       /* multiplayer chat: speech bubbles, the chat log, the input line (presentation only) */
+    pc_net_notice_draw(game); /* batch A (A3): CLIENT "not connected" notice (no-op for host / solo / READY / paused) */
 #endif
     GRAPH_SET_DOING_POINT(this, GAME_MAIN_FINISHED);
     if (ResetStatus < IRQ_RESET_DELAY) {

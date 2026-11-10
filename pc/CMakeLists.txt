@@ -15,13 +15,28 @@ option(PC_CONSOLE "Show console window (disables -mwindows, useful for debugging
 # =============================================================================
 # 32-bit enforcement (required: JSystem casts pointers to u32)
 # =============================================================================
+# EXPERIMENTAL: -DPC_ALLOW_64BIT=ON builds a 64-bit "low address space" process (see
+# 64BIT_MIGRATION_AUDIT.md, section 9). It does NOT link yet: ~2,150 data files still use static
+# _GBI_STATIC_PTR initializers and only a 19-file spike is compiled as C++. Default stays 32-bit only.
+option(PC_ALLOW_64BIT "EXPERIMENTAL: 64-bit low-address build (does not link yet)" OFF)
 if(CMAKE_SIZEOF_VOID_P EQUAL 8)
-    message(FATAL_ERROR
-        "This project MUST be built as 32-bit (pointer-to-u32 casts in JSystem).\n"
-        "  Windows/MSYS2: Use the MINGW32 shell (not MINGW64)\n"
-        "  Linux: Use a 32-bit toolchain, e.g.:\n"
-        "    cmake .. -DCMAKE_C_COMPILER=i686-linux-gnu-gcc -DCMAKE_CXX_COMPILER=i686-linux-gnu-g++\n"
-        "    OR: cmake .. -DCMAKE_TOOLCHAIN_FILE=../cmake/Toolchain-linux32.cmake")
+    if(PC_ALLOW_64BIT)
+        # "Low address space" strategy: a 64-bit process linked so image, heaps and stacks all live
+        # below 4 GB, keeping the decomp's (u32)pointer casts lossless. Applied to ac_pc only.
+        set(PC_LOW_ADDRESS_64 ON)
+        message(WARNING
+            "64-bit low-address build enabled via PC_ALLOW_64BIT (experimental). The decomp still casts host\n"
+            "pointers to u32 (JSystem, emu64, GBI, jaudio); this relies on all game memory being below 4 GB\n"
+            "(pc_lowaddr.c checks it at run time). See 64BIT_MIGRATION_AUDIT.md.")
+    else()
+        message(FATAL_ERROR
+            "This project MUST be built as 32-bit (pointer-to-u32 casts in JSystem).\n"
+            "  Windows/MSYS2: Use a 32-bit MinGW toolchain (MINGW32 is no longer shipped by MSYS2)\n"
+            "  Linux: Use a 32-bit toolchain, e.g.:\n"
+            "    cmake .. -DCMAKE_C_COMPILER=i686-linux-gnu-gcc -DCMAKE_CXX_COMPILER=i686-linux-gnu-g++\n"
+            "    OR: cmake .. -DCMAKE_TOOLCHAIN_FILE=../cmake/Toolchain-linux32.cmake\n"
+            "  Experimental 64-bit configure: -DPC_ALLOW_64BIT=ON (see 64BIT_MIGRATION_AUDIT.md)")
+    endif()
 endif()
 
 # Allow mixed C/C++ linkage
@@ -41,6 +56,9 @@ add_compile_definitions(
     PC_ENHANCEMENTS   # Optional visual improvements (MSAA, etc). Remove to get pure PC port.
     KEYBOARD_TYPING   # Physical keyboard typing in text editor. Remove for platforms without keyboards.
 )
+if(PC_LOW_ADDRESS_64)
+    add_compile_definitions(PC_LOW_ADDRESS_64)
+endif()
 
 # Common compiler flags (applied to all sources). GCC is required:
 # the decomp depends on -fno-strict-aliasing/-fwrapv semantics and the
@@ -267,13 +285,20 @@ list(FILTER GAME_CXX_SOURCES EXCLUDE REGEX ".*/jsyswrapper_main\\.cpp$")
 # =============================================================================
 set(PC_SOURCES
     ${CMAKE_CURRENT_SOURCE_DIR}/src/pc_main.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/pc_log.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/pc_dedicated.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/pc_ded_console.c
     ${CMAKE_CURRENT_SOURCE_DIR}/src/pc_gx.c
     ${CMAKE_CURRENT_SOURCE_DIR}/src/pc_gx_tev.c
     ${CMAKE_CURRENT_SOURCE_DIR}/src/pc_gx_texture.c
     ${CMAKE_CURRENT_SOURCE_DIR}/src/pc_gbi_runtime.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/pc_lowaddr.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/pc_lowaddr_selftest.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/pc_rng_domains_selftest.c
     ${CMAKE_CURRENT_SOURCE_DIR}/src/pc_os.c
     ${CMAKE_CURRENT_SOURCE_DIR}/src/pc_dvd.c
     ${CMAKE_CURRENT_SOURCE_DIR}/src/pc_pad.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/pc_touch.c
     ${CMAKE_CURRENT_SOURCE_DIR}/src/pc_typing.c
     ${DECOMP_ROOT}/src/static/dolphin/pad/Padclamp.c
     ${CMAKE_CURRENT_SOURCE_DIR}/src/pc_card.c
@@ -284,11 +309,28 @@ set(PC_SOURCES
     ${CMAKE_CURRENT_SOURCE_DIR}/src/pc_mtx.c
     ${CMAKE_CURRENT_SOURCE_DIR}/src/pc_m_card.c
     ${CMAKE_CURRENT_SOURCE_DIR}/src/pc_save_bswap.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/pc_mp_records.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/pc_mp_guests.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/pc_town_cache.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/pc_server.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/pc_player_preview.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/pc_town_sanitize.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/pc_guest_profile.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/pc_character.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/pc_mp_membership.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/pc_mp_members.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/pc_session.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/pc_servers.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/pc_relaunch.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/pc_play_online_menu.c
     ${CMAKE_CURRENT_SOURCE_DIR}/src/pc_model_viewer.c
     ${CMAKE_CURRENT_SOURCE_DIR}/src/pc_texture_pack.c
     ${CMAKE_CURRENT_SOURCE_DIR}/src/pc_settings.c
     ${CMAKE_CURRENT_SOURCE_DIR}/src/pc_profiler.c
     ${CMAKE_CURRENT_SOURCE_DIR}/src/pc_pause_menu.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/pc_tool_wheel.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/pc_emote.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/pc_emote_wheel.c
     ${CMAKE_CURRENT_SOURCE_DIR}/src/pc_settings_menu.c
     ${CMAKE_CURRENT_SOURCE_DIR}/src/pc_menu_util.c
     ${CMAKE_CURRENT_SOURCE_DIR}/src/pc_text_draw.c
@@ -298,6 +340,45 @@ set(PC_SOURCES
     ${CMAKE_CURRENT_SOURCE_DIR}/src/pc_stubs_cpp.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/src/pc_assets.c
     ${CMAKE_CURRENT_SOURCE_DIR}/src/pc_disc.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/pc_net.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/pc_xport.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/pc_peer_table.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/pc_guest_admit.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/pc_interest.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/pc_roster.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/pc_puppet_pool.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/pc_keytab.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/pc_tabfile.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/pc_dayclaims.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/pc_day_roll.c      # day rollover on a long-running host (pure logic)
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/pc_day_roll_host.c # day rollover: host integration (reload, play_init hook, console)
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/pc_dresser_store.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/pc_museum_donors.c # worker B: museum_donors.dat (guest donor attribution)
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/pc_evnpc_shared.c # worker E: shared event NPC claims (pure logic)
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/pc_outdoor_furniture.c # outdoor furniture C1 (pure logic: markers, sidecar, message 98 / service 10 shapes)
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/pc_ops.c          # the host's operator list ops.ini (pure logic)
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/pc_roommates.c    # roommates / move-in: roommates.ini + message 104 shapes (pure logic)
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/pc_room_dlg.c     # roommates / move-in: the gyroid's move-in rows + its menu patch (pure)
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/pc_room_ui.c      # roommates / move-in: the move-in dialogue inside the vanilla gyroid conversation (game side)
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/pc_ofurn_draw.c   # outdoor furniture C1: renderer + collision + A / B seams (game side)
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/pc_chat.c         # multiplayer text chat (pure logic: charset, wrap, rate, store, mutes.ini)
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/pc_chat_ui.c      # multiplayer text chat: input line, bubbles, chat log (game side)
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/pc_dresser_ui.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/pc_dresser_layout.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/pc_dresser_items.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/pc_sell_logic.c   # Nook bulk sell basket (pure logic: the shared sell predicate / values / staging)
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/pc_sell_ui.c      # Nook bulk sell basket: screen state + Nook seam helpers (game side)
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/pc_mp_guest_store.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/pc_net_game.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/pc_nook_house.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/pc_remote_player.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/pc_bee_sync.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/pc_ball_authority.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/pc_pvp_authority.c # player-vs-player tool hits (pure logic)
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/pc_action_ext.c # worker P2: puppet ACTION_EXT (msg 96) sender detector / receiver store (pure logic)
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/pc_fishing_view.c # worker P3: BOBBER_VIEW relay / view (pure logic)
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/pc_field_authority.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/pc_wildlife_authority.c
 )
 
 # =============================================================================
@@ -383,6 +464,56 @@ set_source_files_properties(${GAME_C_SOURCES} ${GAME_CXX_SOURCES}
     PROPERTIES COMPILE_OPTIONS "${DECOMP_WARN_FLAGS}"
 )
 
+# GBI static pointers (PC_LOW_ADDRESS_64 only): every file under src/data/** and src/static/bootdata/** is compiled as C++ so that
+# static (unsigned int)(uintptr_t)&sym initializers become startup initialization instead of being
+# rejected by GCC/x64 ("initializer element is not constant"). The data files themselves are unchanged.
+# "this" is renamed because decomp C headers use it as a parameter name. Gameplay/logic files stay C:
+# their static Gfx tables live in src/data/pc_split/*.c (empty translation units in a 32-bit build).
+if(PC_LOW_ADDRESS_64)
+    # C++ mangles function names, but the asset loaders these files define (_pc_load_*, called from the C file
+    # pc_assets.c) and the loader API they call must keep C linkage. The loader names are already listed as
+    # "extern void _pc_load_...(void);" in pc_assets.c; turn them into an extern "C" header that is force-included
+    # into the C++-compiled data files only (a later plain redeclaration/definition inherits C linkage).
+    file(STRINGS "${CMAKE_CURRENT_SOURCE_DIR}/src/pc_assets.c" PC_LOADER_DECLS
+         REGEX "^extern void _pc_load_[A-Za-z0-9_]+[(]void[)];")
+    set(PC_CXX_LINKAGE_CONTENT "/* generated by CMake: C linkage for symbols shared between C++-compiled data files and C code */
+extern \"C\" {
+")
+    foreach(decl IN LISTS PC_LOADER_DECLS)
+        string(REPLACE "extern " "" decl "${decl}")
+        string(APPEND PC_CXX_LINKAGE_CONTENT "${decl}
+")
+    endforeach()
+    string(APPEND PC_CXX_LINKAGE_CONTENT "void pc_load_asset(const char*, void*, unsigned int, unsigned int, int, int);
+")
+    string(APPEND PC_CXX_LINKAGE_CONTENT "void pc_assets_pal_n64_to_gc(unsigned short*, int);
+}
+")
+    set(PC_CXX_LINKAGE_HEADER "${CMAKE_BINARY_DIR}/pc_cxx_data_linkage.h")
+    file(GENERATE OUTPUT "${PC_CXX_LINKAGE_HEADER}" CONTENT "${PC_CXX_LINKAGE_CONTENT}")
+    list(LENGTH PC_LOADER_DECLS PC_LOADER_COUNT)
+    message(STATUS "C++ data files: C linkage for ${PC_LOADER_COUNT} asset loaders")
+
+    foreach(data_src IN LISTS GAME_C_SOURCES)
+        if(data_src MATCHES "/src/(data|static/bootdata)/")
+            set_source_files_properties("${data_src}" PROPERTIES
+                LANGUAGE CXX
+                COMPILE_DEFINITIONS "this=this_arg")
+            set_property(SOURCE "${data_src}" APPEND PROPERTY COMPILE_OPTIONS "-include" "${PC_CXX_LINKAGE_HEADER}")
+        endif()
+    endforeach()
+
+    # jaudio file-format structs (include/jaudio_NES/bx.h, heapctrl.h) keep GameCube-sized 32-bit address fields
+    # (JA_FPTR -> PcLowPtr<T>, a C++ type). The translation units that dereference those fields must therefore be C++;
+    # their functions are declared extern "C" in the jaudio headers, so linkage to the C callers is unchanged.
+    foreach(ja_name bankread waveread bankdrv connect oneshot noteon driverinterface jamosc heapctrl
+                    channel driver memory system track)
+        set_source_files_properties("${DECOMP_ROOT}/src/static/jaudio_NES/internal/${ja_name}.c" PROPERTIES
+            LANGUAGE CXX
+            COMPILE_DEFINITIONS "this=this_arg")
+    endforeach()
+endif()
+
 # PC port code: enable warnings to catch bugs in code we control
 set(PC_C_SOURCES ${PC_SOURCES})
 list(FILTER PC_C_SOURCES EXCLUDE REGEX "\\.cpp$")
@@ -408,6 +539,36 @@ endif()
 # =============================================================================
 # Build executable
 # =============================================================================
+# TEST HOOKS (guest -> resident lifecycle hardening). The hook flags / env switches that inject state (--house-buy-test and --nook-test raise the LOCAL wallet,
+# AC_RELAUNCH_DRYRUN, --house-test-host-edit, --mail-test-*, --txn-fault, --promote-fault, AC_TOWN_NO_MSGBOX) are compiled in ONLY when PC_TEST_HOOKS is ON (the default for the
+# development build, so the test suites keep working) AND even then each one needs the runtime env AC_TEST_HOOKS=1. RELEASE BUILDS MUST CONFIGURE -DPC_TEST_HOOKS=OFF.
+# Scoped to the few translation units that contain hooks (no full rebuild when toggled).
+option(PC_TEST_HOOKS "Compile the test-only hook flags (dev builds; configure OFF for release builds)" ON)
+if(PC_TEST_HOOKS)
+    set_source_files_properties(
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/pc_main.c
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/pc_net_game.c
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/pc_net.c
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/pc_m_card.c
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/pc_relaunch.c
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/pc_nook_house.c
+        ${DECOMP_ROOT}/src/game/m_choice.c
+        ${DECOMP_ROOT}/src/actor/ac_my_room.c # dresser storage UI-drive hook (AC_TEST_DRESSER_UI)
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/pc_day_roll_host.c # day rollover: AC_TEST_DAY_ROLL_AT / console `day advance`
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/pc_sell_ui.c # Nook bulk sell basket: AC_TEST_SELL_BASKET (real-game basket test)
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/pc_emote_wheel.c # emote wheel: AC_TEST_EMOTE_SCRIPT (real-game emote test)
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/pc_room_ui.c # roommates: AC_TEST_ROOM_UI (the gyroid's choice windows answered like a player in the real-game test)
+        PROPERTIES COMPILE_DEFINITIONS PC_NET_TEST_HOOKS)
+endif()
+
+# Dresser storage (docs/dresser-storage-redesign-plan.md 6x): the HOST feature now defaults to ON in every build (27 host-side slots per dresser, grab/move,
+# movable occupied dressers). Host env AC_MP_DRESSER_STORAGE=0 disables it; configure with -DPC_DRESSER_STORAGE_DEFAULT_ON=OFF for an opt-in build.
+# Appended to the ONE file that reads the switch (keeps PC_NET_TEST_HOOKS).
+option(PC_DRESSER_STORAGE_DEFAULT_ON "dresser storage defaults to ON (env AC_MP_DRESSER_STORAGE=0 disables)" ON)
+if(PC_DRESSER_STORAGE_DEFAULT_ON)
+    set_property(SOURCE ${CMAKE_CURRENT_SOURCE_DIR}/src/pc_net_game.c APPEND PROPERTY COMPILE_DEFINITIONS PC_DRESSER_STORAGE_DEFAULT_ON=1)
+endif()
+
 add_executable(ac_pc
     ${PC_SOURCES}
     ${FIXNES_SOURCES}
@@ -425,7 +586,7 @@ else()
 endif()
 
 if(WIN32)
-    target_link_libraries(ac_pc opengl32 winmm imm32 version setupapi)
+    target_link_libraries(ac_pc opengl32 winmm imm32 version setupapi ws2_32)
 else()
     find_package(OpenGL REQUIRED)
     target_link_libraries(ac_pc OpenGL::GL dl pthread m)
@@ -435,6 +596,16 @@ set_target_properties(ac_pc PROPERTIES
     OUTPUT_NAME "AnimalCrossing"
     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
 )
+
+# Low-address 64-bit: keep the image, heaps and stacks below 4 GB (verified with a test program):
+# a low --image-base is required, plus EITHER --disable-dynamicbase (also fixes the image address)
+# OR --disable-high-entropy-va; with ASLR off the HEVA flag is redundant but harmless. ac_pc only, not glad/SDL2.
+if(PC_LOW_ADDRESS_64)
+    target_link_options(ac_pc PRIVATE
+        -Wl,--image-base=0x400000
+        -Wl,--disable-dynamicbase
+        -Wl,--disable-high-entropy-va)
+endif()
 
 # Copy shader files to output directory (loaded at runtime, with embedded fallback)
 add_custom_command(TARGET ac_pc POST_BUILD
@@ -488,6 +659,23 @@ endif()
 # =============================================================================
 # Install rules (cmake --install . --prefix <dest>)
 # =============================================================================
+# Datagram transport self-test (UDP + WebSocket). No SDL, no disc image, no game code.
+add_executable(ac_xport_selftest
+    ${CMAKE_CURRENT_SOURCE_DIR}/tools/xport_selftest.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/pc_xport.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/pc_net.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/pc_peer_table.c
+)
+target_include_directories(ac_xport_selftest PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+if(WIN32)
+    target_link_libraries(ac_xport_selftest PRIVATE ws2_32)
+else()
+    target_link_libraries(ac_xport_selftest PRIVATE pthread)
+endif()
+set_target_properties(ac_xport_selftest PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
+)
+
 install(TARGETS ac_pc RUNTIME DESTINATION bin)
 install(DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/shaders/"
     DESTINATION bin/shaders

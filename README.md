@@ -28,8 +28,9 @@ The game reads all assets directly from the disc image at startup. No extraction
 
 - **Host:** run `ACLauncher.exe --host` (UDP port 7777, or `--host <port>`).
 - **Join:** on the title screen choose *Play Online* and add the host's address and port, or run `ACLauncher.exe --connect <ip>[:port]`.
-- **Dedicated server:** edit `server_config.ini`, then double-click `Start Server.bat`. The server opens its own console (type `help`).
-- The host needs to allow inbound UDP on its port (firewall and, over the internet, a router port forward). Everyone should run the same version.
+- **Dedicated server (Windows):** edit `server_config.ini`, then double-click `Start Server.bat`. The server opens its own console (type `help`).
+- **Dedicated server (Linux):** see [Linux dedicated server](#linux-dedicated-server) below. The process is headless (no window, no OpenGL, no audio device). It listens on UDP and on a WebSocket port so a later browser client can use the same protocol.
+- The host needs to allow inbound UDP on its port, and TCP on the WebSocket port (firewall and, over the internet, a router port forward). Everyone should run the same version.
 - Players join as **residents** (their own house and character) or as **guests** (no house; they can buy a house from Nook).
 
 What the multiplayer includes: a host-run world (items, digging, planting, shops, events), other players shown walking, fishing, sitting and more, shared villagers and wildlife, chat, emotes, dresser storage, outdoor furniture, guest mail and museum donations, and a server console with operator and moderation commands. See the release notes for what each version added.
@@ -77,6 +78,60 @@ pacman -S mingw-w64-ucrt-x86_64-gcc mingw-w64-ucrt-x86_64-cmake mingw-w64-ucrt-x
 
 More details are in [pc/DOCUMENTATION.md](https://github.com/vsimochi/ACGC-PC-Multiplayer/blob/multiplayer/pc/DOCUMENTATION.md).
 
+## Linux dedicated server
+
+The dedicated server is the same `AnimalCrossing` binary with `--dedicated`. On Linux that flag does not open a window, a GL context, or a sound device. The process still links SDL2 and OpenGL because the client is the same binary.
+
+Build it as 32-bit. The decomp's `long` is a 32-bit GameCube type, and i386 System V aligns `double` on 4 bytes unless `-malign-double` is set. That flag keeps `Save_t` on the layout the multiplayer code checks. A 64-bit Linux link is not the build to use yet: `u32`/`s32` are `unsigned int`/`int` under `__LP64__` (they stay `long` on Windows), but many headers still say `long` where they mean 32 bits.
+
+On Ubuntu 24.04, install `qemu-user` before the i386 SDL package. Without it, apt tries to remove `samba`, `nfs-kernel-server`, and `network-manager` while setting up the 32-bit libraries.
+
+```bash
+sudo dpkg --add-architecture i386
+sudo apt install qemu-user
+sudo apt install build-essential gcc-multilib g++-multilib cmake libsdl2-dev:i386 libgl1-mesa-dev:i386
+export PKG_CONFIG_PATH=/usr/lib/i386-linux-gnu/pkgconfig
+export PKG_CONFIG_LIBDIR=/usr/lib/i386-linux-gnu/pkgconfig
+cmake -S pc -B pc/build32 \
+  -DCMAKE_C_COMPILER=gcc -DCMAKE_CXX_COMPILER=g++ \
+  -DCMAKE_C_FLAGS="-m32 -malign-double" \
+  -DCMAKE_CXX_FLAGS="-m32 -malign-double" \
+  -DCMAKE_EXE_LINKER_FLAGS="-m32" \
+  -DPC_TEST_HOOKS=OFF
+cmake --build pc/build32 -j
+```
+
+The transport self-test does not need a disc image. It checks the WebSocket accept string from RFC 6455, a binary-frame round trip, and an ACNP reliable ping/ack over both UDP and WebSocket:
+
+```bash
+cmake --build pc/build32 --target ac_xport_selftest -j
+./pc/build32/bin/ac_xport_selftest
+```
+
+Place your own USA GAFE01 disc image in `rom/` next to the binary (`pc/build32/bin/rom/`). Do not commit it. Then:
+
+```bash
+cd pc/build32/bin
+cp ../../../pc/server/server_config.ini ../../../pc/server/start-server.sh .
+chmod +x start-server.sh
+./start-server.sh ./AnimalCrossing
+```
+
+Or without the script:
+
+```bash
+./AnimalCrossing --host 7777 --dedicated --ws-port 7778
+```
+
+- UDP `7777` is the native client port. Joining is `./AnimalCrossing --connect <ip>:7777 --town-fetch --online-ui`. `--connect` turns `--town-fetch` on by itself (`AC_NO_AUTO_TOWN_FETCH=1` leaves it off). Without a town fetch the guest reads an empty local save and fails with `no valid town save is loaded`. `--online-ui` is the failure dialog (Retry / saved copy / Quit).
+- A second window on the same PC must not share `save/mp/guest.ini` and `save/mp/guest_token.dat`. Give each one `--guest-profile NAME` or `AC_GUEST_PROFILE=NAME` (files `save/mp/guest_<name>.ini` and `save/mp/guest_token_<name>.dat`). One profile must not run in two processes.
+- TCP `7778` is the WebSocket port. Each binary frame is one ACNP datagram, the same bytes as a UDP packet. `ws_port = 0` in `server_config.ini` turns it off.
+- First launch creates `servers/default/` and, once a disc is present, asks for a town name on stdin (1–8 characters) if the town file is missing. Later launches load `servers/default/town/`.
+- Console: `help`, `status`, `players`, `kick`, `promote`, `save`, `stop`. Ctrl+C asks the game loop to stop. Under systemd, stdin is already closed. The same commands go to `servers/default/console.fifo` (mode 0600), for example `echo stop > servers/default/console.fifo`.
+- Without a disc image the process creates the server directory, binds UDP and WebSocket, prints that the ROM is missing, and exits 1. It does not invent a town.
+
+The plan for Android, the browser client, and touch controls is [docs/ROADMAP.md](docs/ROADMAP.md).
+
 ## Controls
 
 Keyboard bindings are customizable in the game (Esc menu > Settings > Controls > Keybindings) or via `keybindings.ini` next to the executable. Mouse buttons (Mouse1/Mouse2/Mouse3) can also be assigned.
@@ -109,7 +164,8 @@ SDL2 game controllers are supported with automatic hotplug detection. Button map
 |------|-------------|
 | `--host [port]` | Host a game (default port 7777) |
 | `--connect <ip>[:port]` | Join a host directly |
-| `--dedicated` | Run a dedicated server (see `Start Server.bat`) |
+| `--dedicated` | Run a dedicated server (Windows: `Start Server.bat`; Linux: headless, see above) |
+| `--ws-port N` | Host: WebSocket TCP port for the same datagrams (default 7778 with `--dedicated`, `0` off) |
 | `--verbose` | Enable diagnostic logging |
 | `--no-framelimit` | Disable frame limiter (unlocked FPS) |
 | `--time HOUR` | Override in-game hour (0-23) |

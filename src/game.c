@@ -23,6 +23,11 @@ extern int g_pc_model_viewer;
 #include "GBA/gba.h"
 #include "m_vibctl.h"
 
+#ifdef TARGET_PC
+/* glibc's errno macro would rewrite the pad status field of the same name. */
+#undef errno
+#endif
+
 GAME* gamePT = NULL;
 
 static u16 last_button[MAXCONTROLLERS];

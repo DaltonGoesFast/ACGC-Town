@@ -4,6 +4,14 @@
 #include "m_malloc.h"
 #include "m_rcp.h"
 #include "sys_matrix.h"
+#ifdef TARGET_PC
+#include "m_scene.h"
+#include "m_play.h"
+#include "m_player_lib.h"
+#include "m_demo.h"
+#include "m_msg.h"
+#include <stdio.h>
+#endif
 
 enum {
     aSI_SHOP_TYPE_ZAKKA,
@@ -116,6 +124,9 @@ static void Shop_Indoor_Actor_ct(ACTOR* actorx, GAME* game);
 static void Shop_Indoor_Actor_dt(ACTOR* actorx, GAME* game);
 static void Shop_Indoor_Actor_move(ACTOR* actorx, GAME* game);
 static void Shop_Indoor_Actor_draw(ACTOR* actorx, GAME* game);
+#ifdef TARGET_PC
+static void aSI_pc_restock_eject_reset(void);
+#endif
 
 // clang-format off
 ACTOR_PROFILE Shop_Indoor_Profile = {
@@ -259,6 +270,9 @@ static void Shop_Indoor_Actor_ct(ACTOR* actorx, GAME* game) {
     aSI_GetShopIndoorBank(actorx, game);
     aSI_ShopIndoorCopy(actorx, game);
     aSI_SetClipProc(actorx, FALSE);
+#ifdef TARGET_PC
+    aSI_pc_restock_eject_reset(); /* a fresh shop room: no exit latched from an earlier visit */
+#endif
 }
 
 static void Shop_Indoor_Actor_dt(ACTOR* actorx, GAME* game) {
@@ -452,9 +466,100 @@ static void Shop_Indoor_Actor_draw(ACTOR* actorx, GAME* game) {
     aSI_DrawShopIndoor(actorx, game);
 }
 
-static void Shop_Indoor_Actor_move(ACTOR* actorx, GAME* game) {
-    // nothing
+#ifdef TARGET_PC
+/* Nook's manual restock: while the host says the shop is RESTOCKING every player inside is walked out through the shop's own exit data (the one the door wrote when this
+ * player came in: Common_Get(structure_exit_door_data), the same scene change a walk onto the exit tile makes). "Elegantly": half a second of grace, then as soon as the player
+ * is idle (not talking, no inventory / menu open).
+ * A restock seen while inside LATCHES the exit (aSI_pc_eject_pending): a player still talking to Nook when the 60 s restock ends is shown out once the talk is over (the floor
+ * display shows the old catalog), never in the middle of it. The forced exit of a busy player (a stuck state) applies only while the shop is STILL closed and only after
+ * aSI_PC_EJECT_HARD_CAP ms of waiting (far beyond the 60 s restock); a busy player is never forced out once the restock is over. Reset when a shop room is built.
+ * Frame-rate independence: the grace and the cap are WALL-CLOCK (pc_net_game_now_ms); they used to count rendered frames (18000 = 5 min only at 60 fps, 18 s on an
+ * uncapped client, which could force a player out in the middle of a Nook talk). */
+extern int pc_net_game_shop_restocking(void);
+extern u32 pc_net_game_now_ms(void);
+/* Multiplayer shop upgrade (pc_shop_upgrade.h): the announced 5-minute closure shows everyone out the same way (the announcing player once Nook's talk is over). */
+extern int pc_shop_upgrade_closed(void);
+#define aSI_PC_EJECT_HARD_CAP 300000 /* ms (5 min) */
+#define aSI_PC_EJECT_GRACE_MS 500    /* "half a second of grace" */
+static int aSI_pc_eject_wait = 0; /* ms since the latch was first seen outside a wipe */
+static u32 aSI_pc_eject_t0 = 0;   /* pc_net_game_now_ms() | 1 of that moment (0 = not started) */
+static u32 aSI_pc_eject_log_ms = 0;
+static int aSI_pc_eject_pending = 0;
+static void aSI_pc_restock_eject_reset(void) {
+    aSI_pc_eject_wait = 0;
+    aSI_pc_eject_t0 = 0;
+    aSI_pc_eject_log_ms = 0;
+    aSI_pc_eject_pending = 0;
 }
+static void aSI_pc_restock_eject(GAME* game) {
+    GAME_PLAY* play = (GAME_PLAY*)game;
+    const int restocking = pc_net_game_shop_restocking() || pc_shop_upgrade_closed(); /* closed for a restock OR for the upgrade */
+    int busy;
+
+    if (restocking) {
+        aSI_pc_eject_pending = 1;
+    }
+    if (!aSI_pc_eject_pending) {
+        aSI_pc_eject_wait = 0;
+        aSI_pc_eject_t0 = 0;
+        aSI_pc_eject_log_ms = 0;
+        return;
+    }
+    if (play->fb_wipe_mode != WIPE_MODE_NONE) {
+        return;
+    }
+    {
+        const u32 now = pc_net_game_now_ms();
+        if (aSI_pc_eject_t0 == 0) {
+            aSI_pc_eject_t0 = now | 1u;
+        }
+        aSI_pc_eject_wait = (int)(s32)(now - aSI_pc_eject_t0); /* signed: t0 = now | 1 may be 1 ms ahead */
+        if (aSI_pc_eject_wait < 0) {
+            aSI_pc_eject_wait = 0;
+        }
+    }
+    if (aSI_pc_eject_wait < aSI_PC_EJECT_GRACE_MS) {
+        return;
+    }
+    /* never cut a Nook conversation: a visible message window (any talk / choice / purchase dialogue), a demo or a non-idle player holds the exit */
+    busy = mPlib_able_submenu_type1(game) == FALSE || mDemo_CheckDemo() != FALSE || mMsg_Check_MainHide(mMsg_Get_base_window_p()) == FALSE;
+    if (busy && (!restocking || aSI_pc_eject_wait < aSI_PC_EJECT_HARD_CAP)) {
+        /* log only: the first held frame of a latch, then every 5 s with --verbose (g_pc_verbose precedent) */
+        extern int g_pc_verbose;
+        if (aSI_pc_eject_log_ms == 0 || (g_pc_verbose && (s32)(pc_net_game_now_ms() - aSI_pc_eject_log_ms) >= 5000)) {
+            aSI_pc_eject_log_ms = pc_net_game_now_ms() | 1u;
+            printf("[NET][RESTOCK] exit held: demo=%d type=%d able=%d msg_hidden=%d restocking=%d waited=%d ms\n", (int)mDemo_CheckDemo(), (int)mDemo_CheckDemoType(),
+                   (int)mPlib_able_submenu_type1(game), (int)mMsg_Check_MainHide(mMsg_Get_base_window_p()), restocking, aSI_pc_eject_wait);
+        }
+        return;
+    }
+    if (Common_Get(structure_exit_door_data).next_scene_id == 0 || Common_Get(structure_exit_door_data).next_scene_id == play->scene_id) {
+        return; /* no valid way out was recorded (a door always writes it): never warp into scene 0; keep waiting */
+    }
+    if (goto_other_scene(play, Common_GetPointer(structure_exit_door_data), FALSE)) {
+        printf("[NET][RESTOCK] shop %s: the player was shown out (waited %d ms%s)\n",
+               !restocking ? "restocked while talking" : pc_shop_upgrade_closed() ? "closed for the upgrade" : "restocking", aSI_pc_eject_wait,
+               busy ? ", FORCED after the hard cap" : "");
+        aSI_pc_eject_pending = 0;
+    }
+    aSI_pc_eject_wait = 0;
+    aSI_pc_eject_t0 = 0;
+    aSI_pc_eject_log_ms = 0;
+}
+#endif
+
+static void Shop_Indoor_Actor_move(ACTOR* actorx, GAME* game) {
+#ifdef TARGET_PC
+    aSI_pc_restock_eject(game);
+#endif
+}
+
+#ifdef TARGET_PC
+/* Nook preview sync (presentation only): a LOCAL preview is reported to the other players in this shop (pc_net_game.c, inert in single player); a REMOTE one (or the nested calls
+ * of aSI_Change2Default) runs with aSI_pc_no_net set so it is never re-sent and plays no sound. */
+extern void pc_net_game_shop_preview_local(int kind, u16 item);
+static int aSI_pc_no_net = 0;
+#endif
 
 static int aSI_ChangeCarpet(mActor_name_t item) {
     if (Common_Get(clip).shop_indoor_clip != NULL) {
@@ -469,9 +574,17 @@ static int aSI_ChangeCarpet(mActor_name_t item) {
             aSI_CopyFloorTexture(actorx, shop_indoor->floor_idx, shop_indoor->floor_data_idx);
 
             if (aSI_se_mode == aSI_SE_MODE_NORMAL) {
+#ifdef TARGET_PC
+                if (!aSI_pc_no_net)
+#endif
                 sAdo_SysTrgStart(NA_SE_11B);
             }
 
+#ifdef TARGET_PC
+            if (!aSI_pc_no_net) {
+                pc_net_game_shop_preview_local(2, (u16)item);
+            }
+#endif
             return TRUE;
         }
     }
@@ -490,7 +603,14 @@ static int aSI_ChangeWall(mActor_name_t item) {
             shop_indoor->wall_idx = (mActor_name_t)item - ITM_WALL_START;
             shop_indoor->wall_data_idx = (wall_data_idx ^ 1) & 1;
             aSI_CopyWallTexture(actorx, shop_indoor->wall_idx, shop_indoor->wall_data_idx);
+#ifdef TARGET_PC
+            if (!aSI_pc_no_net) {
+                pc_net_game_shop_preview_local(1, (u16)item);
+                sAdo_SysTrgStart(NA_SE_11B);
+            }
+#else
             sAdo_SysTrgStart(NA_SE_11B);
+#endif
             return TRUE;
         }
     }
@@ -505,12 +625,47 @@ static void aSI_Change2Default(void) {
         SHOP_INDOOR_ACTOR* shop_indoor = (SHOP_INDOOR_ACTOR*)actorx;
         s16 shop_level = shop_indoor->shop_idx;
 
+#ifdef TARGET_PC
+        int pc_prev_no_net = aSI_pc_no_net;
+        aSI_pc_no_net = 1; /* the two nested changes are one 'default' preview, reported once below */
+#endif
         aSI_se_mode = aSI_SE_MODE_SILENT;
         aSI_ChangeWall(ITM_WALL_START + (mActor_name_t)aSI_wall_default_table[shop_level]);
         aSI_ChangeCarpet(ITM_CARPET_START + (mActor_name_t)aSI_floor_default_table[shop_level]);
         aSI_se_mode = aSI_SE_MODE_NORMAL;
+#ifdef TARGET_PC
+        aSI_pc_no_net = pc_prev_no_net;
+        if (!aSI_pc_no_net) {
+            pc_net_game_shop_preview_local(3, 0);
+        }
+#endif
     }
 }
+
+#ifdef TARGET_PC
+/* pc_net_game.c: another player's preview in the shop this process is inside (kind 1 wall, 2 carpet, 3 default). Returns 0 when no shop room is live. Never re-sent, no sound. */
+int aSI_pc_apply_remote_preview(int kind, u16 item) {
+    int ret = 0;
+
+    if (Common_Get(clip).shop_indoor_clip == NULL || Common_Get(clip).shop_indoor_clip->shop_indoor_actor == NULL) {
+        return 0;
+    }
+    aSI_pc_no_net = 1;
+    if (kind == 1) {
+        ret = aSI_ChangeWall((mActor_name_t)item);
+    } else if (kind == 2) {
+        ret = aSI_ChangeCarpet((mActor_name_t)item);
+    } else if (kind == 3) {
+        aSI_Change2Default();
+        ret = 1;
+    }
+    aSI_pc_no_net = 0;
+    printf("[NET][SHOP] preview apply kind=%d item=0x%04X ret=%d wall_idx=%d floor_idx=%d\n", kind, (unsigned)item, ret,
+           (int)((SHOP_INDOOR_ACTOR*)Common_Get(clip).shop_indoor_clip->shop_indoor_actor)->wall_idx,
+           (int)((SHOP_INDOOR_ACTOR*)Common_Get(clip).shop_indoor_clip->shop_indoor_actor)->floor_idx);
+    return ret;
+}
+#endif
 
 static void aSI_IndoorDmaAgain(void) {
     if (Common_Get(clip).shop_indoor_clip != NULL) {

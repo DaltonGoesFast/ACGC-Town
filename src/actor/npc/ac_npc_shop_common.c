@@ -1,3 +1,22 @@
+#ifdef TARGET_PC
+#include "pc_net_game.h" /* Batch G2/G3: pc_net_game_role() */
+#include "pc_nook_house.h" /* Guest Nook dialogue (M4): generated messages / choice strings */
+#include "pc_residence.h" /* PC_RESIDENCE_HOUSES (lifecycle hardening: the one place that knows the house count) */
+#include "pc_shop_upgrade.h" /* multiplayer shop upgrade: Nook's announcement of the 5-minute closure */
+#include "pc_house_upgrade.h" /* house upgrades via Nook for resident clients (worker C): kind-20 transactions instead of local homes[] / loan writes */
+#include "pc_sell_ui.h" /* Nook bulk sell basket: the sell menu opens the basket screen in a multiplayer session (client + listen host) */
+#include "pc_handover.h" /* hand-over animations: Nook's Work Mode hand-overs + another player's hand-over seen on this process's keeper */
+#include "pc_work_logic.h" /* Nook Work Mode v2: the Check job choices (pc_work_v2_row) */
+#include <string.h>
+/* Batch G2/G3: a network CLIENT's Private_c (wallet, loan, catalog orders) and homes[] are local copies that
+ * are never persisted or delivered by the host, so Nook transactions that only touch those (catalog order, house
+ * order/loan/statue, paint) would debit/commit with nothing to show for it. Role test (not READY-aware):
+ * the client role is set at boot, before any save loads, and clients never persist anyway. */
+#define aNSC_PC_IS_CLIENT() (pc_net_game_role() == PC_NETGAME_ROLE_CLIENT)
+#else
+#define aNSC_PC_IS_CLIENT() (0)
+#endif
+
 enum aNSC_action {
     aNSC_ACTION_EMPTY,
     aNSC_ACTION_SAY_HELLO_APPROACH,
@@ -687,6 +706,92 @@ static void aNSC_set_buy_sum_str(mActor_name_t item, u32 p2) {
     mMsg_Set_free_str(mMsg_Get_base_window_p(), 8, buff, 0x10);
 }
 
+#ifdef TARGET_PC
+/* SHOP KEEPER TARGET SYNC (pc_shop_keeper_target.h, pc_net_game_shop_keeper_target): in a multiplayer shop the keeper's IDLE actions (wait / turn /
+ * walk to the player's zone) follow the player of the shop the shared picker chooses (the nearest, with hysteresis; a talking one first) instead of
+ * this process' own player, so every game shows the same Nook. Only the angle, the zone, the distance and the safe-zone position those actions read
+ * are swapped; a talk demo with the local player, the sales, the hand-overs and every other action keep vanilla (the local player). Keyed by npc_id
+ * (Timmy and Tommy are two actors of one include). Kill switch: AC_MP_SHOP_NOOK_SYNC=0 / settings.ini shop_nook_sync = 0. */
+typedef struct {
+    mActor_name_t npc_id;
+    s16 on;
+    xyz_t pos;
+    f32 dist;
+} aNSC_pc_tgt_c;
+static aNSC_pc_tgt_c aNSC_pc_tgt[2];
+static ACTOR aNSC_pc_tgt_actor_dummy; /* only world.position is read by the safe-zone checks */
+
+static aNSC_pc_tgt_c* aNSC_pc_tgt_of(NPC_SHOP_COMMON_ACTOR* shop_common) {
+    mActor_name_t id = ((ACTOR*)shop_common)->npc_id;
+    int i;
+    for (i = 0; i < 2; i++) {
+        if (aNSC_pc_tgt[i].npc_id == id) {
+            return &aNSC_pc_tgt[i];
+        }
+    }
+    for (i = 0; i < 2; i++) {
+        if (aNSC_pc_tgt[i].npc_id == 0) {
+            break;
+        }
+    }
+    if (i >= 2) {
+        i = 0;
+    }
+    memset(&aNSC_pc_tgt[i], 0, sizeof(aNSC_pc_tgt[i]));
+    aNSC_pc_tgt[i].npc_id = id;
+    return &aNSC_pc_tgt[i];
+}
+
+static int aNSC_pc_idle_action(int action) {
+    return action == aNSC_ACTION_WAIT || action == aNSC_ACTION_0x3e_WAIT || action == aNSC_ACTION_WALK_PL_OTHER_ZONE || action == aNSC_ACTION_0x40_WAIT ||
+           action == aNSC_ACTION_0x41_WALK_PL_OTHER_ZONE || action == aNSC_ACTION_TURN;
+}
+
+/* once per frame, before the action (from aNSC_set_zone_data) */
+static void aNSC_pc_retarget(NPC_SHOP_COMMON_ACTOR* shop_common) {
+    ACTOR* actorx = (ACTOR*)shop_common;
+    aNSC_pc_tgt_c* t = aNSC_pc_tgt_of(shop_common);
+    int local_talk = mDemo_Get_talk_actor() == actorx || mDemo_Check(mDemo_TYPE_SPEAK, actorx) == TRUE || mDemo_Check(mDemo_TYPE_TALK, actorx) == TRUE;
+    int apply = !local_talk && aNSC_pc_idle_action(shop_common->action);
+    float x, y, z, d;
+
+    t->on = FALSE;
+    if (pc_net_game_shop_keeper_target(actorx, (int)(u16)actorx->npc_id, actorx->world.position.x, actorx->world.position.z,
+                                       (f32)gamePT->graph->dt_num_60fps_frames, local_talk, apply, &x, &y, &z, &d) && apply) {
+        t->on = TRUE;
+        t->pos.x = x;
+        t->pos.y = y;
+        t->pos.z = z;
+        t->dist = d;
+    }
+}
+
+static int aNSC_pc_tgt_on(NPC_SHOP_COMMON_ACTOR* shop_common) {
+    return aNSC_pc_tgt_of(shop_common)->on;
+}
+
+/* the distance the idle decision measures: the shared target's, else vanilla's local player */
+static f32 aNSC_pc_player_dist(NPC_SHOP_COMMON_ACTOR* shop_common) {
+    aNSC_pc_tgt_c* t = aNSC_pc_tgt_of(shop_common);
+    return t->on ? t->dist : shop_common->npc_class.actor_class.player_distance_xz;
+}
+
+/* the "player" the safe-zone checks read (world.position only) */
+static ACTOR* aNSC_pc_player_for_zone(NPC_SHOP_COMMON_ACTOR* shop_common, ACTOR* player) {
+    aNSC_pc_tgt_c* t = aNSC_pc_tgt_of(shop_common);
+    if (!t->on) {
+        return player;
+    }
+    aNSC_pc_tgt_actor_dummy.world.position = t->pos;
+    return &aNSC_pc_tgt_actor_dummy;
+}
+#define aNSC_PC_PLAYER_DIST(sc) aNSC_pc_player_dist(sc)
+#define aNSC_PC_ZONE_PLAYER(sc, pl) aNSC_pc_player_for_zone((sc), (pl))
+#else
+#define aNSC_PC_PLAYER_DIST(sc) ((sc)->npc_class.actor_class.player_distance_xz)
+#define aNSC_PC_ZONE_PLAYER(sc, pl) (pl)
+#endif
+
 #ifndef aNSC_MAMEDANUKI
 static int aNSC_decide_next_move_act(NPC_SHOP_COMMON_ACTOR* shop_common, GAME_PLAY* play) {
     int res;
@@ -698,14 +803,14 @@ static int aNSC_decide_next_move_act(NPC_SHOP_COMMON_ACTOR* shop_common, GAME_PL
         if (player == NULL) {
             return shop_common->action;
         }
-        if (aNSC_check_safe_zone(shop_common, player) == TRUE) {
+        if (aNSC_check_safe_zone(shop_common, aNSC_PC_ZONE_PLAYER(shop_common, player)) == TRUE) {
             return aNSC_ACTION_WAIT;
         } else {
-            if (shop_common->npc_class.actor_class.player_distance_xz < aNSC_PLAYER_DISTANCE ||
+            if (aNSC_PC_PLAYER_DIST(shop_common) < aNSC_PLAYER_DISTANCE ||
                 shop_common->talk_start_tim == 0) {
                 return aNSC_ACTION_WAIT;
             } else {
-                f32 player_distance_xz = shop_common->npc_class.actor_class.player_distance_xz;
+                f32 player_distance_xz = aNSC_PC_PLAYER_DIST(shop_common);
                 if (shop_common->player_zone != shop_common->zone) {
                     if (shop_common->action != aNSC_ACTION_WALK_PL_OTHER_ZONE &&
                         shop_common->action != aNSC_ACTION_0x41_WALK_PL_OTHER_ZONE) {
@@ -743,10 +848,10 @@ static int aNSC_decide_next_move_act(NPC_SHOP_COMMON_ACTOR* shop_common, GAME_PL
                (ClObj_DID_COLLIDE(shop_common->npc_class.collision.pipe.collision_obj) ||
                 shop_common->action == aNSC_ACTION_WAIT)) {
         res = aNSC_ACTION_WAIT;
-    } else if (player->world.position.z < 120.0f && (shop_common->zone == 2 || shop_common->zone == 3)) {
+    } else if (aNSC_PC_ZONE_PLAYER(shop_common, player)->world.position.z < 120.0f && (shop_common->zone == 2 || shop_common->zone == 3)) {
         res = aNSC_ACTION_WAIT;
     } else {
-        f32 dist = shop_common->npc_class.actor_class.player_distance_xz;
+        f32 dist = aNSC_PC_PLAYER_DIST(shop_common);
 
         if (dist < 80.0f || shop_common->talk_start_tim == 0) {
             res = aNSC_ACTION_WAIT;
@@ -783,6 +888,12 @@ static void aNSC_set_zone_data(NPC_SHOP_COMMON_ACTOR* shop_common, ACTOR* a2) {
     if (a2 != NULL) {
         shop_common->player_zone = aNSC_get_zone(a2->world.position);
     }
+#ifdef TARGET_PC
+    aNSC_pc_retarget(shop_common); /* SHOP KEEPER TARGET SYNC: the zone of the shared target */
+    if (aNSC_pc_tgt_on(shop_common)) {
+        shop_common->player_zone = aNSC_get_zone(aNSC_pc_tgt_of(shop_common)->pos);
+    }
+#endif
 }
 #else
 static void aNSC_set_zone_data(NPC_SHOP_COMMON_ACTOR* shop_common, ACTOR* a2) {
@@ -792,11 +903,24 @@ static void aNSC_set_zone_data(NPC_SHOP_COMMON_ACTOR* shop_common, ACTOR* a2) {
     if (a2 != NULL) {
         shop_common->player_zone = aNSC_get_zone(shop_common, a2->world.position);
     }
+#ifdef TARGET_PC
+    aNSC_pc_retarget(shop_common); /* SHOP KEEPER TARGET SYNC: the zone of the shared target */
+    if (aNSC_pc_tgt_on(shop_common)) {
+        shop_common->player_zone = aNSC_get_zone(shop_common, aNSC_pc_tgt_of(shop_common)->pos);
+    }
+#endif
 }
 #endif
 
 static void aNSC_set_player_angl(NPC_SHOP_COMMON_ACTOR* shop_common) {
     shop_common->player_angle = shop_common->npc_class.actor_class.player_angle_y;
+#ifdef TARGET_PC
+    if (aNSC_pc_tgt_on(shop_common)) { /* SHOP KEEPER TARGET SYNC: turn toward the shared target */
+        xyz_t* p = &shop_common->npc_class.actor_class.world.position;
+        aNSC_pc_tgt_c* t = aNSC_pc_tgt_of(shop_common);
+        shop_common->player_angle = atans_table(t->pos.z - p->z, t->pos.x - p->x);
+    }
+#endif
 }
 
 static int aNSC_money_check(u32 amount) {
@@ -1086,7 +1210,7 @@ static void aNSC_set_talk_info_sell_item(ACTOR* actorx) {
     }
 
     if (item >= ITM_RED_PAINT && item <= ITM_BROWN_PAINT) {
-        if (mLd_PlayerManKindCheck() == FALSE) {
+        if (mLd_PlayerManKindCheck() == FALSE && !aNSC_PC_IS_CLIENT()) {
             msg_no = aNSC_MSG_SELL_PAINT;
         } else {
             msg_no = aNSC_MSG_SELL_PAINT_FOREIGN;
@@ -1140,7 +1264,7 @@ static void aNSC_message_ctrl_force_talk_start_normal_day(NPC_SHOP_COMMON_ACTOR*
                     next_act_idx = aNSC_ACTION_SHOW_ITEM_CHECK;
                     break;
                 default:
-                    if (ITEM_IS_PAINT(sell_item) && mLd_PlayerManKindCheck()) {
+                    if (ITEM_IS_PAINT(sell_item) && (mLd_PlayerManKindCheck() || aNSC_PC_IS_CLIENT())) {
                         next_act_idx = aNSC_ACTION_REQUEST_Q_END_WAIT;
                     }
                     break;
@@ -1343,7 +1467,7 @@ static int aNSC_message_ctrl(NPC_SHOP_COMMON_ACTOR* shop_common, GAME_PLAY* play
                                             break;
                                         default:
                                             if (item >= ITM_RED_PAINT && item <= ITM_BROWN_PAINT) {
-                                                if (mLd_PlayerManKindCheck() != FALSE) {
+                                                if (mLd_PlayerManKindCheck() != FALSE || aNSC_PC_IS_CLIENT()) {
                                                     action = aNSC_ACTION_REQUEST_Q_END_WAIT;
                                                 }
                                             }
@@ -1564,6 +1688,1179 @@ static int aNSC_buy_item_only_one(u32* bells, mActor_name_t itm, u8* p3, int sel
     return next;
 }
 
+#ifdef TARGET_PC
+/* ===== Town services milestone 2 (NOOK'S SHOP): the CLIENT purchase / sale seams =====
+ * On a network CLIENT the wallet, the pockets and Save_t.shop are never changed locally by a purchase or a sale: the vanilla mutations
+ * (aNSC_sell_answer0's pocket write, aNSC_sell_item_init's debit + mSP_PlusSales + mSP_ShopSaleReport, aNSC_buy_check's credit / exchange / sales
+ * accounting, aNSC_receive_check's disposal) are replaced by ONE host transaction each (TXN_COMMIT SHOP_BUY / SHOP_SELL, pc_net_game_ts_begin_shop_*
+ * + pc_net_game_ts_poll). While it is pending NOTHING changes locally and the dialogue waits in its current action; APPLIED continues the vanilla
+ * success dialogue (the pockets and wallet are already the host's post-image); a refusal takes an existing row. The sale value / price are computed
+ * by the HOST (this file only shows the player its own estimate). Deferred (still refused on a client): paint (house service), catalog orders,
+ * raffle tickets for purchases (never granted), stationery sales, bargain-day / raffle-day stock. */
+static int aNSC_pc_buy_wait;   /* 1 while a SHOP_BUY is in flight (aNSC_sell_answer0 polls it) */
+static int aNSC_pc_sell_wait;  /* 1 = a SHOP_SELL must still be begun, 2 = in flight (aNSC_buy_check / aNSC_receive_check poll it) */
+static u32 aNSC_pc_sell_mask;
+static int aNSC_pc_sell_primary;
+static mActor_name_t aNSC_pc_sell_item;
+static int aNSC_pc_sell_bags_before;
+
+/* MAP LINE: one-shot "this purchase just granted the town map" flag. Set at the grant (host: aNSC_pc_host_first_purchase_map_grant_impl; client: the host's APPLIED of a purchase
+ * that granted, pc_net_game_take_map_granted), consumed by aNSC_pc_map_chain() right after the thanks message of THAT purchase was selected: the message is then armed in
+ * pc_nook_house.c and gets one extra page when it is loaded. A purchase that did not grant never touches any of this. */
+extern int pc_net_game_take_map_granted(void);
+static int aNSC_pc_map_just_granted;
+static int aNSC_pc_map_flag_sets; /* how many times the flag was set in this process (test hook / log) */
+
+static void aNSC_pc_map_chain_msg(int msg_index) {
+    if (aNSC_pc_map_just_granted) {
+        aNSC_pc_map_just_granted = 0;
+        pc_nook_map_line_arm(msg_index);
+        printf("[NET][SHOP] nook dialogue: map line armed for thanks message 0x%04X (one-shot flag consumed)\n", msg_index);
+    }
+}
+
+#define aNSC_PC_ROW_REFUSED 11 /* aNSC_sell_answer0 row 11: a refused purchase (sold out / host refusal): the existing "cancel" text */
+
+static void aNSC_pc_reset_waits(void) {
+    aNSC_pc_buy_wait = 0;
+    aNSC_pc_sell_wait = 0;
+}
+
+/* One step of the purchase transaction. -1 = pending (nothing changed), else the aNSC_sell_answer0 row: 0 success, 3 not enough money,
+ * 4 pockets full, aNSC_PC_ROW_REFUSED. */
+static int aNSC_pc_buy_step(NPC_SHOP_COMMON_ACTOR* shop_common) {
+    mActor_name_t item = shop_common->sell_item;
+    int r, reason;
+    if (!aNSC_pc_buy_wait) {
+        int idx = mPr_GetPossessionItemIdx(Now_Private, EMPTY_NO);
+        int code;
+        if (idx == -1) {
+            return 4;
+        }
+        code = pc_net_game_shop_buy_stock_code((int)item); /* the stock code against the MIRRORED shop; -1 = not buyable (special-day stock, paint, sold out) */
+        if (code < 0) {
+            return aNSC_PC_ROW_REFUSED;
+        }
+        r = pc_net_game_ts_begin_shop_buy(idx, (int)item, code, (int)mSP_ItemNo2ItemPrice(item));
+        if (r < 0) {
+            return -1; /* another pocket transaction is unresolved: try again next frame */
+        }
+        if (r == 0) {
+            return aNSC_PC_ROW_REFUSED;
+        }
+        aNSC_pc_buy_wait = 1;
+        return -1;
+    }
+    r = pc_net_game_ts_poll();
+    if (r == PC_NETGAME_TS_OP_PENDING) {
+        return -1;
+    }
+    aNSC_pc_buy_wait = 0;
+    if (r == PC_NETGAME_TS_OP_APPLIED) {
+        if (pc_net_game_take_map_granted()) { /* this very purchase granted the town map (derived in pcnetgame_txn_apply_shop) */
+            aNSC_pc_map_just_granted = 1;
+            aNSC_pc_map_flag_sets++;
+        }
+        return 0;
+    }
+    reason = pc_net_game_ts_last_reject_reason();
+    if (reason == PC_NETGAME_TS_REJECT_NO_FUNDS) {
+        return 3;
+    }
+    if (reason == PC_NETGAME_TS_REJECT_NOT_AVAILABLE && CLIP(shop_design_clip) != NULL) {
+        /* the item was sold to somebody else first: take it off the floor display (client mode of the report: display only, no accounting) */
+        CLIP(shop_design_clip)->reportGoodsSale_proc(shop_common->ut_x, shop_common->ut_z);
+    }
+    return aNSC_PC_ROW_REFUSED;
+}
+
+/* The follow-up row of an APPLIED purchase: the vanilla special texts for tools / signboards. Furniture / clothes / wallpaper / carpet normally give
+ * a raffle ticket: that is deferred and never granted to a client, so they take the plain "thank you" row 0. */
+static int aNSC_pc_buy_success_row(mActor_name_t item) {
+    if (aNSC_check_item_with_ticket(item) == TRUE) {
+        return 0;
+    }
+    if (item == ITM_SIGNBOARD) {
+        return 0xa;
+    }
+    switch (item) {
+        case ITM_NET:
+            return 0x5;
+        case ITM_AXE:
+            return 0x6;
+        case ITM_SHOVEL:
+            return 0x7;
+        case ITM_ROD:
+            return 0x8;
+    }
+    return 0;
+}
+
+static int aNSC_pc_count_bags(void) {
+    int i, n = 0;
+    for (i = 0; i < mPr_POCKETS_SLOT_COUNT; i++) {
+        if (Now_Private->inventory.pockets[i] == ITM_MONEY_30000) {
+            n++;
+        }
+    }
+    return n;
+}
+
+/* Collects the slots of the sale exactly like vanilla's sale loops (several selected items = their slots; one item with `counter` copies = the
+ * first `counter` NORMAL-condition slots holding it; one item = its slot). 0 = nothing to sell. */
+static int aNSC_pc_sell_prepare(NPC_SHOP_COMMON_ACTOR* shop_common, GAME_PLAY* play) {
+    Submenu_Item_c* si = play->submenu.item_p;
+    u32 mask = 0;
+    int k, n = 0, primary = -1;
+    mActor_name_t item;
+    if (play->submenu.selected_item_num > 1) {
+        for (k = 0; k < (int)play->submenu.selected_item_num; k++) {
+            if (si[k].slot_no < mPr_POCKETS_SLOT_COUNT) {
+                mask |= 1u << si[k].slot_no;
+            }
+        }
+    } else if (shop_common->counter <= 1u) {
+        if (si->slot_no < mPr_POCKETS_SLOT_COUNT) {
+            mask = 1u << si->slot_no;
+        }
+    } else {
+        item = Now_Private->inventory.pockets[si->slot_no];
+        for (k = 0; k < mPr_POCKETS_SLOT_COUNT && n < (int)shop_common->counter; k++) {
+            if (Now_Private->inventory.pockets[k] == item && mPr_GET_ITEM_COND(Now_Private->inventory.item_conditions, k) == mPr_ITEM_COND_NORMAL) {
+                mask |= 1u << k;
+                n++;
+            }
+        }
+    }
+    for (k = 0; k < mPr_POCKETS_SLOT_COUNT; k++) {
+        if (mask & (1u << k)) {
+            primary = k;
+            break;
+        }
+    }
+    if (primary < 0) {
+        return 0;
+    }
+    aNSC_pc_sell_mask = mask;
+    aNSC_pc_sell_primary = primary;
+    aNSC_pc_sell_item = Now_Private->inventory.pockets[primary];
+    aNSC_pc_sell_bags_before = aNSC_pc_count_bags();
+    aNSC_pc_sell_wait = 1;
+    return 1;
+}
+
+/* One step of the sale transaction. -1 = pending, else aNSC_buy_check's row: 0 broke a bag, 1 normal, 2 cancelled / refused, 3 money overflow. */
+static int aNSC_pc_sell_step(void) {
+    int r, reason;
+    if (aNSC_pc_sell_wait == 1) {
+        r = pc_net_game_ts_begin_shop_sell((int)aNSC_pc_sell_mask, aNSC_pc_sell_primary, (int)aNSC_pc_sell_item);
+        if (r < 0) {
+            return -1; /* busy: retried next frame */
+        }
+        if (r == 0) {
+            aNSC_pc_sell_wait = 0;
+            return aNSC_BUY_OUTCOME_CANCEL;
+        }
+        aNSC_pc_sell_wait = 2;
+        return -1;
+    }
+    r = pc_net_game_ts_poll();
+    if (r == PC_NETGAME_TS_OP_PENDING) {
+        return -1;
+    }
+    aNSC_pc_sell_wait = 0;
+    if (r == PC_NETGAME_TS_OP_APPLIED) {
+        return aNSC_pc_count_bags() > aNSC_pc_sell_bags_before ? aNSC_BUY_OUTCOME_BREAK_BAG : aNSC_BUY_OUTCOME_NORMAL;
+    }
+    reason = pc_net_game_ts_last_reject_reason();
+    return reason == PC_NETGAME_TS_REJECT_NO_ROOM ? aNSC_BUY_OUTCOME_MONEY_OVERFLOW : aNSC_BUY_OUTCOME_CANCEL;
+}
+
+static int aNSC_pc_selection_has_paper(Submenu* menu) {
+    int k;
+    for (k = 0; k < (int)menu->selected_item_num; k++) {
+        if (ITEM_IS_PAPER(menu->item_p[k].item)) {
+            return TRUE;
+        }
+    }
+    return FALSE;
+}
+#endif
+
+#if defined(TARGET_PC) && !defined(aNSC_MAMEDANUKI)
+/* ===== Guest-first town M4 (NOOK'S SHOP): the GUEST house offer =====
+ * A network CLIENT that is a GUEST (player_no >= PLAYER_NUM, READY link) gets: (1) on its FIRST greeting (membership.ini `nook_intro` absent) Nook introduces himself and asks
+ * "would you like to buy a house?" Yes./No.; (2) later (declined / skipped) a 4th choice "Buy a house." in the "Other things" submenu; both start the same flow: price ->
+ * which free house -> confirm -> pc_net_game_ts_begin_house_purchase() -> poll -> APPLIED = the congratulation row (the session then ends by itself and the in-process rejoin
+ * brings the player back as the resident: the dialogue never waits for it) / REJECTED = the existing-style refusal rows. NO => `nook_intro = declined`. Residents, the host,
+ * solo play and every other talk are untouched (every entry point tests aNSC_pc_hs_guest()). The texts are generated messages (pc_nook_house.c, ids >= MSG_MAX).
+ * The flow runs as a replacement `proc` of an existing action (the animation / camera of that action stay), see aNSC_pc_house_proc. */
+#define aNSC_PC_HOUSE 1
+
+enum {
+    aNSC_PC_HS_NONE,
+    aNSC_PC_HS_ASK_INTRO,   /* waiting for Yes./No. of the first-talk offer */
+    aNSC_PC_HS_ASK_PICK,    /* waiting for the house choice */
+    aNSC_PC_HS_ASK_CONFIRM, /* waiting for Yes./No. of the confirmation */
+    aNSC_PC_HS_BEGIN,       /* begin the purchase (retried while another transaction is unresolved) */
+    aNSC_PC_HS_PENDING,     /* the transaction is in flight */
+    aNSC_PC_HS_END,         /* the closing row is showing: wait for the conversation to end */
+    aNSC_PC_RS_ASK,         /* manual restock: waiting for Yes./No. of the 500 Bells confirmation */
+    aNSC_PC_RS_BEGIN,       /* begin the restock payment (retried while another transaction is unresolved) */
+    aNSC_PC_RS_PENDING,     /* the SHOP_RESTOCK transaction is in flight */
+    aNSC_PC_WK_OP_BEGIN,    /* Work Mode: begin the op in aNSC_pc_wk_op (retried while another transaction is unresolved) */
+    aNSC_PC_WK_OP_PENDING,  /* the work transaction is in flight */
+    aNSC_PC_WK_ASK,         /* the job row is up: its choices come from pc_nook_work_row() */
+    aNSC_PC_UP_ASK,         /* shop upgrade: the announcement is up, waiting for its acknowledgement choice */
+    aNSC_PC_UP_BEGIN,       /* shop upgrade: start the closure (host: at once; client: the request) */
+    aNSC_PC_UP_PENDING,     /* shop upgrade: the client's start request is in flight (the host's service 6 answers) */
+    aNSC_PC_HU_BEGIN,       /* house upgrade (worker C): the wait row is up, begin the REHOUSE talk-start op (retried while another transaction is unresolved) */
+    aNSC_PC_HU_PENDING,     /* house upgrade: the kind-20 transaction is in flight (the wait row stays at its continue point) */
+    aNSC_PC_HO_RUN,         /* hand-over animations (pc_handover.h): a Work Mode hand-over plays (the job row is locked at its end), then END */
+    aNSC_PC_WK2_ASK,        /* Work v2: the Check job row is up ("did you bring ...?"): its choices come from pc_work_v2_row() */
+    aNSC_PC_WK2_ROWWAIT     /* Work v2: a row was selected; once it is ON SCREEN the hand-over starts (it plays while the row is read), then the next row */
+};
+
+static int aNSC_pc_hs_state;
+static int aNSC_pc_hs_house = -1;
+static int aNSC_pc_hs_free[PC_RESIDENCE_HOUSES];
+static int aNSC_pc_hs_nfree;
+static int aNSC_pc_hs_other_active; /* 1 while the guest "Other things" message (5 choices) is the one on screen */
+static int aNSC_pc_hs_mem_declined; /* RAM fallback of `nook_intro = declined` when there is no store character / membership file to write it to */
+static int aNSC_pc_hs_cache = -1;   /* cached intro state: 0 absent, 1 declined, 2 bought, -1 unknown */
+static int aNSC_pc_hs_cache_age;
+
+static int aNSC_pc_hs_guest(void) {
+    return pc_net_game_house_offer_available(); /* CLIENT role + READY link + the local player is a guest (all three tested inside) */
+}
+
+static int aNSC_pc_hs_intro_state(void) {
+    char v[32];
+    int r;
+    if (aNSC_pc_hs_cache >= 0 && ++aNSC_pc_hs_cache_age < 120) {
+        return aNSC_pc_hs_cache;
+    }
+    aNSC_pc_hs_cache_age = 0;
+    r = pc_net_game_nook_intro_get(v, sizeof(v));
+    if (r > 0) {
+        aNSC_pc_hs_cache = (strcmp(v, "bought") == 0) ? 2 : 1;
+    } else {
+        aNSC_pc_hs_cache = aNSC_pc_hs_mem_declined ? 1 : 0;
+    }
+    return aNSC_pc_hs_cache;
+}
+
+static int aNSC_pc_hs_intro_due(void) {
+    return aNSC_pc_hs_guest() && aNSC_pc_hs_intro_state() == 0;
+}
+
+static int aNSC_pc_hs_menu_offer(void) {
+    return aNSC_pc_hs_guest() && aNSC_pc_hs_intro_state() != 2;
+}
+
+static void aNSC_pc_hs_mark_declined(void) {
+    if (aNSC_pc_hs_intro_state() == 0) {
+        if (!pc_net_game_nook_intro_set("declined")) {
+            aNSC_pc_hs_mem_declined = 1;
+        }
+        aNSC_pc_hs_cache = -1;
+    }
+}
+
+static void aNSC_pc_hs_set_msg(NPC_SHOP_COMMON_ACTOR* shop_common, int which) {
+    aNSC_Set_continue_msg_num(mMsg_Get_base_window_p(), shop_common, pc_nook_msg_id(which));
+    mDemo_Set_OrderValue(mDemo_ORDER_NPC0, 0x9, 0x0);
+}
+
+static void aNSC_pc_hs_end(NPC_SHOP_COMMON_ACTOR* shop_common, int which, int declined) {
+    if (declined) {
+        aNSC_pc_hs_mark_declined();
+    }
+    aNSC_pc_hs_set_msg(shop_common, which);
+    aNSC_pc_hs_state = aNSC_PC_HS_END;
+}
+
+/* `sent` = 1 when the request really went to the host (a reason 0 is then a LINK LOSS: the outcome is unknown, so the row never claims "nothing was charged"). */
+static void aNSC_pc_hs_fail_row(NPC_SHOP_COMMON_ACTOR* shop_common, int reason, int sent) {
+    int which = PC_NOOK_MSG_FAILED;
+    if (reason == PC_NETGAME_HOUSE_REJECT_NO_FUNDS) {
+        which = PC_NOOK_MSG_NOFUNDS;
+    } else if (reason == PC_NETGAME_HOUSE_REJECT_NAME_TAKEN) {
+        which = PC_NOOK_MSG_NAMETAKEN;
+    } else if (reason == PC_NETGAME_HOUSE_REJECT_NO_RESIDENCE || reason == PC_NETGAME_HOUSE_REJECT_INVALID_HOUSE) {
+        which = PC_NOOK_MSG_NOLOT;
+    } else if (reason == 0 && sent) {
+        which = PC_NOOK_MSG_LINKLOST;
+    }
+    printf("[NET][HOUSE] nook dialogue: purchase not made (reason %d) -> row %d\n", reason, which);
+    pc_nook_house_rejoin_hold_set(0);
+    aNSC_pc_hs_end(shop_common, which, 1);
+}
+
+/* ---- Nook's manual restock ("Refresh shop." under Other things, every player: resident, guest, the host's own player) ----
+ * confirm (500 Bells) -> pc_net_game_restock_begin() (host: pays locally and starts, client: one SHOP_RESTOCK TXN_COMMIT) -> APPLIED = the thanks row (the shop then closes, everybody
+ * inside is shown out by ac_shop_indoor.c) / a refusal row (RESTOCKING, no funds, ...). The HOST owns the price, the 60 s timer and the new catalog; nothing here is authoritative. */
+static void aNSC_pc_rs_fail_row(NPC_SHOP_COMMON_ACTOR* shop_common, int reason, int sent) {
+    int which = PC_NOOK_MSG_RESTOCK_FAILED;
+    if (reason == PC_NETGAME_TS_REJECT_RESTOCKING) {
+        which = PC_NOOK_MSG_RESTOCK_BUSY;
+    } else if (reason == PC_NETGAME_TS_REJECT_NO_FUNDS) {
+        which = PC_NOOK_MSG_RESTOCK_NOFUNDS;
+    } else if (reason == 0 && sent) {
+        which = PC_NOOK_MSG_RESTOCK_LINKLOST;
+    }
+    printf("[NET][RESTOCK] nook dialogue: restock not made (reason %d) -> row %d\n", reason, which);
+    aNSC_pc_hs_end(shop_common, which, 0);
+}
+
+/* ---- Nook Work Mode ("I'd like to work." / "Check my job" on the FIRST page of Nook's talk, every player: resident, guest, the host's own player) ----
+ * The first page choice is added when the vanilla message is loaded (pc_nook_msg_patch), from the authoritative job state: no job = "I'd like to work", an active job = "Check my job".
+ * Choosing it: ENTER (the host creates / resumes the job) -> the job row (type + step + Nook reward) -> its choices: hand the item in (DELIVER) / take the parcel (TAKE_PARCEL) / report
+ * the delivery (REPORT) / come back later / quit the job (LEAVE). The villager steps (the fetched item, the parcel's recipient + tip) happen in the villager's own talk
+ * (ac_quest_manager.c). The HOST owns the job, the validation and every payment; nothing here is authoritative. */
+static int aNSC_pc_wk_op;
+static PCWorkView aNSC_pc_wk_view; /* the job as the row on screen shows it (also the reward text of the closing row) */
+static int aNSC_pc_wk2, aNSC_pc_wk2_after;                                            /* Work v2 (defined with its block below) */
+static void aNSC_pc_wk2_check(NPC_SHOP_COMMON_ACTOR* shop_common, const PCWorkView* v); /* Work v2: the Check job row */
+
+static void aNSC_pc_wk_set_row(NPC_SHOP_COMMON_ACTOR* shop_common, int which) {
+    unsigned char nm[8];
+    memset(nm, ' ', sizeof(nm));
+    (void)pc_net_game_work_villager_name(aNSC_pc_wk_view.target_villager, nm);
+    pc_nook_house_set_work_view(&aNSC_pc_wk_view, nm);
+    aNSC_pc_hs_set_msg(shop_common, which);
+}
+
+static void aNSC_pc_wk_end_row(NPC_SHOP_COMMON_ACTOR* shop_common, int which) {
+    unsigned char nm[8];
+    memset(nm, ' ', sizeof(nm));
+    (void)pc_net_game_work_villager_name(aNSC_pc_wk_view.target_villager, nm);
+    pc_nook_house_set_work_view(&aNSC_pc_wk_view, nm);
+    aNSC_pc_hs_end(shop_common, which, 0);
+}
+
+static void aNSC_pc_wk_fail_row(NPC_SHOP_COMMON_ACTOR* shop_common, int reason, int sent) {
+    int which = PC_NOOK_MSG_WORK_FAILED;
+    if (reason == PC_NETGAME_TS_REJECT_WORK_WALLET_FULL) {
+        which = PC_NOOK_MSG_WORK_FULL;
+    } else if (reason == PC_NETGAME_TS_REJECT_PRECOND && !sent) {
+        which = PC_NOOK_MSG_WORK_NOITEM; /* refused locally: the pockets hold nothing to hand in / no room */
+    } else if (reason == 0 && sent) {
+        which = PC_NOOK_MSG_WORK_LINKLOST;
+    }
+    printf("[NET][WORK] nook dialogue: work op %d not done (reason %d) -> row %d\n", aNSC_pc_wk_op, reason, which);
+    aNSC_pc_wk_end_row(shop_common, which);
+}
+
+/* the job row from the character's job as the host last told us */
+static void aNSC_pc_wk_show_job(NPC_SHOP_COMMON_ACTOR* shop_common) {
+    PCWorkView v;
+    if (!pc_net_game_work_view(&v) || v.state != PC_WORK_STATE_ACTIVE || !v.mode_on) {
+        aNSC_pc_wk_fail_row(shop_common, PC_NETGAME_TS_REJECT_WORK_NO_JOB, 1);
+        return;
+    }
+    aNSC_pc_wk_view = v;
+    printf("[NET][WORK] nook dialogue: job row: job %u type %d step %d item 0x%04X villager 0x%04X reward %u\n", v.job_id, v.job_type, v.obj_state, (unsigned)v.obj_item,
+           (unsigned)v.target_villager, v.reward);
+    aNSC_pc_wk_set_row(shop_common, PC_NOOK_MSG_WORK_JOB);
+    aNSC_pc_hs_state = aNSC_PC_WK_ASK;
+}
+
+/* the first page choice was taken: show the active job at once, else ask the host for one (ENTER) */
+static void aNSC_pc_wk_start_flow(NPC_SHOP_COMMON_ACTOR* shop_common) {
+    PCWorkView v;
+    printf("[NET][WORK] nook dialogue: the Work Mode choice of the first page was taken\n");
+    memset(&aNSC_pc_wk_view, 0, sizeof(aNSC_pc_wk_view));
+    aNSC_pc_wk2 = pc_net_game_work_v2();
+    aNSC_pc_wk2_after = -1;
+    if (aNSC_pc_wk2 && pc_net_game_work_offer_available() && pc_net_game_work_view(&v) && v.state == PC_WORK_STATE_ACTIVE && v.mode_on) {
+        aNSC_pc_wk2_check(shop_common, &v); /* Work v2: "Check job" */
+        return;
+    }
+    if (!pc_net_game_work_offer_available()) {
+        aNSC_pc_wk_op = PC_WORK_OP_ENTER;
+        aNSC_pc_wk_fail_row(shop_common, PC_NETGAME_TS_REJECT_PRECOND, 1);
+        return;
+    }
+    if (pc_net_game_work_view(&v) && v.state == PC_WORK_STATE_ACTIVE && v.mode_on) {
+        aNSC_pc_wk_show_job(shop_common);
+        return;
+    }
+    aNSC_pc_wk_op = PC_WORK_OP_ENTER;
+    aNSC_pc_hs_state = aNSC_PC_WK_OP_BEGIN; /* the first page text stays up until the host answers */
+}
+
+/* ---- Hand-over animations (pc_handover.h, ON by default; AC_MP_HANDOVER_ANIM=0 / [Gameplay] handover_anim = 0 = the old instant pocket change) ----
+ * An APPLIED (or, for the host's own player, done) TAKE_PARCEL / DELIVER plays the vanilla hand-over while the job row waits at its end (the message is locked, as in vanilla):
+ * TAKE_PARCEL = Nook takes the parcel out and holds it to the player (the handOverItem actor with Nook as master: TRANSFER1 -> TRANS_WAIT1, exactly
+ * aNSC_present_balloon_trans_takeout), the player's RECIEVE_WAIT / STRETCH / RECIEVE / PUTAWAY states take it; DELIVER = the player holds the item out
+ * (mPlib_request_main_give_type1: GIVE / GIVE_WAIT), Nook reaches for it and puts it away (GET1 -> GET_PULL1 -> GET_PUTAWAY1, the handOverItem master change exactly as
+ * aNPC_act_get). Presentation only: the pockets already hold the host's post-image (nothing is written here); a refusal plays nothing; every step has a time cap after which
+ * the row is unlocked (the dialogue never hangs). The other players in the shop see Nook do it (message 103, pc_net_game_handover_local). */
+static int aNSC_pc_ho_n, aNSC_pc_ho_idx, aNSC_pc_ho_step;
+static int aNSC_pc_ho_kind[2], aNSC_pc_ho_item[2];
+static f32 aNSC_pc_ho_frames;
+
+static void aNSC_pc_ho_anim(NPC_SHOP_COMMON_ACTOR* shop_common, int anim) {
+    CLIP(npc_clip)->animation_init_proc((ACTOR*)shop_common, anim, TRUE);
+}
+
+static void aNSC_pc_ho_plan(NPC_SHOP_COMMON_ACTOR* shop_common) {
+    int item_obj = aNSC_pc_wk_view.obj_item, item_carried = aNSC_pc_wk_view.carried_item;
+    aNSC_pc_ho_n = pc_handover_enabled() ? pc_ho_work_plan(aNSC_pc_wk_op, 1, item_obj, item_carried, 0, 0, aNSC_pc_ho_kind, aNSC_pc_ho_item) : 0;
+    if (aNSC_pc_ho_n <= 0) {
+        return;
+    }
+    aNSC_pc_ho_idx = 0;
+    aNSC_pc_ho_step = 0;
+    aNSC_pc_ho_frames = 0.0f;
+    mMsg_Set_LockContinue(mMsg_Get_base_window_p()); /* the job row waits at its end until the hand-over is over */
+    aNSC_pc_hs_state = aNSC_PC_HO_RUN;
+    printf("[NET][HANDOVER] nook work: op %d -> %s item 0x%04X\n", aNSC_pc_wk_op, aNSC_pc_ho_kind[0] == PC_HO_KIND_NPC_GIVES ? "Nook -> player" : "player -> Nook",
+           (unsigned)aNSC_pc_ho_item[0]);
+}
+
+/* one frame of the Nook hand-over; TRUE = over (done or abandoned) */
+static int aNSC_pc_ho_tick(NPC_SHOP_COMMON_ACTOR* shop_common) {
+    ACTOR* actorx = (ACTOR*)shop_common;
+    aHOI_Clip_c* hoi = CLIP(handOverItem_clip);
+    mActor_name_t item = (mActor_name_t)aNSC_pc_ho_item[aNSC_pc_ho_idx];
+    int fish = ITEM_IS_FISH(item) == TRUE;
+    int stopped = shop_common->npc_class.draw.main_animation_state == cKF_STATE_STOPPED;
+    f32 cap = 240.0f;
+    const char* why = NULL;
+
+    aNSC_pc_ho_frames += (f32)gamePT->graph->dt_num_60fps_frames;
+    if (hoi == NULL) {
+        why = "no hand-over actor";
+    } else {
+        mMsg_Set_LockContinue(mMsg_Get_base_window_p());
+        switch (aNSC_pc_ho_step) {
+            case 0: /* start */
+                if (hoi->master_actor != NULL) {
+                    break; /* another hand-over is still finishing */
+                }
+                if (aNSC_pc_ho_kind[aNSC_pc_ho_idx] == PC_HO_KIND_NPC_GIVES) {
+                    ACTOR* it = hoi->birth_proc(item, aHOI_REQUEST_PUTAWAY, aHOI_NOT_PRESENT, actorx);
+                    if (it == NULL) {
+                        why = "the hand-over actor refused the birth (no talk actors)";
+                        break;
+                    }
+                    hoi->chg_request_mode_proc(actorx, aHOI_REQUEST_TRANSFER);
+                    shop_common->npc_class.left_hand.item_actor_p = it;
+                    shop_common->npc_class.head.lock_flag = TRUE;
+                    aNSC_pc_ho_anim(shop_common, fish ? aNPC_ANIM_TRANSFER_F1 : aNPC_ANIM_TRANSFER1);
+                    sAdo_OngenTrgStart(NA_SE_GASAGOSO, &actorx->world.position);
+                    pc_net_game_handover_local(PC_HO_CLASS_SHOP, -1, (int)(u16)actorx->npc_id, PC_HO_KIND_NPC_GIVES, (int)item, fish);
+                    aNSC_pc_ho_step = 1;
+                } else {
+                    mPlib_request_main_give_type1(gamePT, item, aHOI_REQUEST_PUTAWAY, FALSE, FALSE); /* the player holds the item out */
+                    aNSC_pc_ho_step = 10;
+                }
+                aNSC_pc_ho_frames = 0.0f;
+                break;
+            case 1: /* Nook holds it out (TRANSFER1 ends) */
+                if (stopped && aNSC_pc_ho_frames >= 8.0f && hoi->master_actor == actorx) {
+                    hoi->chg_request_mode_proc(actorx, aHOI_REQUEST_TRANS_WAIT); /* the player's RECIEVE_WAIT starts from here (aHOI_actor_move) */
+                    aNSC_pc_ho_anim(shop_common, fish ? aNPC_ANIM_TRANS_WAIT_F1 : aNPC_ANIM_TRANS_WAIT1);
+                    aNSC_pc_ho_step = 2;
+                    aNSC_pc_ho_frames = 0.0f;
+                }
+                break;
+            case 2: /* waiting for the player to take it */
+                cap = 600.0f;
+                if (hoi->master_actor != actorx) {
+                    shop_common->npc_class.left_hand.item_actor_p = NULL;
+                    shop_common->npc_class.head.lock_flag = FALSE;
+                    aNSC_set_animation(shop_common, shop_common->action);
+                    aNSC_pc_ho_step = 3;
+                    aNSC_pc_ho_frames = 0.0f;
+                }
+                break;
+            case 3: /* the player puts it away */
+                cap = 600.0f;
+                if (hoi->master_actor == NULL && !mPlib_check_player_actor_main_index_RecieveMove(gamePT)) {
+                    aNSC_pc_ho_step = 99;
+                }
+                break;
+            case 10: /* the player holds it out (GIVE -> GIVE_WAIT sets TRANS_WAIT) */
+                if (hoi->request_mode == aHOI_REQUEST_TRANS_WAIT && hoi->master_actor != NULL && hoi->master_actor != actorx) {
+                    aNSC_pc_ho_anim(shop_common, fish ? aNPC_ANIM_GET_F1 : aNPC_ANIM_GET1);
+                    pc_net_game_handover_local(PC_HO_CLASS_SHOP, -1, (int)(u16)actorx->npc_id, PC_HO_KIND_NPC_TAKES, (int)item, fish);
+                    aNSC_pc_ho_step = 11;
+                    aNSC_pc_ho_frames = 0.0f;
+                }
+                break;
+            case 11: /* Nook reaches for it (GET1 ends): the item changes hands */
+                if (stopped && aNSC_pc_ho_frames >= 8.0f) {
+                    ACTOR* it = hoi->chg_master_proc(actorx);
+                    if (it == NULL) {
+                        why = "the hand-over actor refused the master change";
+                        break;
+                    }
+                    hoi->chg_request_mode_proc(actorx, aHOI_REQUEST_GET_PULL);
+                    shop_common->npc_class.left_hand.item_actor_p = it;
+                    aNSC_pc_ho_anim(shop_common, fish ? aNPC_ANIM_GET_PULL_F1 : aNPC_ANIM_GET_PULL1);
+                    aNSC_pc_ho_step = 12;
+                    aNSC_pc_ho_frames = 0.0f;
+                }
+                break;
+            case 12: /* pulled in: put it away */
+                if (stopped && aNSC_pc_ho_frames >= 8.0f) {
+                    hoi->chg_request_mode_proc(actorx, hoi->player_after_mode);
+                    aNSC_pc_ho_anim(shop_common, fish ? aNPC_ANIM_GET_PUTAWAY_F1 : aNPC_ANIM_GET_PUTAWAY1);
+                    sAdo_OngenTrgStart(NA_SE_GASAGOSO, &actorx->world.position);
+                    aNSC_pc_ho_step = 13;
+                    aNSC_pc_ho_frames = 0.0f;
+                }
+                break;
+            case 13:
+                if (stopped && aNSC_pc_ho_frames >= 8.0f) {
+                    shop_common->npc_class.left_hand.item_actor_p = NULL;
+                    aNSC_set_animation(shop_common, shop_common->action);
+                    aNSC_pc_ho_step = 14;
+                    aNSC_pc_ho_frames = 0.0f;
+                }
+                break;
+            case 14:
+                if (hoi->master_actor == NULL) {
+                    aNSC_pc_ho_step = 99;
+                }
+                break;
+            default:
+                break;
+        }
+        if (why == NULL && aNSC_pc_ho_step != 99 && aNSC_pc_ho_frames >= cap) {
+            why = "TIMEOUT";
+        }
+    }
+    if (why == NULL && aNSC_pc_ho_step != 99) {
+        return FALSE;
+    }
+    printf("[NET][HANDOVER] nook work: hand-over %d/%d item 0x%04X %s%s\n", aNSC_pc_ho_idx + 1, aNSC_pc_ho_n, (unsigned)item, why == NULL ? "done" : "abandoned: ",
+           why == NULL ? "" : why);
+    if (why != NULL) {
+        shop_common->npc_class.left_hand.item_actor_p = NULL;
+        shop_common->npc_class.head.lock_flag = FALSE;
+        aNSC_set_animation(shop_common, shop_common->action);
+    } else if (++aNSC_pc_ho_idx < aNSC_pc_ho_n) {
+        aNSC_pc_ho_step = 0;
+        aNSC_pc_ho_frames = 0.0f;
+        return FALSE;
+    }
+    mMsg_Unset_LockContinue(mMsg_Get_base_window_p());
+    return TRUE;
+}
+
+/* ---- Nook Work Mode v2 (pc_work_logic.h; only with pc_net_game_work_v2(): the host announced it, the switch is on) ----
+ * "Give me a job" (no job): ENTER -> the assignment row (FRUIT / FETCH), or for a delivery TAKE_PARCEL at once -> "here is <item> for <villager>" while Nook hands
+ * it over -> the pay row. "Check job" (an active job): "did you bring <item> from <villager>?" with [Here it is! / I'll take it. / I delivered it.] No. / Quit job:
+ * No. = URGE (the HOST decides: "take your time" or "this is urgent" + a bonus, once); Quit job = QUIT (the job's item goes back to Nook while he says so) or LEAVE
+ * (nothing to give back). Every hand-over plays WHILE its row is read: the row is selected, and once it is on screen (pc_nook_wk2_serial changed) the vanilla
+ * hand-over starts; the row waits at its end for it, then the closing row follows. Nothing here is authoritative. */
+static int aNSC_pc_wk2;                 /* the running Work Mode flow is the v2 one */
+static int aNSC_pc_wk2_has;             /* the has-item bit of the Check job row on screen (its choices) */
+static int aNSC_pc_wk2_ho_op, aNSC_pc_wk2_next, aNSC_pc_wk2_frames, aNSC_pc_wk2_after = -1;
+static unsigned aNSC_pc_wk2_serial0;
+
+static void aNSC_pc_wk2_prep(const PCWorkView* v, unsigned bonus) {
+    unsigned char nm[8], it[16];
+    int art = 0;
+    memset(nm, ' ', sizeof(nm));
+    (void)pc_net_game_work_villager_name(v->target_villager, nm);
+    pc_nook_house_set_work_view(v, nm);
+    pc_net_game_work_item_name(v->job_type == PC_WORK_JOB_DELIVER_VILLAGER && v->carried_item != 0 ? v->carried_item : v->obj_item, it, &art);
+    pc_nook_house_set_work_item(it, art);
+    pc_nook_house_set_wk2_extra(bonus, aNSC_pc_wk2_has);
+}
+
+/* a closing row (MSGEND) */
+static void aNSC_pc_wk2_end(NPC_SHOP_COMMON_ACTOR* shop_common, int variant) {
+    aNSC_pc_wk2_prep(&aNSC_pc_wk_view, 0u);
+    pc_nook_house_set_wk2(variant, PC_WK2_V_NONE);
+    printf("[NET][WORK] nook dialogue v2: row %d\n", variant);
+    aNSC_pc_hs_end(shop_common, PC_NOOK_MSG_WK2, 0);
+}
+
+/* row1 (a hand-over plays while it is read) + row2 (closing) */
+static void aNSC_pc_wk2_row_ho(NPC_SHOP_COMMON_ACTOR* shop_common, int row1, int row2, int ho_op) {
+    aNSC_pc_wk2_prep(&aNSC_pc_wk_view, 0u);
+    pc_nook_house_set_wk2(row1, row2);
+    aNSC_pc_wk2_serial0 = pc_nook_wk2_serial();
+    aNSC_pc_wk2_ho_op = ho_op;
+    aNSC_pc_wk2_next = row2;
+    aNSC_pc_wk2_frames = 0;
+    printf("[NET][WORK] nook dialogue v2: row %d (hand-over of op %d while it is read), then row %d\n", row1, ho_op, row2);
+    aNSC_pc_hs_set_msg(shop_common, PC_NOOK_MSG_WK2);
+    aNSC_pc_hs_state = aNSC_PC_WK2_ROWWAIT;
+}
+
+/* one frame of ROWWAIT: the row came on screen -> start its hand-over (or, without one, continue to the closing row) */
+static void aNSC_pc_wk2_rowwait(NPC_SHOP_COMMON_ACTOR* shop_common) {
+    int n = 0;
+    if (pc_nook_wk2_serial() == aNSC_pc_wk2_serial0 && ++aNSC_pc_wk2_frames < 1800) {
+        return; /* the previous row is still being read */
+    }
+    if (pc_nook_wk2_serial() != aNSC_pc_wk2_serial0 && pc_handover_enabled()) {
+        n = pc_ho_work_plan(aNSC_pc_wk2_ho_op, 1, aNSC_pc_wk_view.obj_item, aNSC_pc_wk_view.carried_item, 0, 0, aNSC_pc_ho_kind, aNSC_pc_ho_item);
+    }
+    if (n <= 0) {
+        aNSC_pc_hs_end(shop_common, PC_NOOK_MSG_WK2_NEXT, 0);
+        return;
+    }
+    aNSC_pc_ho_n = n;
+    aNSC_pc_ho_idx = 0;
+    aNSC_pc_ho_step = 0;
+    aNSC_pc_ho_frames = 0.0f;
+    aNSC_pc_wk2_after = PC_NOOK_MSG_WK2_NEXT;
+    mMsg_Set_LockContinue(mMsg_Get_base_window_p()); /* the row waits at its end until the hand-over is over */
+    aNSC_pc_hs_state = aNSC_PC_HO_RUN;
+    printf("[NET][HANDOVER] nook work v2: op %d -> %s item 0x%04X while the row is read\n", aNSC_pc_wk2_ho_op,
+           aNSC_pc_ho_kind[0] == PC_HO_KIND_NPC_GIVES ? "Nook -> player" : "player -> Nook", (unsigned)aNSC_pc_ho_item[0]);
+}
+
+/* the Check job row */
+static void aNSC_pc_wk2_check(NPC_SHOP_COMMON_ACTOR* shop_common, const PCWorkView* v) {
+    aNSC_pc_wk_view = *v;
+    aNSC_pc_wk2_has = pc_net_game_work_has_item(v);
+    aNSC_pc_wk2_prep(v, 0u);
+    pc_nook_house_set_wk2(PC_WK2_V_CHECK, PC_WK2_V_NONE);
+    printf("[NET][WORK] nook dialogue v2: Check job: job %u type %d step %d item 0x%04X villager 0x%04X reward %u has_item %d urged %d\n", v->job_id, v->job_type, v->obj_state,
+           (unsigned)v->obj_item, (unsigned)v->target_villager, v->reward, aNSC_pc_wk2_has, v->urged);
+    aNSC_pc_hs_set_msg(shop_common, PC_NOOK_MSG_WK2);
+    aNSC_pc_hs_state = aNSC_PC_WK2_ASK;
+}
+
+/* a v2 op finished (APPLIED, or done at once for the host's own player) */
+static void aNSC_pc_wk2_done(NPC_SHOP_COMMON_ACTOR* shop_common) {
+    PCWorkView v;
+    const PCWorkView before = aNSC_pc_wk_view;
+    int have = pc_net_game_work_view(&v);
+    switch (aNSC_pc_wk_op) {
+        case PC_WORK_OP_ENTER:
+            if (!have || v.state != PC_WORK_STATE_ACTIVE) {
+                aNSC_pc_wk_fail_row(shop_common, PC_NETGAME_TS_REJECT_WORK_NO_JOB, 1);
+                break;
+            }
+            aNSC_pc_wk_view = v;
+            if (v.job_type == PC_WORK_JOB_DELIVER_VILLAGER && v.obj_state == PC_WORK_OBJ_START) {
+                if (pc_net_game_work_has_item(&v)) {
+                    aNSC_pc_wk_op = PC_WORK_OP_TAKE_PARCEL; /* the delivery item is handed over right with the job */
+                    aNSC_pc_hs_state = aNSC_PC_WK_OP_BEGIN;
+                } else {
+                    aNSC_pc_wk2_end(shop_common, PC_WK2_V_NOROOM);
+                }
+                break;
+            }
+            aNSC_pc_wk2_end(shop_common, PC_WK2_V_ASSIGN);
+            break;
+        case PC_WORK_OP_TAKE_PARCEL:
+            if (have) {
+                aNSC_pc_wk_view = v;
+            }
+            aNSC_pc_wk2_row_ho(shop_common, PC_WK2_V_PARCEL, PC_WK2_V_PARCEL_PAY, PC_WORK_OP_TAKE_PARCEL);
+            break;
+        case PC_WORK_OP_DELIVER:
+            aNSC_pc_wk2_row_ho(shop_common, PC_WK2_V_THANKS, PC_WK2_V_PAID, PC_WORK_OP_DELIVER); /* the reward of the job that was on screen */
+            break;
+        case PC_WORK_OP_REPORT:
+            aNSC_pc_wk2_end(shop_common, PC_WK2_V_PAID);
+            break;
+        case PC_WORK_OP_URGE:
+            if (have) {
+                aNSC_pc_wk_view = v;
+            }
+            if (have && v.urged && v.reward > before.reward) {
+                aNSC_pc_wk2_prep(&aNSC_pc_wk_view, v.reward - before.reward);
+                pc_nook_house_set_wk2(PC_WK2_V_URGENT, PC_WK2_V_NONE);
+                printf("[NET][WORK] nook dialogue v2: the job is urgent: +%u Bells, %u in all\n", v.reward - before.reward, v.reward);
+                aNSC_pc_hs_end(shop_common, PC_NOOK_MSG_WK2, 0);
+            } else {
+                aNSC_pc_wk2_end(shop_common, (have && v.urged) ? PC_WK2_V_HURRY : PC_WK2_V_RELAX);
+            }
+            break;
+        case PC_WORK_OP_QUIT:
+            aNSC_pc_wk2_row_ho(shop_common, PC_WK2_V_TAKEBACK, PC_WK2_V_QUIT, PC_WORK_OP_QUIT); /* Nook takes the job's item back while he says so */
+            break;
+        default: /* LEAVE */
+            aNSC_pc_wk2_end(shop_common, PC_WK2_V_QUIT);
+            break;
+    }
+}
+
+/* the op finished (APPLIED, or done at once for the host's own player) */
+static void aNSC_pc_wk_done(NPC_SHOP_COMMON_ACTOR* shop_common) {
+    PCWorkView v;
+    if (aNSC_pc_wk2) {
+        aNSC_pc_wk2_done(shop_common); /* Work v2: its own rows */
+        return;
+    }
+    switch (aNSC_pc_wk_op) {
+        case PC_WORK_OP_ENTER:
+            aNSC_pc_wk_show_job(shop_common);
+            break;
+        case PC_WORK_OP_TAKE_PARCEL:
+            if (pc_net_game_work_view(&v)) {
+                aNSC_pc_wk_view = v;
+            }
+            aNSC_pc_wk_end_row(shop_common, PC_NOOK_MSG_WORK_PARCEL);
+            aNSC_pc_ho_plan(shop_common); /* hand-over animations: Nook hands the parcel over (the state becomes HO_RUN, then END) */
+            break;
+        case PC_WORK_OP_LEAVE:
+            aNSC_pc_wk_end_row(shop_common, PC_NOOK_MSG_WORK_LEFT);
+            break;
+        default: /* DELIVER / REPORT: the Nook reward was paid (the row shows the reward of the job that was on screen) */
+            aNSC_pc_wk_end_row(shop_common, PC_NOOK_MSG_WORK_DONE);
+            aNSC_pc_ho_plan(shop_common); /* hand-over animations: DELIVER = the player hands the item to Nook (REPORT has no item: nothing) */
+            break;
+    }
+}
+
+static void aNSC_pc_wk_begin(NPC_SHOP_COMMON_ACTOR* shop_common) {
+    int r = pc_net_game_work_begin_op(aNSC_pc_wk_op, 0);
+    if (r < 0) {
+        return; /* another transaction is unresolved: next frame */
+    }
+    if (r == 0 && aNSC_pc_wk2 && aNSC_pc_wk_op == PC_WORK_OP_QUIT) {
+        printf("[NET][WORK] nook dialogue v2: the job's item is not in the pockets any more: quitting without it (LEAVE)\n");
+        aNSC_pc_wk_op = PC_WORK_OP_LEAVE; /* nothing to give back (the item was lost / never taken): the plain quit, next frame */
+        return;
+    }
+    if (r == 0) {
+        aNSC_pc_wk_fail_row(shop_common, pc_net_game_ts_last_reject_reason(), 0); /* refused locally: nothing was sent */
+    } else if (r == 3) {
+        aNSC_pc_wk_done(shop_common);
+    } else {
+        aNSC_pc_hs_state = aNSC_PC_WK_OP_PENDING;
+    }
+}
+
+static void aNSC_pc_wk_pending(NPC_SHOP_COMMON_ACTOR* shop_common) {
+    int r = pc_net_game_ts_poll();
+    if (r == PC_NETGAME_TS_OP_PENDING) {
+        return;
+    }
+    if (r != PC_NETGAME_TS_OP_APPLIED) {
+        aNSC_pc_wk_fail_row(shop_common, pc_net_game_ts_last_reject_reason(), 1);
+    } else {
+        aNSC_pc_wk_done(shop_common);
+    }
+}
+
+static void aNSC_pc_rs_start_flow(NPC_SHOP_COMMON_ACTOR* shop_common) {
+    int r = pc_net_game_restock_precheck();
+    printf("[NET][RESTOCK] nook dialogue: 'Refresh shop.' chosen, precheck=%d\n", r);
+    if (r != 0) {
+        aNSC_pc_rs_fail_row(shop_common, r, 0);
+        return;
+    }
+    aNSC_pc_hs_set_msg(shop_common, PC_NOOK_MSG_RESTOCK_ASK);
+    aNSC_pc_hs_state = aNSC_PC_RS_ASK;
+}
+
+/* ---- Multiplayer shop upgrade (pc_shop_upgrade.h): the NEXT talk after the town qualified for the next shop tier ----
+ * Nook announces the upgrade (PC_NOOK_MSG_UPGRADE_ANNOUNCE, two acknowledgement choices), then the closure starts: pc_shop_upgrade_begin() (host: at once, client: one request, the
+ * host's service 6 is the answer, polled by pc_shop_upgrade_poll()) -> the closing row (the shop interior then shows everybody out once the talk is over) / the fallback row when the
+ * start failed (the shop stays open; the next talk announces again). The HOST owns the state, the timer and the renewal; nothing here is authoritative. */
+static void aNSC_pc_up_after_begin(NPC_SHOP_COMMON_ACTOR* shop_common, int r) {
+    if (r == 1) {
+        printf("[NET][SHOPUP] nook dialogue: the closure of the upgrade was started -> closing row\n");
+        aNSC_pc_hs_end(shop_common, PC_NOOK_MSG_UPGRADE_CLOSING, 0);
+    } else {
+        printf("[NET][SHOPUP] nook dialogue: the upgrade could not be started (outcome %d) -> fallback row, the shop stays open\n", r);
+        aNSC_pc_hs_end(shop_common, PC_NOOK_MSG_UPGRADE_LATER, 0);
+    }
+}
+
+/* ---- House upgrades via Nook for a resident CLIENT (worker C, pc_house_upgrade.h) ----
+ * Every write of the vanilla rehouse dialogue (the size / roof order, the basement order, the statue order, the "built" acknowledgement with the next loan) is ONE host
+ * transaction (kind 20) instead of a local write: homes[] arrives from the host through house sync, the loan of an acknowledgement is set by the APPLIED apply. Two seams:
+ *   (a) the REHOUSE talk start (statue order / acknowledgement / the automatic basement of a Large house): the wait row PC_NOOK_MSG_UPG_WAIT is shown, the op runs
+ *       (aNSC_PC_HU_BEGIN / _PENDING), APPLIED continues with the vanilla row Nook would have said, a refusal with a PC row;
+ *   (b) the choices of the DONE_REHOUSE offer (roof colour = the size order, the basement): the vanilla message is LOCKED at its continue point while the op runs
+ *       (aNSC_pc_hu_choice_step); APPLIED unlocks it (the vanilla follow-up row), a refusal replaces the follow-up with a PC row.
+ * Without the capability (an old host / no house sync / a guest) the previous behaviour stays: the plain greeting (Batch G3). Host / solo: untouched. */
+static int aNSC_pc_hu_op;    /* the talk-start op (PC_HU_OP_*), 0 = none */
+static int aNSC_pc_hu_after; /* the vanilla row (aNSC_MSG_*) that follows an APPLIED talk-start op */
+static int aNSC_pc_hu_hold;  /* the choice seam: 0 idle, 2 the transaction is in flight (the vanilla message is locked) */
+static int aNSC_get_start_call_msg_no(ACTOR* actorx);
+
+static mHm_hs_c* aNSC_pc_hu_home(void) {
+    return &Save_Get(homes)[mHS_get_arrange_idx(Common_Get(player_no))];
+}
+
+/* The op a client's talk must run on the host FIRST (aNSC_set_talk_info_start_wait / the Large-without-basement case of aNSC_start_wait) and the vanilla row after it. 0 = none. */
+static int aNSC_pc_hu_talk_op(int* after) {
+    static const int built[3] = { aNSC_MSG_MEDIUM_BUILT, aNSC_MSG_LARGE_BUILT, aNSC_MSG_UPPER_BUILT };
+    mHm_hs_c* home = aNSC_pc_hu_home();
+    mHm_rmsz_c* size = &home->size_info;
+    if (Now_Private == NULL) {
+        return 0;
+    }
+    if (size->renew == TRUE) {
+        *after = size->basement_ordered ? aNSC_MSG_BASEMENT_BUILT : built[(size->size >= 1 && size->size <= 3) ? size->size - 1 : 0];
+        return PC_HU_OP_ACK_BUILT;
+    }
+    if (size->statue_ordered == TRUE && size->next_size == mHm_HOMESIZE_STATUE) {
+        *after = aNSC_MSG_STATUE_BUILT;
+        return PC_HU_OP_ACK_BUILT;
+    }
+    if (Now_Private->inventory.loan == 0 && size->size == mHm_HOMESIZE_UPPER && size->size == size->next_size && size->statue_ordered == FALSE) {
+        *after = aNSC_MSG_REHOUSE_STATUE;
+        return PC_HU_OP_ORDER_STATUE;
+    }
+    if (Now_Private->inventory.loan == 0 && size->size == mHm_HOMESIZE_LARGE && size->size == size->next_size && size->basement_ordered == FALSE &&
+        home->flags.has_basement == FALSE && size->pad_1 == FALSE) {
+        *after = aNSC_MSG_REHOUSE_BASEMENT; /* aNSC_start_wait's DONE_REHOUSE Large case: the basement is ordered without a choice */
+        return PC_HU_OP_ORDER_BASEMENT;
+    }
+    return 0;
+}
+
+static void aNSC_pc_set_talk_info_houseup(ACTOR* actorx) {
+    mDemo_Set_msg_num(pc_nook_msg_id(PC_NOOK_MSG_UPG_WAIT));
+    ((NPC_SHOP_COMMON_ACTOR*)actorx)->next_action = aNSC_ACTION_CHECK_COL_CHG_OR_MAKE_BASEMENT;
+}
+
+static int aNSC_pc_hu_fail_which(int reason, int sent) {
+    if (reason == PC_HU_REJECT_BUSY || reason == PC_HU_REJECT_CHANGED) {
+        return PC_NOOK_MSG_UPG_BUSY;
+    }
+    if (reason == 0 && sent) {
+        return PC_NOOK_MSG_UPG_LINKLOST;
+    }
+    return PC_NOOK_MSG_UPG_FAILED;
+}
+
+/* the talk-start op finished: APPLIED -> the vanilla row, else a refusal row (both end the conversation) */
+static void aNSC_pc_hu_talk_done(NPC_SHOP_COMMON_ACTOR* shop_common, int applied) {
+    if (applied) {
+        printf("[NET][HOUSEUP] nook dialogue: op %d APPLIED -> the vanilla row %d\n", aNSC_pc_hu_op, aNSC_pc_hu_after);
+        aNSC_Set_continue_msg_num(mMsg_Get_base_window_p(), shop_common, aNSC_get_msg_no(aNSC_pc_hu_after));
+        mDemo_Set_OrderValue(mDemo_ORDER_NPC0, 0x9, 0x0);
+        aNSC_pc_hs_state = aNSC_PC_HS_END;
+    } else {
+        const int which = aNSC_pc_hu_fail_which(pc_house_upgrade_last_reason(), pc_house_upgrade_last_sent());
+        printf("[NET][HOUSEUP] nook dialogue: op %d not done (reason %d, sent %d) -> row %d\n", aNSC_pc_hu_op, pc_house_upgrade_last_reason(), pc_house_upgrade_last_sent(), which);
+        aNSC_pc_hs_end(shop_common, which, 0);
+    }
+}
+
+/* The choice seam (b). -1 = hold (the caller returns; the vanilla message stays locked at its continue point), 1 = APPLIED (the caller continues the vanilla flow without its
+ * local write), 0 = not done (a refusal row is the next message; the caller continues the vanilla flow without its local write). */
+static int aNSC_pc_hu_choice_step(NPC_SHOP_COMMON_ACTOR* shop_common, int op, int arg) {
+    mMsg_Window_c* msg_p = mMsg_Get_base_window_p();
+    int r, which;
+    if (aNSC_pc_hu_hold == 0) {
+        r = pc_house_upgrade_begin(op, arg);
+        if (r < 0) {
+            mMsg_Set_LockContinue(msg_p); /* another transaction is unresolved: retried next frame, the message waits */
+            return -1;
+        }
+        if (r == 1) {
+            printf("[NET][HOUSEUP] nook dialogue: order op %d (arg %d) sent to the host; the message waits\n", op, arg);
+            mMsg_Set_LockContinue(msg_p);
+            aNSC_pc_hu_hold = 2;
+            return -1;
+        }
+        which = aNSC_pc_hu_fail_which(0, 0);
+    } else {
+        r = pc_house_upgrade_poll();
+        if (r == PC_NETGAME_TS_OP_PENDING) {
+            return -1;
+        }
+        aNSC_pc_hu_hold = 0;
+        if (r == PC_NETGAME_TS_OP_APPLIED) {
+            printf("[NET][HOUSEUP] nook dialogue: order op %d APPLIED -> the vanilla follow-up row\n", op);
+            mMsg_Unset_LockContinue(msg_p);
+            return 1;
+        }
+        which = aNSC_pc_hu_fail_which(pc_house_upgrade_last_reason(), pc_house_upgrade_last_sent());
+    }
+    printf("[NET][HOUSEUP] nook dialogue: order op %d not done (reason %d) -> row %d instead of the vanilla follow-up\n", op, pc_house_upgrade_last_reason(), which);
+    aNSC_Set_continue_msg_num(msg_p, shop_common, pc_nook_msg_id(which));
+    mMsg_Unset_LockContinue(msg_p);
+    return 0;
+}
+
+/* Yes. of the offer / the "Buy a house." choice: price, then the free houses. */
+static void aNSC_pc_hs_start_flow(NPC_SHOP_COMMON_ACTOR* shop_common) {
+    int r = pc_net_game_house_purchase_precheck(-1);
+    printf("[NET][HOUSE] nook dialogue: house offer accepted, precheck=%d\n", r);
+    if (r != 0) {
+        aNSC_pc_hs_fail_row(shop_common, r, 0);
+        return;
+    }
+    aNSC_pc_hs_nfree = pc_net_game_house_free_list(aNSC_pc_hs_free, PC_RESIDENCE_HOUSES);
+    if (aNSC_pc_hs_nfree < 1) {
+        aNSC_pc_hs_fail_row(shop_common, PC_NETGAME_HOUSE_REJECT_NO_RESIDENCE, 0);
+        return;
+    }
+    pc_nook_house_set_pick(aNSC_pc_hs_free, aNSC_pc_hs_nfree);
+    aNSC_pc_hs_set_msg(shop_common, PC_NOOK_MSG_PICK);
+    aNSC_pc_hs_state = aNSC_PC_HS_ASK_PICK;
+}
+
+static void aNSC_pc_house_proc(NPC_SHOP_COMMON_ACTOR* shop_common, GAME_PLAY* play) {
+    ACTOR* actorx = (ACTOR*)shop_common;
+    mMsg_Window_c* msg_p = mMsg_Get_base_window_p();
+    int k, r;
+
+    if (actorx->world.position.z > aNSC_POS_Z_MAX) { /* the greeting position (same as aNSC_check_col_chg_or_make_basement) */
+        actorx->world.position.z = aNSC_POS_Z_MAX;
+        aNSC_set_stop_spd(shop_common);
+        CLIP(npc_clip)->animation_init_proc(actorx, 0x5, 0x1);
+    }
+
+    if (aNSC_pc_hs_state == aNSC_PC_HS_BEGIN || aNSC_pc_hs_state == aNSC_PC_HS_PENDING || aNSC_pc_hs_state == aNSC_PC_HS_END) {
+        pc_nook_house_rejoin_hold_touch(); /* heartbeat: the rejoin hold lives only while this proc runs (PENDING / END) */
+    }
+    switch (aNSC_pc_hs_state) {
+        case aNSC_PC_HU_BEGIN:
+            if (aNSC_pc_hu_op == 0) {
+                /* the house changed between the request and the talk: nothing to do, the plain greeting follows the wait row */
+                aNSC_Set_continue_msg_num(msg_p, shop_common, aNSC_get_msg_no(aNSC_get_start_call_msg_no(actorx)));
+                aNSC_pc_hs_state = aNSC_PC_HS_END;
+                break;
+            }
+            r = pc_house_upgrade_begin(aNSC_pc_hu_op, 0);
+            if (r < 0) {
+                return; /* another transaction is unresolved: next frame */
+            }
+            if (r == 0) {
+                aNSC_pc_hu_talk_done(shop_common, 0); /* refused locally: nothing was sent */
+            } else {
+                aNSC_pc_hs_state = aNSC_PC_HU_PENDING;
+            }
+            break;
+        case aNSC_PC_HU_PENDING:
+            r = pc_house_upgrade_poll();
+            if (r == PC_NETGAME_TS_OP_PENDING) {
+                return;
+            }
+            aNSC_pc_hu_talk_done(shop_common, r == PC_NETGAME_TS_OP_APPLIED);
+            break;
+        case aNSC_PC_UP_BEGIN:
+            r = pc_shop_upgrade_begin();
+            if (r == 3) {
+                aNSC_pc_up_after_begin(shop_common, 1); /* the host's own player: started (or already closing) */
+            } else if (r == 1) {
+                aNSC_pc_hs_state = aNSC_PC_UP_PENDING; /* the announcement stays up until the host's state answers */
+            } else {
+                aNSC_pc_up_after_begin(shop_common, pc_shop_upgrade_closed() ? 1 : -1); /* refused locally: somebody else may have started it already */
+            }
+            break;
+        case aNSC_PC_UP_PENDING:
+            r = pc_shop_upgrade_poll();
+            if (r != 0) {
+                aNSC_pc_up_after_begin(shop_common, r);
+            }
+            break;
+        case aNSC_PC_WK_OP_BEGIN:
+            aNSC_pc_wk_begin(shop_common);
+            break;
+        case aNSC_PC_WK_OP_PENDING:
+            aNSC_pc_wk_pending(shop_common);
+            break;
+        case aNSC_PC_HO_RUN:
+            if (aNSC_pc_ho_tick(shop_common)) {
+                aNSC_pc_hs_state = aNSC_PC_HS_END; /* the end row (already set as the continue message) follows */
+                if (aNSC_pc_wk2_after >= 0) {
+                    aNSC_pc_hs_set_msg(shop_common, aNSC_pc_wk2_after); /* Work v2: the hand-over played while its row was read: now the closing row */
+                    aNSC_pc_wk2_after = -1;
+                }
+            }
+            break;
+        case aNSC_PC_WK2_ROWWAIT:
+            aNSC_pc_wk2_rowwait(shop_common);
+            break;
+        case aNSC_PC_RS_BEGIN:
+            r = pc_net_game_restock_begin();
+            if (r < 0) {
+                return; /* another transaction is unresolved: next frame */
+            }
+            if (r == 3) {
+                printf("[NET][RESTOCK] nook dialogue: restock started by the host player -> thanks row\n");
+                aNSC_pc_hs_end(shop_common, PC_NOOK_MSG_RESTOCK_THANKS, 0);
+            } else if (r == 0) {
+                aNSC_pc_rs_fail_row(shop_common, pc_net_game_ts_last_reject_reason(), 0); /* refused locally: nothing was sent */
+            } else {
+                aNSC_pc_hs_state = aNSC_PC_RS_PENDING;
+            }
+            break;
+        case aNSC_PC_RS_PENDING:
+            r = pc_net_game_ts_poll();
+            if (r == PC_NETGAME_TS_OP_PENDING) {
+                return;
+            }
+            if (r == PC_NETGAME_TS_OP_APPLIED) {
+                printf("[NET][RESTOCK] nook dialogue: restock APPLIED -> thanks row\n");
+                aNSC_pc_hs_end(shop_common, PC_NOOK_MSG_RESTOCK_THANKS, 0);
+            } else {
+                aNSC_pc_rs_fail_row(shop_common, pc_net_game_ts_last_reject_reason(), 1);
+            }
+            break;
+        case aNSC_PC_UP_ASK:
+        case aNSC_PC_WK_ASK:
+        case aNSC_PC_WK2_ASK:
+        case aNSC_PC_RS_ASK:
+        case aNSC_PC_HS_ASK_INTRO:
+        case aNSC_PC_HS_ASK_PICK:
+        case aNSC_PC_HS_ASK_CONFIRM:
+            if (mDemo_Get_OrderValue(mDemo_TYPE_4, 0x9) == 0 || mMsg_Check_MainNormalContinue(msg_p) != TRUE) {
+                return;
+            }
+            k = mChoice_Get_ChoseNum(mChoice_Get_base_window_p());
+            if (aNSC_pc_hs_state == aNSC_PC_WK2_ASK) {
+                int acts[4];
+                const int n = pc_work_v2_row(aNSC_pc_wk_view.job_type, aNSC_pc_wk_view.obj_state, aNSC_pc_wk2_has, acts, 4);
+                const int act = (k >= 0 && k < n) ? acts[k] : PC_WORK_ACT_LATER;
+                aNSC_pc_wk_op = act == PC_WORK_ACT_HAND ? PC_WORK_OP_DELIVER : act == PC_WORK_ACT_TAKE ? PC_WORK_OP_TAKE_PARCEL : act == PC_WORK_ACT_REPORT ? PC_WORK_OP_REPORT
+                              : act == PC_WORK_ACT_NO ? PC_WORK_OP_URGE
+                              : act == PC_WORK_ACT_QUIT ? (aNSC_pc_wk_view.obj_state == PC_WORK_OBJ_CARRYING ? PC_WORK_OP_QUIT : PC_WORK_OP_LEAVE) : 0;
+                printf("[NET][WORK] nook dialogue v2: Check job choice %d -> action %d (op %d)\n", k, act, aNSC_pc_wk_op);
+                if (aNSC_pc_wk_op == 0) {
+                    aNSC_pc_wk_end_row(shop_common, PC_NOOK_MSG_WORK_LATER);
+                } else {
+                    aNSC_pc_hs_state = aNSC_PC_WK_OP_BEGIN; /* the row stays up until the host answers */
+                }
+            } else if (aNSC_pc_hs_state == aNSC_PC_UP_ASK) {
+                printf("[NET][SHOPUP] nook dialogue: the announcement was acknowledged (choice %d): starting the closure\n", k);
+                aNSC_pc_hs_state = aNSC_PC_UP_BEGIN; /* every choice is an acknowledgement: the upgrade is Nook's decision */
+            } else if (aNSC_pc_hs_state == aNSC_PC_WK_ASK) {
+                int acts[4];
+                int n = pc_nook_work_row(&aNSC_pc_wk_view, acts, 4);
+                int act = (k >= 0 && k < n) ? acts[k] : PC_NOOK_WACT_LATER;
+                switch (act) {
+                    case PC_NOOK_WACT_HAND:
+                        aNSC_pc_wk_op = PC_WORK_OP_DELIVER;
+                        break;
+                    case PC_NOOK_WACT_TAKE:
+                        aNSC_pc_wk_op = PC_WORK_OP_TAKE_PARCEL;
+                        break;
+                    case PC_NOOK_WACT_REPORT:
+                        aNSC_pc_wk_op = PC_WORK_OP_REPORT;
+                        break;
+                    case PC_NOOK_WACT_QUIT:
+                        aNSC_pc_wk_op = PC_WORK_OP_LEAVE;
+                        break;
+                    default:
+                        aNSC_pc_wk_op = 0;
+                        break;
+                }
+                printf("[NET][WORK] nook dialogue: job row choice %d -> action %d (op %d)\n", k, act, aNSC_pc_wk_op);
+                if (aNSC_pc_wk_op == 0) {
+                    aNSC_pc_wk_end_row(shop_common, PC_NOOK_MSG_WORK_LATER);
+                } else {
+                    aNSC_pc_hs_state = aNSC_PC_WK_OP_BEGIN; /* the job row stays up until the host answers */
+                }
+            } else if (aNSC_pc_hs_state == aNSC_PC_RS_ASK) {
+                if (k == mChoice_CHOICE0) {
+                    printf("[NET][RESTOCK] nook dialogue: payment confirmed, requesting the restock\n");
+                    aNSC_pc_hs_state = aNSC_PC_RS_BEGIN; /* the text stays up; the order value stays set until the answer */
+                } else {
+                    printf("[NET][RESTOCK] nook dialogue: the player declined the restock\n");
+                    aNSC_pc_hs_end(shop_common, PC_NOOK_MSG_RESTOCK_DECLINE, 0);
+                }
+            } else if (aNSC_pc_hs_state == aNSC_PC_HS_ASK_INTRO) {
+                if (k == mChoice_CHOICE0) {
+                    aNSC_pc_hs_start_flow(shop_common);
+                } else {
+                    printf("[NET][HOUSE] nook dialogue: the guest declined the first offer\n");
+                    aNSC_pc_hs_end(shop_common, PC_NOOK_MSG_DECLINE, 1);
+                }
+            } else if (aNSC_pc_hs_state == aNSC_PC_HS_ASK_PICK) {
+                int house = -2;
+                if (k < aNSC_pc_hs_nfree) {
+                    house = aNSC_pc_hs_free[k];
+                } else if (aNSC_pc_hs_nfree >= 2 && k == aNSC_pc_hs_nfree) {
+                    house = -1;
+                }
+                if (house == -2) {
+                    printf("[NET][HOUSE] nook dialogue: the guest backed out at the house choice\n");
+                    aNSC_pc_hs_end(shop_common, PC_NOOK_MSG_DECLINE, 1);
+                } else if ((r = pc_net_game_house_purchase_precheck(house)) != 0) {
+                    aNSC_pc_hs_fail_row(shop_common, r, 0);
+                } else {
+                    aNSC_pc_hs_house = house;
+                    printf("[NET][HOUSE] nook dialogue: house %d chosen (-1 = any)\n", house);
+                    pc_nook_house_set_confirm(house);
+                    aNSC_pc_hs_set_msg(shop_common, PC_NOOK_MSG_CONFIRM);
+                    aNSC_pc_hs_state = aNSC_PC_HS_ASK_CONFIRM;
+                }
+            } else if (k == mChoice_CHOICE0) {
+                printf("[NET][HOUSE] nook dialogue: payment confirmed, requesting the purchase (house %d)\n", aNSC_pc_hs_house);
+                aNSC_pc_hs_state = aNSC_PC_HS_BEGIN; /* the text stays up; the order value stays set until the answer */
+            } else {
+                printf("[NET][HOUSE] nook dialogue: the guest declined at the confirmation\n");
+                aNSC_pc_hs_end(shop_common, PC_NOOK_MSG_DECLINE, 1);
+            }
+            break;
+        case aNSC_PC_HS_BEGIN:
+            r = pc_net_game_ts_begin_house_purchase(aNSC_pc_hs_house);
+            if (r < 0) {
+                return; /* another transaction is unresolved: next frame */
+            }
+            if (r == 0) {
+                aNSC_pc_hs_fail_row(shop_common, pc_net_game_ts_last_reject_reason(), 0); /* refused locally: nothing was sent */
+            } else {
+                aNSC_pc_hs_state = aNSC_PC_HS_PENDING;
+                pc_nook_house_rejoin_hold_set(1); /* set BEFORE the answer can arrive: the rejoin of an applied purchase must not start before the congratulation row was read */
+            }
+            break;
+        case aNSC_PC_HS_PENDING:
+            r = pc_net_game_ts_poll();
+            if (r == PC_NETGAME_TS_OP_PENDING) {
+                return;
+            }
+            if (r == PC_NETGAME_TS_OP_APPLIED || pc_net_game_house_purchase_applied()) {
+                /* the host closes the session within a frame or two of the APPLIED result: a link-loss REJECTED after an applied purchase is still the APPLIED purchase */
+                printf("[NET][HOUSE] nook dialogue: purchase APPLIED -> congratulation row (the session ends by itself, the rejoin waits for the row to be read)\n");
+                aNSC_pc_hs_cache = -1;
+                pc_nook_house_rejoin_hold_set(2); /* APPLIED: the rejoin waits for the row, kept alive by the heartbeat (hard cap ~15 s) */
+                aNSC_pc_hs_end(shop_common, PC_NOOK_MSG_THANKS, 0);
+            } else {
+                aNSC_pc_hs_fail_row(shop_common, pc_net_game_ts_last_reject_reason(), 1);
+            }
+            break;
+        case aNSC_PC_HS_END:
+            if (mDemo_Check(mDemo_TYPE_SPEAK, actorx) == FALSE && mDemo_Check(mDemo_TYPE_TALK, actorx) == FALSE) {
+                printf("[NET][HOUSE] nook dialogue: the conversation ended -> the rejoin hold is released\n");
+                pc_nook_house_rejoin_hold_set(0); /* the congratulation row (if any) was read: the in-process rejoin may start */
+                shop_common->sell_item = EMPTY_NO;
+                shop_common->npc_class.talk_info.melody_inst = 0;
+                aNSC_pc_hs_state = aNSC_PC_HS_NONE;
+                aNSC_setupAction(shop_common, play, aNSC_ACTION_WAIT);
+            }
+            break;
+        default:
+            break;
+    }
+}
+
+/* Switches the running action over to the house dialogue (the action id, animation and camera stay those of the action it replaces). */
+static void aNSC_pc_hs_enter(NPC_SHOP_COMMON_ACTOR* shop_common, int state) {
+    aNSC_pc_hs_state = state;
+    aNSC_pc_hs_other_active = 0;
+    shop_common->proc = aNSC_pc_house_proc;
+}
+
+static void aNSC_pc_set_talk_info_intro(ACTOR* actorx) {
+    mDemo_Set_msg_num(pc_nook_msg_id(PC_NOOK_MSG_INTRO));
+    ((NPC_SHOP_COMMON_ACTOR*)actorx)->next_action = aNSC_ACTION_CHECK_COL_CHG_OR_MAKE_BASEMENT;
+}
+
+static void aNSC_pc_set_talk_info_upgrade(ACTOR* actorx) {
+    mDemo_Set_msg_num(pc_nook_msg_id(PC_NOOK_MSG_UPGRADE_ANNOUNCE));
+    ((NPC_SHOP_COMMON_ACTOR*)actorx)->next_action = aNSC_ACTION_CHECK_COL_CHG_OR_MAKE_BASEMENT;
+}
+
+/* 1 = this talk is the shop upgrade announcement: the town qualified (host state / the client's mirror), not during the local player's first-job chores (their own Nook flow). */
+static int aNSC_pc_up_due(void) {
+    return pc_shop_upgrade_announce_due() && !mEv_CheckFirstJob();
+}
+#endif
+
 #ifdef aNSC_MAMEDANUKI
 
 static void aNSC_set_talk_info_start_wait(ACTOR* actorx) {
@@ -1756,6 +3053,49 @@ static void aNSC_start_wait(NPC_SHOP_COMMON_ACTOR* shop_common, GAME_PLAY* play)
         wait_type = aNSC_WAIT_TYPE_3;
     }
 
+    if (aNSC_PC_IS_CLIENT() &&
+        (wait_type == aNSC_WAIT_TYPE_REHOUSE || wait_type == aNSC_WAIT_TYPE_DONE_REHOUSE)) {
+        /* Batch G3: REHOUSE (loan/statue bookkeeping in aNSC_set_talk_info_start_wait) and DONE_REHOUSE (house
+         * upgrade/basement/roof-colour order) write homes[] / Private_c.inventory.loan locally. For a client use
+         * the plain greeting instead; TYPE_3 is identical to REHOUSE's else-branch (aNSC_get_start_call_msg_no,
+         * next_action SAY_HELLO_APPROACH) minus those writes. Host/solo unchanged.
+         * House upgrades via Nook (worker C): with the host's kind-20 support (pc_house_upgrade_available) a resident client keeps the vanilla
+         * talk: a talk start that must write (statue order / "built" acknowledgement / the automatic basement) becomes PC_HOUSEUP (the host does
+         * it first), DONE_REHOUSE keeps its offer (its order choices go through the host: aNSC_pc_hu_choice_step), the rest is the greeting. */
+#ifdef aNSC_PC_HOUSE
+        int pc_after = 0;
+        aNSC_pc_hu_hold = 0; /* a new talk: no choice seam is in flight */
+        if (pc_house_upgrade_available() && (aNSC_pc_hu_op = aNSC_pc_hu_talk_op(&pc_after)) != 0) {
+            wait_type = aNSC_WAIT_TYPE_PC_HOUSEUP;
+            aNSC_pc_hu_after = pc_after;
+        } else if (!pc_house_upgrade_available() || wait_type == aNSC_WAIT_TYPE_REHOUSE) {
+            wait_type = aNSC_WAIT_TYPE_3;
+        }
+#else
+        wait_type = aNSC_WAIT_TYPE_3;
+#endif
+    }
+
+#ifdef aNSC_PC_HOUSE
+    if (wait_type == aNSC_WAIT_TYPE_3 && aNSC_pc_hs_intro_due()) {
+        /* Guest-first town M4: a GUEST that was never offered a house: Nook introduces himself and asks (first greeting only) */
+        wait_type = aNSC_WAIT_TYPE_PC_HOUSE;
+    }
+    if (wait_type != aNSC_WAIT_TYPE_HRATALK && aNSC_pc_up_due()) {
+        /* Multiplayer shop upgrade: the NEXT talk after the town qualified is Nook's announcement (a house reminder / balloon / guest intro simply waits for the next talk) */
+        wait_type = aNSC_WAIT_TYPE_PC_UPGRADE;
+    }
+#endif
+
+#ifdef aNSC_PC_HOUSE
+    {
+        static int s_pc_last_wait_type = -1;
+        if (aNSC_PC_IS_CLIENT() && wait_type != s_pc_last_wait_type) {
+            s_pc_last_wait_type = wait_type;
+            printf("[NET][HOUSEUP] nook dialogue: client talk type now %d (0 rehouse, 1 done-rehouse offer, 3 greeting, 7 house upgrade talk start)\n", wait_type);
+        }
+    }
+#endif
     if (mDemo_Check(mDemo_TYPE_SPEAK, actorx) == TRUE && mDemo_Check_ListenAble() == FALSE) {
         switch (wait_type) {
             case aNSC_WAIT_TYPE_HRATALK:
@@ -1767,6 +3107,13 @@ static void aNSC_start_wait(NPC_SHOP_COMMON_ACTOR* shop_common, GAME_PLAY* play)
             case aNSC_WAIT_TYPE_3:
                 action = shop_common->next_action;
                 break;
+#ifdef aNSC_PC_HOUSE
+            case aNSC_WAIT_TYPE_PC_HOUSE:
+            case aNSC_WAIT_TYPE_PC_UPGRADE:
+            case aNSC_WAIT_TYPE_PC_HOUSEUP:
+                action = aNSC_ACTION_CHECK_COL_CHG_OR_MAKE_BASEMENT; /* a greeting that waits for a choice: same animation / position handling */
+                break;
+#endif
             case aNSC_WAIT_TYPE_DONE_REHOUSE: {
                 int idx = mHS_get_arrange_idx(Common_Get(player_no));
                 mHm_hs_c* home = &Save_Get(homes)[idx];
@@ -1795,6 +3142,17 @@ static void aNSC_start_wait(NPC_SHOP_COMMON_ACTOR* shop_common, GAME_PLAY* play)
         }
         aNSC_Set_ListenAble(shop_common);
         aNSC_setupAction(shop_common, play, action);
+#ifdef aNSC_PC_HOUSE
+        if (wait_type == aNSC_WAIT_TYPE_PC_HOUSE) {
+            aNSC_pc_hs_enter(shop_common, aNSC_PC_HS_ASK_INTRO);
+        } else if (wait_type == aNSC_WAIT_TYPE_PC_UPGRADE) {
+            printf("[NET][SHOPUP] nook dialogue: the shop upgrade announcement is shown\n");
+            aNSC_pc_hs_enter(shop_common, aNSC_PC_UP_ASK);
+        } else if (wait_type == aNSC_WAIT_TYPE_PC_HOUSEUP) {
+            printf("[NET][HOUSEUP] nook dialogue: talk start needs the host first: op %d (then vanilla row %d)\n", aNSC_pc_hu_op, aNSC_pc_hu_after);
+            aNSC_pc_hs_enter(shop_common, aNSC_PC_HU_BEGIN);
+        }
+#endif
         return;
     }
 
@@ -1815,6 +3173,17 @@ static void aNSC_start_wait(NPC_SHOP_COMMON_ACTOR* shop_common, GAME_PLAY* play)
         case aNSC_WAIT_TYPE_HRATALK:
             proc = aNSC_set_talk_info_start_wait4;
             break;
+#ifdef aNSC_PC_HOUSE
+        case aNSC_WAIT_TYPE_PC_HOUSE:
+            proc = aNSC_pc_set_talk_info_intro;
+            break;
+        case aNSC_WAIT_TYPE_PC_UPGRADE:
+            proc = aNSC_pc_set_talk_info_upgrade;
+            break;
+        case aNSC_WAIT_TYPE_PC_HOUSEUP:
+            proc = aNSC_pc_set_talk_info_houseup;
+            break;
+#endif
     }
     mDemo_Request(mDemo_TYPE_SPEAK, actorx, proc);
 }
@@ -1874,6 +3243,16 @@ static void aNSC_check_col_chg_or_make_basement(NPC_SHOP_COMMON_ACTOR* shop_comm
                 action = aNSC_ACTION_CHECK_ROOF_COL_ORDER;
                 break;
             case mChoice_CHOICE1:
+#ifdef aNSC_PC_HOUSE
+                if (aNSC_PC_IS_CLIENT()) {
+                    /* worker C: the basement order is the host's (kind 20); the message waits at its continue point meanwhile */
+                    if (aNSC_pc_hu_choice_step(shop_common, PC_HU_OP_ORDER_BASEMENT, 0) < 0) {
+                        return;
+                    }
+                    action = aNSC_ACTION_SAY_HELLO_END_WAIT;
+                    break;
+                }
+#endif
                 aNSC_set_make_basement_info();
                 action = aNSC_ACTION_SAY_HELLO_END_WAIT;
                 break;
@@ -1900,6 +3279,15 @@ static void aNSC_check_roof_col_order(NPC_SHOP_COMMON_ACTOR* shop_common, GAME_P
                 case mChoice_CHOICE1:
                 case mChoice_CHOICE2:
                     action = aNSC_ACTION_SAY_HELLO_END_WAIT;
+#ifdef aNSC_PC_HOUSE
+                    if (aNSC_PC_IS_CLIENT()) {
+                        /* worker C: the size + roof order is the host's (kind 20); the message waits at its continue point meanwhile */
+                        if (aNSC_pc_hu_choice_step(shop_common, PC_HU_OP_ORDER_SIZE, choice) < 0) {
+                            return;
+                        }
+                        break;
+                    }
+#endif
                     home->size_info.next_size += 1;
                     home->ordered_outlook_pal = choice;
                     aNSC_set_rehouse_order_date(home);
@@ -1925,6 +3313,15 @@ static void aNSC_check_roof_col_order2(NPC_SHOP_COMMON_ACTOR* shop_common, GAME_
             case mChoice_CHOICE1:
             case mChoice_CHOICE2:
                 action = aNSC_ACTION_SAY_HELLO_END_WAIT;
+#ifdef aNSC_PC_HOUSE
+                if (aNSC_PC_IS_CLIENT()) {
+                    /* worker C: the size + roof order (second colour page) is the host's (kind 20) */
+                    if (aNSC_pc_hu_choice_step(shop_common, PC_HU_OP_ORDER_SIZE, choice + unk * 3) < 0) {
+                        return;
+                    }
+                    break;
+                }
+#endif
                 home->size_info.next_size += 1;
                 home->ordered_outlook_pal = choice + unk * 3;
                 aNSC_set_rehouse_order_date(home);
@@ -1962,6 +3359,9 @@ static void aNSC_present_balloon_trans_takeout(NPC_SHOP_COMMON_ACTOR* shop_commo
             CLIP(handOverItem_clip)->chg_request_mode_proc((ACTOR*)shop_common, aHOI_REQUEST_TRANSFER);
 
             shop_common->npc_class.left_hand.item_actor_p = res;
+#ifdef TARGET_PC
+            pc_net_game_handover_local(PC_HO_CLASS_SHOP, -1, (int)(u16)actorx->npc_id, PC_HO_KIND_NPC_GIVES, ITM_BALLOON_START, FALSE); /* the other shoppers see it */
+#endif
         }
     }
 
@@ -2019,6 +3419,14 @@ static void aNSC_request_Q_answer_wait(NPC_SHOP_COMMON_ACTOR* shop_common, GAME_
         if (mMsg_Check_MainNormalContinue(msg_p) == TRUE) {
             int next;
             mDemo_Set_msg_num(aNSC_get_msg_no(aNSC_MSG_INTERACT_START));
+#ifdef aNSC_PC_HOUSE
+            if (pc_nook_first_page_work() && mChoice_Get_ChoseNum(mChoice_Get_base_window_p()) == mChoice_CHOICE3) {
+                /* Work Mode: the choice the first page got when its message was loaded ("I'd like to work" / "Check my job") */
+                aNSC_pc_hs_enter(shop_common, aNSC_PC_HS_NONE);
+                aNSC_pc_wk_start_flow(shop_common);
+                return;
+            }
+#endif
             switch (mChoice_Get_ChoseNum(mChoice_Get_base_window_p())) {
                 case mChoice_CHOICE0:
                     next = 1;
@@ -2038,7 +3446,22 @@ static void aNSC_request_Q_answer_wait(NPC_SHOP_COMMON_ACTOR* shop_common, GAME_
                     break;
             }
             mDemo_Set_OrderValue(mDemo_ORDER_NPC0, 0x9, 0x0);
+#ifdef aNSC_PC_HOUSE
+            if (next == 0 && aNSC_pc_hs_menu_offer()) {
+                /* Guest-first town M4: the guest variant of the "Other things" row: the same text + "Buy a house." and "Refresh shop." */
+                aNSC_Set_continue_msg_num(msg_p, shop_common, pc_nook_msg_id(PC_NOOK_MSG_OTHER));
+                aNSC_pc_hs_other_active = 1;
+            } else if (next == 0 && pc_net_game_restock_offer_available()) {
+                /* resident / host player: the same text + "Refresh shop." */
+                aNSC_Set_continue_msg_num(msg_p, shop_common, pc_nook_msg_id(PC_NOOK_MSG_OTHER_R));
+                aNSC_pc_hs_other_active = 2;
+            } else {
+                aNSC_pc_hs_other_active = 0;
+                aNSC_Set_continue_msg_num(msg_p, shop_common, aNSC_get_msg_no(msg_no[next]));
+            }
+#else
             aNSC_Set_continue_msg_num(msg_p, shop_common, aNSC_get_msg_no(msg_no[next]));
+#endif
             aNSC_setupAction(shop_common, play, next_act_idx[next]);
         }
     }
@@ -2058,6 +3481,22 @@ static void aNSC_request_Q_answer_wait2(NPC_SHOP_COMMON_ACTOR* shop_common, GAME
     if (res != 0) {
         if (mMsg_Check_MainNormalContinue(msg_p) == TRUE) {
             int next;
+#ifdef aNSC_PC_HOUSE
+            if ((aNSC_pc_hs_other_active == 1 && mChoice_Get_ChoseNum(mChoice_Get_base_window_p()) == mChoice_CHOICE4) ||
+                (aNSC_pc_hs_other_active == 2 && mChoice_Get_ChoseNum(mChoice_Get_base_window_p()) == mChoice_CHOICE3)) {
+                /* "Refresh shop." (the guest menu has it 5th, the resident menu 4th; the vanilla last choice moved down) */
+                aNSC_pc_hs_enter(shop_common, aNSC_PC_HS_NONE);
+                aNSC_pc_rs_start_flow(shop_common);
+                return;
+            }
+            if (aNSC_pc_hs_other_active == 1 && mChoice_Get_ChoseNum(mChoice_Get_base_window_p()) == mChoice_CHOICE3 && aNSC_pc_hs_menu_offer()) {
+                /* Guest-first town M4: "Buy a house." of the guest "Other things" row (the vanilla 4th choice moved to the 5th place) */
+                printf("[NET][HOUSE] nook dialogue: 'Buy a house.' chosen in the Other things menu\n");
+                aNSC_pc_hs_enter(shop_common, aNSC_PC_HS_NONE);
+                aNSC_pc_hs_start_flow(shop_common);
+                return;
+            }
+#endif
             switch (mChoice_Get_ChoseNum(mChoice_Get_base_window_p())) {
                 case mChoice_CHOICE0:
                     if (Common_Get(time).rtc_time.weekday == 0) {
@@ -2103,6 +3542,9 @@ static void aNSC_request_Q_end_wait(NPC_SHOP_COMMON_ACTOR* shop_common, GAME_PLA
     ACTOR* actorx = (ACTOR*)shop_common;
     if (mDemo_Check(mDemo_TYPE_SPEAK, actorx) == FALSE && mDemo_Check(mDemo_TYPE_TALK, actorx) == FALSE) {
         shop_common->sell_item = EMPTY_NO;
+#ifdef TARGET_PC
+        pc_sell_ui_reset("the conversation ended"); /* Nook bulk sell basket: nothing survives the talk */
+#endif
         aNSC_setupAction(shop_common, play, aNSC_ACTION_WAIT);
     }
 }
@@ -2124,6 +3566,11 @@ static void aNSC_buy_menu_open_wait(NPC_SHOP_COMMON_ACTOR* shop_common, GAME_PLA
 
 static void aNSC_buy_menu_close_wait(NPC_SHOP_COMMON_ACTOR* shop_common, GAME_PLAY* play) {
     if (play->submenu.open_flag == FALSE) {
+#ifdef TARGET_PC
+        if (pc_sell_ui_active()) {
+            (void)pc_sell_ui_close(&play->submenu); /* Nook bulk sell basket: the staged items become the vanilla selection (item_p[], selected_item_num) */
+        }
+#endif
         aNSC_setupAction(shop_common, play, shop_common->action + 1);
     }
 }
@@ -2149,7 +3596,28 @@ static void aNSC_msg_win_open_wait(NPC_SHOP_COMMON_ACTOR* shop_common, GAME_PLAY
             action = aNSC_CHECK_BUY_NONE_SELECTED;
         } else {
             action = aNSC_check_buy_item(shop_common, submenu);
+#ifdef TARGET_PC
+            if (aNSC_PC_IS_CLIENT() && aNSC_pc_selection_has_paper(submenu)) {
+                /* stationery stacks (price x stack, per-stack paper accounting) are not sold through the network seam: the existing "cannot take that" row */
+                action = aNSC_CHECK_BUY_REFUSE_QUEST_COND;
+            }
+#endif
         }
+#ifdef TARGET_PC
+        if (pc_sell_ui_take_from_basket() && item != EMPTY_NO && action != aNSC_CHECK_BUY_REFUSE_QUEST_COND) {
+            /* Nook bulk sell basket: the closed basket is ONE multi-item sale (also for a single item: never the "all of these?" offer). counter = the count
+             * (aNSC_check_buy_item_plural), the quote row says the count and the total (the same price / 4 + turnip values aNSC_buy_check_init computes) and
+             * asks Yes. / No.; aNSC_buy_check reads that choice exactly like the vanilla offer (Yes = the vanilla / network sale of every selected slot). */
+            (void)aNSC_check_buy_item_plural(shop_common, submenu);
+            pc_nook_house_set_sell(pc_sell_ui_last_count(), pc_sell_ui_last_total());
+            msg_no = pc_nook_msg_id(PC_NOOK_MSG_SELL_BASKET);
+            printf("[NET][SELL] nook dialogue: basket quote %d item(s) %u Bells (message 0x%04X)\n", pc_sell_ui_last_count(), pc_sell_ui_last_total(), msg_no);
+            aNSC_Set_continue_msg_num(msg_p, shop_common, msg_no);
+            mMsg_Set_ForceNext(msg_p);
+            aNSC_setupAction(shop_common, play, aNSC_ACTION_BUY_CHECK);
+            return;
+        }
+#endif
         if (action == aNSC_CHECK_BUY_OFFER_BUY_ALL) {
 #ifdef aNSC_MAMEDANUKI
             msg_no = 0x173D;
@@ -2159,6 +3627,12 @@ static void aNSC_msg_win_open_wait(NPC_SHOP_COMMON_ACTOR* shop_common, GAME_PLAY
         } else {
             msg_no = aNSC_get_msg_no(msg_no_table[action]);
         }
+#ifdef TARGET_PC
+        if (action == aNSC_CHECK_BUY_NONE_SELECTED && pc_sell_ui_enabled()) {
+            /* Nook bulk sell basket: B (or an empty basket) = the vanilla cancel of the sell picker: aNSC_MSG_SELL_CANCEL, then his "anything else?" choice */
+            printf("[NET][SELL] nook dialogue: nothing selected (the basket was cancelled) -> the vanilla sell-cancel row 0x%04X\n", msg_no);
+        }
+#endif
         aNSC_Set_continue_msg_num(msg_p, shop_common, msg_no);
         mMsg_Set_ForceNext(msg_p);
         aNSC_setupAction(shop_common, play, next_act_idx[action]);
@@ -2203,6 +3677,30 @@ static void aNSC_buy_check(NPC_SHOP_COMMON_ACTOR* shop_common, GAME_PLAY* play) 
     int n3 = aNSC_get_msg_no(aNSC_MSG_BUY_REFUSE_PLURAL);
     int num = mMsg_Get_msg_num(msg_p);
     int next;
+#ifdef TARGET_PC
+    if (aNSC_PC_IS_CLIENT() && aNSC_pc_sell_wait) {
+        /* the sale transaction is in flight (or still to be begun): nothing local changes until the host's answer */
+        next = aNSC_pc_sell_step();
+        if (next == -1) {
+            return;
+        }
+        mMsg_Set_ForceNext(msg_p);
+        aNSC_Set_continue_msg_num(msg_p, shop_common, aNSC_get_msg_no(msg_no[next]));
+        aNSC_setupAction(shop_common, play, next_act_idx[next]);
+        return;
+    }
+#endif
+#ifdef TARGET_PC
+    if (num == pc_nook_msg_id(PC_NOOK_MSG_SELL_BASKET) && mMsg_Check_MainNormalContinue(msg_p) &&
+        (mChoice_Get_ChoseNum(mChoice_Get_base_window_p()) == mChoice_CHOICE0 || mChoice_Get_ChoseNum(mChoice_Get_base_window_p()) == mChoice_CHOICE1)) {
+        /* Nook bulk sell basket: Yes. (the sale reads the vanilla Submenu selection, not the basket) or No. (the vanilla sell-cancel row + "anything else?"):
+         * nothing of the basket is remembered either way (the next open is EMPTY) */
+        pc_sell_ui_reset(mChoice_Get_ChoseNum(mChoice_Get_base_window_p()) == mChoice_CHOICE0 ? "Nook's quote: Yes" : "Nook's quote: No");
+    }
+    if (num == pc_nook_msg_id(PC_NOOK_MSG_SELL_BASKET)) {
+        num = n2; /* the basket quote is read exactly like the vanilla multi-item offer (aNSC_MSG_BUY_MANY_OFFER) */
+    }
+#endif
     if (num == n1 || num == n2 || num == n3) {
         if (mMsg_Check_MainNormalContinue(msg_p)) {
             next = -1;
@@ -2215,7 +3713,14 @@ static void aNSC_buy_check(NPC_SHOP_COMMON_ACTOR* shop_common, GAME_PLAY* play) 
                     next = 1;
                     if (!aNSC_check_money_overflow(bells, counter)) {
                         next = aNSC_BUY_OUTCOME_MONEY_OVERFLOW;
-                    } else {
+                    }
+#ifdef TARGET_PC
+                    else if (aNSC_PC_IS_CLIENT()) {
+                        /* town services milestone 2: the host pays, credits sales_sum and empties the slots; nothing is changed here */
+                        next = aNSC_pc_sell_prepare(shop_common, play) ? aNSC_pc_sell_step() : aNSC_BUY_OUTCOME_CANCEL;
+                    }
+#endif
+                    else {
                         mActor_name_t item = Now_Private->inventory.pockets[submenu_item->slot_no];
                         mSP_PlusSales(shop_common->money / 2);
                         if (counter == 1) {
@@ -2304,11 +3809,37 @@ static void aNSC_buy_continue_check(NPC_SHOP_COMMON_ACTOR* shop_common, GAME_PLA
 static void aNSC_receive_check(NPC_SHOP_COMMON_ACTOR* shop_common, GAME_PLAY* play) {
     mMsg_Window_c* msg_p = mMsg_Get_base_window_p();
     int no = mMsg_Get_msg_num(msg_p);
+#ifdef TARGET_PC
+    if (aNSC_PC_IS_CLIENT() && aNSC_pc_sell_wait) {
+        /* the free disposal of a worthless item is a SHOP_SELL of value 0 and is in flight */
+        if (aNSC_pc_sell_step() == -1) {
+            return;
+        }
+        aNSC_setupAction(shop_common, play, aNSC_ACTION_REQUEST_Q_ANSWER_WAIT);
+        return;
+    }
+#endif
     if (shop_common->msg_no == no) {
         if (mMsg_Check_MainNormalContinue(msg_p)) {
             Submenu_Item_c* submenu_item = play->submenu.item_p;
             switch (mChoice_Get_ChoseNum(mChoice_Get_base_window_p())) {
                 case mChoice_CHOICE0:
+#ifdef TARGET_PC
+                    if (aNSC_PC_IS_CLIENT()) {
+                        /* town services milestone 2: the slot is emptied by the host's post-image, never here */
+                        if (submenu_item->slot_no < mPr_POCKETS_SLOT_COUNT) {
+                            aNSC_pc_sell_mask = 1u << submenu_item->slot_no;
+                            aNSC_pc_sell_primary = submenu_item->slot_no;
+                            aNSC_pc_sell_item = Now_Private->inventory.pockets[submenu_item->slot_no];
+                            aNSC_pc_sell_bags_before = aNSC_pc_count_bags();
+                            aNSC_pc_sell_wait = 1;
+                            if (aNSC_pc_sell_step() == -1) {
+                                return;
+                            }
+                        }
+                        break;
+                    }
+#endif
                     mPr_SetPossessionItem(Now_Private, submenu_item->slot_no, EMPTY_NO, mPr_ITEM_COND_NORMAL);
                     break;
             }
@@ -2331,6 +3862,12 @@ static void aNSC_msg_win_open_wait2(NPC_SHOP_COMMON_ACTOR* shop_common, GAME_PLA
             action = 0;
         } else {
             action = (submenu_item->slot_no != 0 ? 2 : 1);
+            if (aNSC_PC_IS_CLIENT()) {
+                /* Batch G2: refuse the order up front (ORDER_UNAVAILABLE -> REQUEST_Q_ANSWER_WAIT, the
+                 * same clean path as an unorderable item) so no bell is taken for an order the host never
+                 * delivers. Host/solo unchanged. */
+                action = 1;
+            }
             aNSC_set_item_name_str(item, 0x1);
             shop_common->order_item = item;
         }
@@ -2349,7 +3886,11 @@ static void aNSC_order_check(NPC_SHOP_COMMON_ACTOR* shop_common, GAME_PLAY* play
             switch (mChoice_Get_ChoseNum(mChoice_Get_base_window_p())) {
                 case mChoice_CHOICE0:
                     price = mSP_ItemNo2ItemPrice(shop_common->order_item);
-                    if (aNSC_money_check(price) == FALSE) {
+                    if (aNSC_PC_IS_CLIENT()) {
+                        /* Batch G2 defense in depth (normally unreachable: the offer is refused above):
+                         * end as a cancelled order, before any bell or order slot is touched. */
+                        msg_no = aNSC_MSG_ORDER_CANCEL;
+                    } else if (aNSC_money_check(price) == FALSE) {
                         msg_no = aNSC_MSG_ORDER_INSUFFICIENT_FUNDS;
                     } else {
                         msg_no = aNSC_MSG_ORDER_CONFIRM;
@@ -2401,21 +3942,45 @@ static void aNSC_sell_check(NPC_SHOP_COMMON_ACTOR* shop_common, GAME_PLAY* play)
 }
 
 static void aNSC_sell_answer0(NPC_SHOP_COMMON_ACTOR* shop_common, GAME_PLAY* play) {
-    static int next_act_idx[11] = { aNSC_ACTION_SELL_ITEM_WITHOUT_TICKET, aNSC_ACTION_SELL_ITEM_WITH_TICKET,
+    static int next_act_idx[12] = { aNSC_ACTION_SELL_ITEM_WITHOUT_TICKET, aNSC_ACTION_SELL_ITEM_WITH_TICKET,
                                     aNSC_ACTION_SELL_ITEM_WITH_TICKET,    aNSC_ACTION_SELL_ITEM_INSUFICIENT_FUNDS,
                                     aNSC_ACTION_SELL_ITEM_POCKETS_FULL,   aNSC_ACTION_SELL_ITEM_WITHOUT_TICKET,
                                     aNSC_ACTION_SELL_ITEM_WITHOUT_TICKET, aNSC_ACTION_SELL_ITEM_WITHOUT_TICKET,
                                     aNSC_ACTION_SELL_ITEM_WITHOUT_TICKET, aNSC_ACTION_SELL_ITEM_WITHOUT_TICKET,
-                                    aNSC_ACTION_SELL_ITEM_WITHOUT_TICKET };
-    static int msg_no[11] = { aNSC_MSG_BUY_NORMAL,         aNSC_MSG_GIVE_TICKET,  aNSC_MSG_MAIL_TICKET,
+                                    aNSC_ACTION_SELL_ITEM_WITHOUT_TICKET, aNSC_ACTION_SELL_ITEM_INSUFICIENT_FUNDS };
+    static int msg_no[12] = { aNSC_MSG_BUY_NORMAL,         aNSC_MSG_GIVE_TICKET,  aNSC_MSG_MAIL_TICKET,
                               aNSC_MSG_INSUFFICIENT_FUNDS, aNSC_MSG_POCKETS_FULL, aNSC_MSG_SELL_NET,
                               aNSC_MSG_SELL_AXE,           aNSC_MSG_SELL_SHOVEL,  aNSC_MSG_SELL_ROD,
-                              aNSC_MSG_SELL_PAINT_CONFIRM, aNSC_MSG_SELL_SIGN };
+                              aNSC_MSG_SELL_PAINT_CONFIRM, aNSC_MSG_SELL_SIGN,    aNSC_MSG_BUY_CANCEL };
+#ifdef TARGET_PC
+    if (aNSC_PC_IS_CLIENT() && aNSC_pc_buy_wait) {
+        /* the purchase transaction is in flight: nothing local changes until the host's answer (the money check is NOT re-run: APPLIED already debited) */
+        int pc_next = aNSC_pc_buy_step(shop_common);
+        if (pc_next == -1) {
+            return;
+        }
+        if (pc_next == 0) {
+            pc_next = aNSC_pc_buy_success_row(shop_common->sell_item);
+        }
+        pc_nook_map_line_clear(); /* a stale arm never reaches a purchase that did not grant */
+        aNSC_Set_continue_msg_num(mMsg_Get_base_window_p(), shop_common, aNSC_get_msg_no(msg_no[pc_next]));
+        aNSC_pc_map_chain_msg(shop_common->msg_no); /* a no-op unless THIS purchase just granted the map (the flag is only set on APPLIED) */
+        mDemo_Set_OrderValue(mDemo_ORDER_NPC0, 0x9, 0x0);
+        aNSC_setupAction(shop_common, play, next_act_idx[pc_next]);
+        return;
+    }
+#endif
     if (mDemo_Get_OrderValue(mDemo_TYPE_4, 0x9)) {
         mMsg_Window_c* msg_p = mMsg_Get_base_window_p();
         if (mMsg_Check_MainNormal(msg_p) == TRUE) {
             int next = 0;
             if (aNSC_money_check(shop_common->value) == FALSE) {
+                next = 0x3;
+            } else if (aNSC_PC_IS_CLIENT() && shop_common->sell_item >= ITM_RED_PAINT &&
+                       shop_common->sell_item <= ITM_BROWN_PAINT) {
+                /* Batch G3 defense in depth (normally unreachable: client paint talks take the foreigner
+                 * path above): refuse before homes[].next_outlook_pal or the pending flag is written. The
+                 * existing INSUFFICIENT_FUNDS reply ends cleanly and takes no bell. */
                 next = 0x3;
             } else {
                 mActor_name_t item = shop_common->sell_item;
@@ -2425,12 +3990,35 @@ static void aNSC_sell_answer0(NPC_SHOP_COMMON_ACTOR* shop_common, GAME_PLAY* pla
                         (item >= ITM_RED_PAINT && item <= ITM_BROWN_PAINT) ? (item - ITM_RED_PAINT) : 0;
                     next = 0x9;
                     Now_Private->state_flags |= mPr_FLAG_UPDATE_OUTLOOK_PENDING;
-                } else {
+                }
+#ifdef TARGET_PC
+                else if (aNSC_PC_IS_CLIENT()) {
+                    /* town services milestone 2: the host takes the price, marks the stock slot sold, credits sales_sum and puts the item in the
+                     * pocket slot of its post-image; this seam changes nothing locally (see aNSC_pc_buy_step) */
+                    int pc_next = aNSC_pc_buy_step(shop_common);
+                    if (pc_next == -1) {
+                        return;
+                    }
+                    next = (pc_next == 0) ? aNSC_pc_buy_success_row(item) : pc_next;
+                }
+#endif
+                else {
                     int idx = mPr_GetPossessionItemIdx(Now_Private, EMPTY_NO);
                     if (idx == -1) {
                         next = 0x4;
-                    } else {
+                    }
+#ifdef TARGET_PC
+                    else if (!pc_net_game_host_shop_can_sell((int)item)) {
+                        /* H1: a networked HOST re-checks the stock at the moment of the purchase (a client's SHOP_BUY may have sold this unique item
+                         * since the price dialogue opened): refused with the existing cancel row BEFORE the pocket write / debit */
+                        next = aNSC_PC_ROW_REFUSED;
+                    }
+#endif
+                    else {
                         mPr_SetPossessionItem(Now_Private, idx, item, mPr_ITEM_COND_NORMAL);
+#ifdef TARGET_PC
+                        pc_net_game_host_shop_reserve((int)item); /* Patch 1: the unique item is taken; the debit + sold mark follow in aNSC_sell_item_init: until then a client's SHOP_BUY must not see it as stock */
+#endif
                         if (aNSC_check_item_with_ticket(item) == TRUE) {
                             mActor_name_t ticket = (Common_Get(time).rtc_time.month - 1) * 8 + ITM_TICKET_START;
                             if (aNSC_check_same_month_ticket(ticket) == TRUE) {
@@ -2460,6 +4048,9 @@ static void aNSC_sell_answer0(NPC_SHOP_COMMON_ACTOR* shop_common, GAME_PLAY* pla
                     }
                 }
             }
+#ifdef TARGET_PC
+            pc_nook_map_line_clear(); /* a stale arm never reaches a purchase that did not grant (the host's grant arms later, in aNSC_sell_item_init) */
+#endif
             aNSC_Set_continue_msg_num(msg_p, shop_common, aNSC_get_msg_no(msg_no[next]));
             mDemo_Set_OrderValue(mDemo_ORDER_NPC0, 0x9, 0x0);
             aNSC_setupAction(shop_common, play, next_act_idx[next]);
@@ -2764,6 +4355,9 @@ static void aNSC_pc_present_trans_takeout(NPC_SHOP_COMMON_ACTOR* shop_common, GA
         if (actor) {
             CLIP(handOverItem_clip)->chg_request_mode_proc((ACTOR*)shop_common, 0x1);
             shop_common->npc_class.left_hand.item_actor_p = actor;
+#ifdef TARGET_PC
+            pc_net_game_handover_local(PC_HO_CLASS_SHOP, -1, (int)(u16)((ACTOR*)shop_common)->npc_id, PC_HO_KIND_NPC_GIVES, (int)shop_common->password.item, FALSE); /* the other shoppers see it */
+#endif
         }
     }
     if (shop_common->npc_class.draw.main_animation_state == cKF_STATE_STOPPED) {
@@ -2787,7 +4381,43 @@ static void aNSC_pc_present_end_wait(NPC_SHOP_COMMON_ACTOR* shop_common, GAME_PL
     }
 }
 
+#ifdef TARGET_PC
+/* hand-over animations (pc_handover.h): ANOTHER player's hand-over with the keeper of this shop (message 103, relayed by the host): the idle keeper here plays the same clips
+ * once (no item in hand: the item actor belongs to that player's own process). TRUE = a clip of it is showing (the idle decision waits). */
+static int aNSC_pc_ho_observer(NPC_SHOP_COMMON_ACTOR* shop_common, GAME_PLAY* play) {
+    static int s_last = PC_HO_ST_NONE;
+    static const s16 anim_n[] = { aNPC_ANIM_WAIT1, aNPC_ANIM_TRANSFER1, aNPC_ANIM_TRANS_WAIT1, aNPC_ANIM_GET1, aNPC_ANIM_GET_PULL1, aNPC_ANIM_GET_PUTAWAY1 };
+    static const s16 anim_f[] = { aNPC_ANIM_WAIT1, aNPC_ANIM_TRANSFER_F1, aNPC_ANIM_TRANS_WAIT_F1, aNPC_ANIM_GET_F1, aNPC_ANIM_GET_PULL_F1, aNPC_ANIM_GET_PUTAWAY_F1 };
+    ACTOR* actorx = (ACTOR*)shop_common;
+    int changed = 0, fish = 0;
+    int st = pc_net_game_shop_handover_step((int)(u16)actorx->npc_id, shop_common->npc_class.draw.main_animation_state == cKF_STATE_STOPPED,
+                                            (f32)gamePT->graph->dt_num_60fps_frames, &changed, &fish);
+
+    if (st == PC_HO_ST_NONE || st == PC_HO_ST_DONE) {
+        if (s_last != PC_HO_ST_NONE) {
+            aNSC_setupAction(shop_common, play, shop_common->action); /* back to the idle action (its clip and its speed) */
+            s_last = PC_HO_ST_NONE;
+        }
+        return FALSE;
+    }
+    aNSC_set_stop_spd(shop_common); /* a keeper walking after his player stops for it */
+    if (st != s_last) {
+        CLIP(npc_clip)->animation_init_proc(actorx, fish ? anim_f[st] : anim_n[st], TRUE);
+        if (st == PC_HO_ST_TRANSFER || st == PC_HO_ST_GET_PUTAWAY) {
+            sAdo_OngenTrgStart(NA_SE_GASAGOSO, &actorx->world.position);
+        }
+        s_last = st;
+    }
+    return TRUE;
+}
+#endif
+
 static void aNSC_wait(NPC_SHOP_COMMON_ACTOR* shop_common, GAME_PLAY* play) {
+#ifdef TARGET_PC
+    if (aNSC_pc_ho_observer(shop_common, play)) {
+        return;
+    }
+#endif
     if (aNSC_message_ctrl(shop_common, play) != TRUE) {
         int act = aNSC_decide_next_move_act(shop_common, play);
         if (act != shop_common->action) {
@@ -2799,6 +4429,11 @@ static void aNSC_wait(NPC_SHOP_COMMON_ACTOR* shop_common, GAME_PLAY* play) {
 }
 
 static void aNSC_walk_pl_other_zone(NPC_SHOP_COMMON_ACTOR* shop_common, GAME_PLAY* play) {
+#ifdef TARGET_PC
+    if (aNSC_pc_ho_observer(shop_common, play)) {
+        return; /* hand-over animations: another player's hand-over with this keeper is showing */
+    }
+#endif
     if (aNSC_message_ctrl(shop_common, play) != TRUE) {
         int act = aNSC_decide_next_move_act(shop_common, play);
         if (act != shop_common->action) {
@@ -2811,6 +4446,11 @@ static void aNSC_walk_pl_other_zone(NPC_SHOP_COMMON_ACTOR* shop_common, GAME_PLA
 
 static void aNSC_turn(NPC_SHOP_COMMON_ACTOR* shop_common, GAME_PLAY* play) {
     ACTOR* actorx = (ACTOR*)shop_common;
+#ifdef TARGET_PC
+    if (aNSC_pc_ho_observer(shop_common, play)) {
+        return; /* hand-over animations: another player's hand-over with this keeper is showing */
+    }
+#endif
     if (aNSC_message_ctrl(shop_common, play) != TRUE) {
         if (GET_PLAYER_ACTOR(play)) {
             s16 player_angle = shop_common->player_angle;
@@ -2972,6 +4612,17 @@ static void aNSC_buy_menu_open_wait_init(NPC_SHOP_COMMON_ACTOR* shop_common, GAM
 }
 
 static void aNSC_buy_menu_close_wait_init(NPC_SHOP_COMMON_ACTOR* shop_common, GAME_PLAY* play) {
+#ifdef TARGET_PC
+    if (pc_sell_ui_enabled()) {
+        /* Nook bulk sell basket: the sell picker is the basket screen (the dresser screen in basket mode: the inventory in HANIWA_ENTRUST mode opens the gyroid
+         * overlay; data1 = 0 is never read in basket mode). Nothing changes in the pockets while it is open; its close fills the vanilla multi-item selection
+         * (aNSC_buy_menu_close_wait -> pc_sell_ui_close), which the rest of this state machine already knows (vanilla X-mark "Sell all"). */
+        pc_sell_ui_open();
+        mSM_open_submenu(&play->submenu, mSM_OVL_INVENTORY, mSM_IV_OPEN_HANIWA_ENTRUST, 0x0);
+        shop_common->next_action = 0x13;
+        return;
+    }
+#endif
     mSM_open_submenu(&play->submenu, mSM_OVL_INVENTORY, 0x5, 0x0);
     shop_common->next_action = 0x13;
 }
@@ -2982,6 +4633,9 @@ static void aNSC_msg_win_open_wait_init(NPC_SHOP_COMMON_ACTOR* shop_common, GAME
 
 static void aNSC_buy_sum_check_init(NPC_SHOP_COMMON_ACTOR* shop_common, GAME_PLAY* play) {
     mDemo_Set_OrderValue(mDemo_ORDER_NPC0, 0x9, 0x0);
+#ifdef TARGET_PC
+    aNSC_pc_reset_waits(); /* a new sale starts: no stale town-service wait state */
+#endif
 }
 
 static void aNSC_buy_check_init(NPC_SHOP_COMMON_ACTOR* shop_common, GAME_PLAY* play) {
@@ -3027,6 +4681,9 @@ static void aNSC_order_check_init(NPC_SHOP_COMMON_ACTOR* shop_common, GAME_PLAY*
 static void aNSC_sell_check_before_init(NPC_SHOP_COMMON_ACTOR* shop_common, GAME_PLAY* play) {
     mDemo_Set_OrderValue(mDemo_ORDER_NPC0, 0x9, 0x0);
     aNSC_set_stop_spd(shop_common);
+#ifdef TARGET_PC
+    aNSC_pc_reset_waits(); /* a new purchase starts: no stale town-service wait state */
+#endif
 }
 
 static void aNSC_sell_answer0_init(NPC_SHOP_COMMON_ACTOR* shop_common, GAME_PLAY* play) {
@@ -3057,11 +4714,58 @@ static void aNSC_sell_answer1_init(NPC_SHOP_COMMON_ACTOR* shop_common, GAME_PLAY
     shop_common->sell_item = EMPTY_NO;
 }
 
+#ifdef TARGET_PC
+/* MAP GRANT for the networked HOST's own player (a client's grant is made by the host in the mirror + its APPLIED): the first completed purchase
+ * records this land in Private_c.maps[] (mPr_SetNewMap skips a land already present: idempotent) and unlocks the town map. Solo (ROLE_NONE) untouched.
+ * This file is #included by several shop actors, so the function is static here (one copy per includer); the PC_NET_TEST_HOOKS host hook
+ * (AC_TEST_HOST_MAP_GRANT) reaches the SAME code through ONE exported wrapper, defined only in the includer that sets aNSC_PC_EXPORT_MAP_GRANT.
+ * Returns 1 when the entry was added. */
+static int aNSC_pc_host_first_purchase_map_grant_impl(void) {
+    if (pc_net_game_role() == PC_NETGAME_ROLE_HOST && Now_Private != NULL &&
+        mPr_GetThisLandMapIdx(Now_Private->maps, mPr_FOREIGN_MAP_COUNT) == -1) {
+        mPr_SetNewMap(Now_Private->maps, mPr_FOREIGN_MAP_COUNT);
+        Common_Set(map_flag, TRUE);
+        aNSC_pc_map_just_granted = 1; /* the one-shot MAP LINE flag: consumed by aNSC_pc_map_chain_msg() in aNSC_sell_item_init */
+        aNSC_pc_map_flag_sets++;
+        printf("[NET][SHOP] host: own purchase granted the town map (one-shot map-line flag set, total %d)\n", aNSC_pc_map_flag_sets);
+        return 1;
+    }
+    return 0;
+}
+#ifdef aNSC_PC_EXPORT_MAP_GRANT
+int aNSC_pc_host_first_purchase_map_grant(void) {
+    return aNSC_pc_host_first_purchase_map_grant_impl();
+}
+/* TEST-ONLY reach into the single exported copy's one-shot state (the PC_NET_TEST_HOOKS map-grant hook): returns the flag, *total = times it was set;
+ * chain_test(msg) runs the same consume-and-arm step aNSC_sell_item_init runs (no dialogue is driven). */
+int aNSC_pc_map_oneshot_state(int* total) {
+    if (total != NULL) {
+        *total = aNSC_pc_map_flag_sets;
+    }
+    return aNSC_pc_map_just_granted;
+}
+void aNSC_pc_map_chain_test(int msg_index) {
+    aNSC_pc_map_chain_msg(msg_index);
+}
+#endif
+#endif
+
 static void aNSC_sell_item_init(NPC_SHOP_COMMON_ACTOR* shop_common, GAME_PLAY* play) {
+#ifdef TARGET_PC
+    if (!aNSC_PC_IS_CLIENT()) {
+        aNSC_get_sell_price(shop_common->value);
+        (void)aNSC_pc_host_first_purchase_map_grant_impl();
+        aNSC_pc_map_chain_msg(shop_common->msg_no); /* the thanks message was selected by aNSC_sell_answer0 just before this init: arm the extra page iff this purchase granted */
+    } /* else: a CLIENT's bells already left with the host's post-image (APPLIED); the report below only redraws the floor on a client */
+#else
     aNSC_get_sell_price(shop_common->value);
+#endif
     if (CLIP(shop_design_clip) != NULL) {
         CLIP(shop_design_clip)->reportGoodsSale_proc(shop_common->ut_x, shop_common->ut_z);
     }
+#ifdef TARGET_PC
+    pc_net_game_host_shop_sold_notify(); /* Patch 1: publish the host's own sale at once (a no-op for a client / solo) */
+#endif
     shop_common->sell_item = EMPTY_NO;
 }
 

@@ -25,6 +25,9 @@ enum {
     ITEM_RESETTI,
     ITEM_SHOP_VISITOR,
     ITEM_BORDERLESS_ACRES,
+    ITEM_FAST_TEXT,
+    ITEM_SHOW_ACRE,
+    ITEM_TOUCH,
     ITEM_NES_ASPECT,
     ITEM_MASTER_VOLUME,
     ITEM_STICK_DEADZONE,
@@ -54,6 +57,9 @@ static const Item tab_gameplay_items[] = {
     { "Resetti",          ITEM_RESETTI,          0 },
     { "Shop upgrade",     ITEM_SHOP_VISITOR,     0 },
     { "Borderless acres", ITEM_BORDERLESS_ACRES, 0 },
+    { "Fast text",        ITEM_FAST_TEXT,        0 },
+    { "Acre label",       ITEM_SHOW_ACRE,        0 },
+    { "Touch controls",   ITEM_TOUCH,            0 },
     { "NES aspect",       ITEM_NES_ASPECT,       0 },
 };
 
@@ -141,6 +147,11 @@ static const BindRow s_bind_rows[] = {
     BROW("D-Pad Down",  dpad_down,  dpad_down),
     BROW("D-Pad Left",  dpad_left,  dpad_left),
     BROW("D-Pad Right", dpad_right, dpad_right),
+    /* PC actions (keybindings.ini Wheel / Chat / Emote, Pad_Wheel / Pad_Emote): the tool wheel and the emote wheel are HELD (the mouse /
+     * the right stick selects, release confirms); chat is keyboard only (its line is typed) */
+    BROW("Tool Wheel",  wheel,      wheel),
+    BROW_K("Chat",      chat,       "-"),
+    BROW("Emote Wheel", emote,      emote),
 };
 #define BIND_ROW_COUNT    ((int)(sizeof(s_bind_rows) / sizeof(s_bind_rows[0])))
 #define BIND_VISIBLE      9
@@ -174,12 +185,21 @@ static void bind_assign_kb(int row, PCInputCode code) {
     *dst = code;
 }
 
+/* The one deliberately shared pad pair: the emote wheel (held, free play only) and the D-Pad Up button (read only by choice menus, unused
+ * in free play) may both be D-pad Up, the default. Every other pad conflict swaps as usual. */
+static int bind_pad_shared_ok(int a, int b) {
+    const int emote_off = (int)offsetof(PCPadBindings, emote), up_off = (int)offsetof(PCPadBindings, dpad_up);
+    const int pa = s_bind_rows[a].pad_off, pb = s_bind_rows[b].pad_off;
+    return (pa == emote_off && pb == up_off) || (pa == up_off && pb == emote_off);
+}
+
 static void bind_assign_pad(int row, PCPadCode code) {
     PCPadCode* dst = bind_pad_slot(row);
     if (!dst) return;
     if (code >= 0) {
         for (int i = 0; i < BIND_ROW_COUNT; i++) {
             if (i == row) continue;
+            if (bind_pad_shared_ok(row, i)) continue;
             PCPadCode* other = bind_pad_slot(i);
             if (other && *other == code) { *other = *dst; break; }
         }
@@ -254,6 +274,9 @@ static void recompute_dirty(void) {
         (s_pending.disable_resetti  != g_pc_settings.disable_resetti) ||
         (s_pending.disable_shop_visitor_req != g_pc_settings.disable_shop_visitor_req) ||
         (s_pending.borderless_acres != g_pc_settings.borderless_acres) ||
+        (s_pending.fast_text        != g_pc_settings.fast_text) ||
+        (s_pending.show_acre        != g_pc_settings.show_acre) ||
+        (s_pending.touch_controls   != g_pc_settings.touch_controls) ||
         (s_pending.nes_aspect       != g_pc_settings.nes_aspect) ||
         (s_pending.master_volume    != g_pc_settings.master_volume) ||
         (s_pending.stick_deadzone   != g_pc_settings.stick_deadzone) ||
@@ -312,6 +335,15 @@ static void item_cycle(int id, int dir) {
             break;
         case ITEM_BORDERLESS_ACRES:
             s_pending.borderless_acres = !s_pending.borderless_acres;
+            break;
+        case ITEM_FAST_TEXT:
+            s_pending.fast_text = !s_pending.fast_text;
+            break;
+        case ITEM_SHOW_ACRE:
+            s_pending.show_acre = !s_pending.show_acre;
+            break;
+        case ITEM_TOUCH:
+            s_pending.touch_controls = s_pending.touch_controls < 0 ? 1 : s_pending.touch_controls > 0 ? 0 : -1;
             break;
         case ITEM_NES_ASPECT:
             s_pending.nes_aspect = !s_pending.nes_aspect;
@@ -383,6 +415,15 @@ static void item_format(int id, char* buf, size_t n) {
         case ITEM_BORDERLESS_ACRES:
             snprintf(buf, n, "%s", s_pending.borderless_acres ? "< On >" : "< Off >");
             break;
+        case ITEM_FAST_TEXT:
+            snprintf(buf, n, "%s", s_pending.fast_text ? "< On >" : "< Off >");
+            break;
+        case ITEM_SHOW_ACRE:
+            snprintf(buf, n, "%s", s_pending.show_acre ? "< On >" : "< Off >");
+            break;
+        case ITEM_TOUCH:
+            snprintf(buf, n, "%s", s_pending.touch_controls < 0 ? "< Auto >" : s_pending.touch_controls ? "< On >" : "< Off >");
+            break;
         case ITEM_NES_ASPECT:
             snprintf(buf, n, "%s", s_pending.nes_aspect ? "< 4:3 >" : "< Stretch >");
             break;
@@ -418,6 +459,9 @@ static int item_changed(int id) {
         case ITEM_RESETTI:    return s_pending.disable_resetti  != g_pc_settings.disable_resetti;
         case ITEM_SHOP_VISITOR: return s_pending.disable_shop_visitor_req != g_pc_settings.disable_shop_visitor_req;
         case ITEM_BORDERLESS_ACRES: return s_pending.borderless_acres != g_pc_settings.borderless_acres;
+        case ITEM_FAST_TEXT:        return s_pending.fast_text        != g_pc_settings.fast_text;
+        case ITEM_SHOW_ACRE:        return s_pending.show_acre        != g_pc_settings.show_acre;
+        case ITEM_TOUCH:            return s_pending.touch_controls   != g_pc_settings.touch_controls;
         case ITEM_NES_ASPECT:    return s_pending.nes_aspect    != g_pc_settings.nes_aspect;
         case ITEM_MASTER_VOLUME: return s_pending.master_volume != g_pc_settings.master_volume;
         case ITEM_STICK_DEADZONE:  return s_pending.stick_deadzone  != g_pc_settings.stick_deadzone;

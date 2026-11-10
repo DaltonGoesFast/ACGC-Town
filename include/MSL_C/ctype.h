@@ -1,9 +1,15 @@
+#ifdef TARGET_PC
+#include <ctype.h>
+/* A macro, not a static inline: MinGW's ctype.h already declares _tolower as a
+ * function, and a second definition fails to compile. glibc's macro is replaced
+ * with the same call. */
+#ifdef _tolower
+#undef _tolower
+#endif
+#define _tolower(c) tolower((c))
+#else
 #ifndef _CTYPE_H
 #define _CTYPE_H
-
-#ifdef TARGET_PC
-#include <ctype.h> // Conflicts can happen otherwise in certain compiler versions
-#else
 
 #include "MSL_C/locale.h"
 #include "MSL_C/ctype_api.h"

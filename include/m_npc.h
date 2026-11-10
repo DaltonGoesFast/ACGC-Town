@@ -361,6 +361,17 @@ extern u8 mNpc_CheckNormalMail_nes(u8* body);
 extern int mNpc_SendMailtoNpc(Mail_c* mail);
 extern void mNpc_ClearRemail(Anmremail_c* remail);
 extern void mNpc_Remail();
+extern void mNpc_RemailFor(Private_c* priv); /* the town-villager part of mNpc_Remail() for ONE resident's record (host: every connected resident, M2r) */
+/* guest mailbox: the same pass with the reply handed to `sink` (TRUE = taken) instead of the post office (host: every connected guest) */
+typedef int (*mNpc_REMAIL_SINK)(Mail_c* mail, void* ctx);
+extern void mNpc_RemailForSink(Private_c* priv, mNpc_REMAIL_SINK sink, void* ctx);
+#ifdef TARGET_PC
+/* guest mailbox (host): the villager EVENT letters of one GUEST key handed to `sink` (birthday cards, the Christmas card, Valentine's Day presents, goodbye letters) */
+extern int mNpc_GuestBirthdayCardsForSink(PersonalID_c* key, mNpc_REMAIL_SINK sink, void* ctx);
+extern int mNpc_GuestXmasCardForSink(PersonalID_c* key, mNpc_REMAIL_SINK sink, void* ctx);
+extern int mNpc_GuestVtdayMailForSink(PersonalID_c* keys, const u8* genders, int num, mNpc_REMAIL_SINK sink, void* ctx);
+extern int mNpc_GuestGoodbyMailForSink(PersonalID_c* key, AnmPersonalID_c* anm_id, mNpc_REMAIL_SINK sink, void* ctx);
+#endif
 extern u8 mNpc_GetPaperType();
 extern int mNpc_SendVtdayMail();
 extern int mNpc_CheckFriendship(PersonalID_c* pid, Animal_c* animal);
@@ -431,6 +442,39 @@ extern int mNpc_GetNpcSoundSpec(ACTOR* actor);
 extern void mNpc_InitNpcAllInfo(int malloc_flag);
 extern void mNpc_Grow();
 extern void mNpc_ForceRemove();
+#ifdef TARGET_PC
+/* Villager population/is_home milestone (m_npc.c): client-side apply for
+ * PC_NETGAME_MSG_VILLAGER_ARRIVAL/_DEPARTURE and the initial join snapshot -- see pc_net_game.c and
+ * the doc comments on these functions' definitions in m_npc.c for the full contract. Never re-rolls
+ * any RNG; reproduces the host's already-resolved, deterministic result. */
+extern void mNpc_PcApplyVillagerArrival(int slot, u16 npc_id, u8 reserved_block_x, u8 reserved_block_z,
+                                        u8 reserved_ut_x, u8 reserved_ut_z, u8 new_now_npc_max);
+extern void mNpc_PcApplyVillagerSnapshotSlot(int slot, u16 npc_id, u8 home_block_x, u8 home_block_z, u8 home_ut_x,
+                                             u8 home_ut_z, u8 is_home, u8 new_now_npc_max);
+extern void mNpc_PcApplyVillagerDeparture(int slot, u8 new_now_npc_max);
+/* TEST-ONLY (see pc_main.c's --force-villager-grow/--force-villager-remove and pc_net_game.c's
+ * pcnetgame_run_villager_test_triggers()). See the doc comments on these functions' definitions in
+ * m_npc.c for the full contract. */
+extern void mNpc_DebugForceGrow(void);
+extern void mNpc_DebugForceRemove(void);
+
+/* Friendship/mail sync milestone (m_npc.c): shared by mNpc_AddFriendship()/mNpc_SendMailtoNpc()'s
+ * own client-intercept/host-apply branches and by pc_net_game.c's request/update handlers -- see
+ * the doc comments on these functions' definitions in m_npc.c for the full contract. Never rolls
+ * any RNG mNpc_CheckNormalMail() doesn't already roll deterministically from mail content. */
+extern int mNpc_FindAnimalSlotForMemory(Anmmem_c* memory);
+extern int mNpc_PcHostResolveAndApplyFriendshipDelta(int slot, PersonalID_c* pid, int delta);
+extern void mNpc_PcApplyFriendshipUpdate(int slot, PersonalID_c* pid, int friendship);
+extern void mNpc_PcApplyMailSnapshotEntry(int slot, PersonalID_c* pid, u8 letter_info, const u8* letter,
+                                          int letter_size);
+extern int mNpc_PcApplyMailToVillagerMemory(Mail_c* mail, int* out_friendship, u8* out_letter_info, u8* out_letter,
+                                            int letter_buf_size);
+/* TEST-ONLY (see pc_main.c's --force-friendship-delta/--force-mail-send and pc_net_game.c's
+ * pcnetgame_run_friendship_mail_test_triggers()). See the doc comments on these functions'
+ * definitions in m_npc.c for the full contract. */
+extern void mNpc_DebugForceFriendshipDelta(int delta);
+extern void mNpc_DebugForceMailSend(void);
+#endif
 extern int mNpc_DecideMaskNpc_summercamp(mActor_name_t* npc_id);
 extern int mNpc_RegistMaskNpc_summercamp(mActor_name_t mask_id, mActor_name_t npc_id, mActor_name_t cloth_id);
 extern int mNpc_CheckNpcSet_fgcol(mActor_name_t fg_item, u32 attribute);

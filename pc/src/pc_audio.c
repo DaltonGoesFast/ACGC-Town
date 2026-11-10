@@ -11,6 +11,9 @@
 #include "pc_platform.h"
 #include "pc_settings.h"
 #include "jaudio_NES/audiothread.h"
+#include "pc_dedicated.h"
+#include <stdio.h>
+#include <stdlib.h>
 
 #define PC_AUDIO_SAMPLE_RATE 32000
 
@@ -26,6 +29,31 @@ static s16 ring_buffer[RING_BUF_SAMPLES];
 static SDL_atomic_t ring_write_pos; /* written by audio producer thread */
 static SDL_atomic_t ring_read_pos;  /* written by SDL audio callback */
 static SDL_AudioDeviceID audio_device = 0;
+static int audio_null = 0;
+static SDL_atomic_t audio_null_running;
+static SDL_Thread* audio_null_thread = NULL;
+
+/* Headless dedicated server: no SDL audio device. Drain the ring at 32 kHz stereo so the
+ * producer thread keeps generating samples (fades and message waits follow that clock). */
+static int pc_audio_null_func(void* unused) {
+    Uint32 last = SDL_GetTicks();
+    (void)unused;
+    while (SDL_AtomicGet(&audio_null_running)) {
+        Uint32 now = SDL_GetTicks();
+        Uint32 dt = now - last;
+        u32 wp, rp, used, want;
+        last = now;
+        if (dt > 100) dt = 100;
+        want = (u32)(((uint64_t)dt * 64000ull) / 1000ull) & ~1u;
+        wp = (u32)SDL_AtomicGet(&ring_write_pos);
+        rp = (u32)SDL_AtomicGet(&ring_read_pos);
+        used = wp - rp;
+        if (want > used) want = used & ~1u;
+        if (want != 0) SDL_AtomicSet(&ring_read_pos, (int)(rp + want));
+        SDL_Delay(5);
+    }
+    return 0;
+}
 
 typedef void (*AIDMACallback)(void);
 static AIDMACallback ai_dma_callback = NULL;
@@ -95,7 +123,16 @@ static void pc_audio_callback(void* userdata, Uint8* stream, int len) {
 
 void AIInit(u8* stack) {
     (void)stack;
-    if (audio_device != 0) return;
+    if (audio_device != 0 || audio_null) return;
+
+    if (g_pc_headless) {
+        audio_null = 1;
+        SDL_AtomicSet(&audio_null_running, 1);
+        audio_null_thread = SDL_CreateThread(pc_audio_null_func, "AudioNull", NULL);
+        printf("[AUDIO] headless null consumer (no device) rate=%d\n", PC_AUDIO_SAMPLE_RATE);
+        if (g_pc_dedicated) pc_dedicated_audio_opened(audio_null_thread != NULL, PC_AUDIO_SAMPLE_RATE, 2, 512);
+        return;
+    }
 
     SDL_AudioSpec want, have;
     memset(&want, 0, sizeof(want));
@@ -109,9 +146,34 @@ void AIInit(u8* stack) {
     if (audio_device != 0) {
         printf("[AUDIO] Opened: freq=%d fmt=0x%04X ch=%d samples=%d (requested: freq=%d)\n",
                have.freq, have.format, have.channels, have.samples, want.freq);
+        if (g_pc_dedicated) pc_dedicated_audio_opened(1, have.freq, have.channels, have.samples);
     } else {
         printf("[AUDIO] Failed to open: %s\n", SDL_GetError());
+        if (g_pc_dedicated) pc_dedicated_audio_opened(0, 0, 0, 0); /* dedicated: a stalled audio producer is not acceptable -> exits 1 */
     }
+}
+
+/* Test aid: AC_MASTER_VOLUME=<0..100> (integer percent, same scale as settings master_volume: sample * vol / 100) overrides the settings value AT THE AUDIO OUTPUT ONLY
+ * for this process. It is read once here and NEVER written back (g_pc_settings.master_volume and settings.ini are untouched); no Windows system / per-app volume is
+ * touched. An unset / malformed / out-of-range value is ignored (the settings value applies). */
+static int pc_audio_master_volume(void) {
+    static int s_env_vol = -2; /* -2 = not read yet, -1 = no valid override */
+    if (s_env_vol == -2) {
+        const char* e = getenv("AC_MASTER_VOLUME");
+        char* end = NULL;
+        long v;
+        s_env_vol = -1;
+        if (e != NULL && e[0] != '\0') {
+            v = strtol(e, &end, 10);
+            if (end != e && *end == '\0' && v >= 0 && v <= 100) {
+                s_env_vol = (int)v;
+                printf("[PC] audio: AC_MASTER_VOLUME=%d%% overrides the master volume for this process (settings.ini untouched)\n", s_env_vol);
+            } else {
+                printf("[PC] audio: AC_MASTER_VOLUME='%s' ignored (want an integer 0..100)\n", e);
+            }
+        }
+    }
+    return s_env_vol >= 0 ? s_env_vol : g_pc_settings.master_volume;
 }
 
 void AIInitDMA(u32 addr, u32 size) {
@@ -129,7 +191,7 @@ void AIInitDMA(u32 addr, u32 size) {
         n_samples = free & ~1u;
     }
 
-    int vol = g_pc_settings.master_volume;
+    int vol = pc_audio_master_volume();
     if (vol < 0)   vol = 0;
     if (vol > 100) vol = 100;
 
@@ -195,13 +257,24 @@ int pc_audio_get_buffer_fill(void) {
     return SDL_AtomicGet(&ring_write_pos) - SDL_AtomicGet(&ring_read_pos);
 }
 
+/* --dedicated `status`: total samples the SDL callback has consumed (proves the dummy device keeps draining the ring). Read-only. */
+int pc_audio_consumed_samples(void) {
+    return SDL_AtomicGet(&ring_read_pos);
+}
+
 int pc_audio_is_active(void) {
-    return audio_device != 0;
+    return audio_device != 0 || audio_null;
 }
 
 void pc_audio_shutdown(void) {
     /* Stop producer thread first */
     SDL_AtomicSet(&audio_thread_running, 0);
+    SDL_AtomicSet(&audio_null_running, 0);
+    if (audio_null_thread) {
+        SDL_WaitThread(audio_null_thread, NULL);
+        audio_null_thread = NULL;
+    }
+    audio_null = 0;
     if (audio_producer_thread) {
         SDL_WaitThread(audio_producer_thread, NULL);
         audio_producer_thread = NULL;

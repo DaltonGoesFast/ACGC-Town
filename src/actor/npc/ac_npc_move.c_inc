@@ -656,21 +656,825 @@ static void aNPC_setupAction(NPC_ACTOR* nactorx, u8 action) {
     aNPC_Animation_init((ACTOR*)nactorx, aNPC_animeSeqNoTable[(int)action], data_p->talk_flag);
 }
 
+#ifdef TARGET_PC
+/* Client villager-talk "lease".
+ *
+ * Talking is a LOCAL interaction: the player's A press, the demo request, the player's TALK state
+ * (mPlayer_INDEX_TALK) and the message window all run on this process. The player only gets past
+ * m_demo.c's wait_talk_start() once the villager has set mDemo_Set_ListenAble(), and only the villager's
+ * own local think/action code does that (aNPC_talk_request_check() sets talk_condition = START ->
+ * aNPC_think_chk_interrupt_proc() requests aNPC_ACT_TALK -> aNPC_act_talk_wait()). A host-authoritative
+ * client skips aNPC_schedule_proc()/aNPC_action_proc() (see aNPC_pc_is_client_consumer()) and forces
+ * aNPC_setupAction(host_action) every frame, so without this lease the talk action never ran, ListenAble
+ * never came and the client sat in mPlayer_INDEX_TALK forever.
+ *
+ * While the lease is active the villager is NOT a client consumer: it runs the unmodified local
+ * think/action/angle/position code exactly as in single-player, and the host snapshot for it is simply not
+ * applied (the ring keeps filling; nothing is queued). The lease is STATELESS -- derived every frame from
+ * the NPC's own talk state, so a disconnect (pc_net_game_world_is_host_authoritative() -> FALSE, local AI
+ * resumes anyway) or a villager despawn can never leak it:
+ *   - talk_condition != NONE: set by aNPC_setup_talk_start(), cleared only by aNPC_setup_talk_end();
+ *   - action.idx == aNPC_ACT_TALK: still TRUE for a few frames after aNPC_setup_talk_end() until the local
+ *     think picks the next action (aNPC_talk_request_check() refuses a new talk while action.idx is TALK,
+ *     and a consumer never changes action.idx, so releasing earlier would make the villager un-talkable).
+ * The lease ends deterministically when the local think has moved the villager out of the talk action;
+ * the very next frame resumes host mirroring (position/facing/action are hard-set from the host pose). */
+static int aNPC_pc_talk_lease_active(NPC_ACTOR* nactorx) {
+    static int s_disabled = -1; /* test-only negative control: PC_NPC_TALKLEASE_DISABLE=1 restores old behavior */
+    if (s_disabled < 0) {
+        const char* e = getenv("PC_NPC_TALKLEASE_DISABLE");
+        s_disabled = (e != NULL && e[0] == '1') ? 1 : 0;
+    }
+    if (s_disabled) {
+        return FALSE;
+    }
+    return nactorx->condition_info.talk_condition != aNPC_TALK_TYPE_NONE || nactorx->action.idx == aNPC_ACT_TALK;
+}
+
+/* Rate-limited begin/end logging for the lease (observation only -- never changes behavior). Called
+ * once per frame per villager from aNPC_actor_move_show() on a ready client. */
+static void aNPC_pc_talk_lease_log(NPC_ACTOR* nactorx, int consumer_eligible) {
+    static u32 s_logged_mask = 0;
+    int slot;
+    int active;
+
+    if (!pc_net_game_world_is_host_authoritative() || nactorx->npc_info.animal == NULL) {
+        return;
+    }
+    slot = aNPC_get_animal_idx(nactorx);
+    if (slot < 0 || slot >= 32) {
+        return;
+    }
+    active = aNPC_pc_talk_lease_active(nactorx);
+    if (active && !(s_logged_mask & (1u << slot))) {
+        s_logged_mask |= (1u << slot);
+        printf("[NPC][TALKLEASE] begin slot=%d talk_cond=%d act_idx=%d\n", slot,
+               (int)nactorx->condition_info.talk_condition, (int)nactorx->action.idx);
+    } else if (!active && (s_logged_mask & (1u << slot))) {
+        s_logged_mask &= ~(1u << slot);
+        printf("[NPC][TALKLEASE] end slot=%d talk_cond=%d act_idx=%d (host mirroring resumes)\n", slot,
+               (int)nactorx->condition_info.talk_condition, (int)nactorx->action.idx);
+    }
+    (void)consumer_eligible;
+}
+
+/* Villager authority range and stale fallback (pc_npc_authority.h, pc_net_game.c). The host streams a villager (NPC_MOVE) only while it has an actor for it,
+ * i.e. near its own player -- for a dedicated server only around its hidden observer's acre. A villager the host does not simulate used to be held here at its
+ * spawn / last pose forever, and was unpushable (a consumer never integrates the local collision push). Now, when the slot's stream is stale (no sample for
+ * 2.5 s, or none within 4 s of the actor's creation / the session start), this villager runs the unmodified single-player AI + physics on this client (the
+ * same path a talk lease already uses: schedule/action/angle/aNPC_position_move all run, so pushing works), and pc_net_game.c reports its pose to the host,
+ * which relays it to the other players. A fresh host stream (5 consecutive samples) switches it back; the first host pose is a hard set (a snap).
+ * Never while the villager is hidden in its house (nothing to move; the host's NPC_STATE stays authoritative) or another player owns its conversation.
+ * Evaluated once per frame per villager; AC_MP_NPC_FALLBACK=0 restores the old "hold" behaviour. Local AI consumes the client's own qrand() stream (never
+ * synchronized with the host's in the first place) and may set this client's local is_home; neither is ever sent to the host. */
+static int aNPC_pc_stale_fallback_local(NPC_ACTOR* nactorx) {
+    static NPC_ACTOR* s_actor[ANIMAL_NUM_MAX];
+    static u32 s_frame[ANIMAL_NUM_MAX];
+    static u8 s_val[ANIMAL_NUM_MAX];
+    static u32 s_any_frame, s_any_prev_frame;
+    int slot = aNPC_get_animal_idx(nactorx);
+    u32 frame;
+    int actor_new;
+    int must_hold;
+    u16 npc_id;
+
+    if (slot < 0 || slot >= ANIMAL_NUM_MAX || gamePT == NULL) {
+        return FALSE;
+    }
+    frame = gamePT->frame_counter;
+    if (s_actor[slot] == nactorx && s_frame[slot] == frame) {
+        return s_val[slot];
+    }
+    if (frame != s_any_frame) {
+        s_any_prev_frame = s_any_frame;
+        s_any_frame = frame;
+    }
+    /* a new actor: another address, or the same address after this slot alone missed > 1 s of frames while the other villagers kept running (a re-created actor in
+     * reused memory; a frozen world -- submenu -- stops every villager, so it is not mistaken for one) */
+    actor_new = s_actor[slot] != nactorx || ((u32)(frame - s_frame[slot]) > 60u && (u32)(frame - s_any_prev_frame) <= 2u);
+    npc_id = (u16)nactorx->npc_info.animal->id.npc_id;
+    must_hold = nactorx->condition_info.hide_flg != FALSE || pc_net_game_npc_talk_busy(slot, npc_id);
+    s_actor[slot] = nactorx;
+    s_frame[slot] = frame;
+    s_val[slot] = (u8)(pc_net_game_npc_client_local_ai(slot, npc_id, actor_new, must_hold) ? TRUE : FALSE);
+    return s_val[slot];
+}
+
+/* N2 villager movement sync.
+ *
+ * TRUE iff this NPC_ACTOR is a regular, Save_t.animals[]-backed villager (aNPC_get_animal_idx()
+ * returns a real slot -- an event/island/special NPC does not, and must always keep running the
+ * unmodified decomp path) AND this process is a READY network client, i.e. the host -- not this
+ * process -- is authoritative over `nactorx`'s movement (pc_net_game_world_is_host_authoritative()).
+ * Checked once per frame per NPC_ACTOR from aNPC_actor_move_show()/_show_before(); see those
+ * functions for exactly which decomp calls this gates. */
+static int aNPC_pc_is_client_consumer(NPC_ACTOR* nactorx) {
+    if (!pc_net_game_world_is_host_authoritative()) {
+        return FALSE;
+    }
+    if (nactorx->npc_info.animal == NULL) {
+        return FALSE;
+    }
+    if (aNPC_get_animal_idx(nactorx) < 0) {
+        return FALSE;
+    }
+    if (aNPC_pc_stale_fallback_local(nactorx)) { /* evaluated first: it is stateful (actor creation, hysteresis) and must see every frame */
+        return FALSE; /* the host does not simulate this villager: vanilla local AI + physics -- see aNPC_pc_stale_fallback_local() */
+    }
+    if (aNPC_pc_talk_lease_active(nactorx)) {
+        return FALSE; /* local talk interaction in progress -- see aNPC_pc_talk_lease_active() */
+    }
+    return TRUE;
+}
+
+/* M9-C: client villager-talk notification + host hold.
+ *
+ * CLIENT side: the talk lease above is purely local, so the HOST's copy of the villager kept walking while the
+ * client talked to it (and the client snapped to the host pose at lease end). aNPC_pc_talk_net_edge() reports the
+ * lease's rising/falling edge ONCE per edge to the host (pc_net_game_notify_local_npc_talk(), reliable) so the host
+ * can hold the villager still; aNPC_pc_talk_net_on_destroy() sends the END if the villager actor is destroyed while
+ * the BEGIN is outstanding (despawn / scene change). It has its OWN per-slot sent-mask (aNPC_pc_talk_lease_log()'s
+ * log mask is host-authoritative-gated and goes stale across disconnects) and never sends positions: the client
+ * remains a pure consumer of the host's NPC poses. The mask is dropped on every client session reset (epoch) and
+ * whenever this process is not a READY client; a bit also remembers which actor set it, so a bit left by an actor
+ * that vanished without its destructor can never be mistaken for the next actor of that slot.
+ * PC_NPC_TALKHOLD_DISABLE=1 (test-only negative control) suppresses the BEGIN (and therefore the END). */
+/* Patch 8: the begin/end/keepalive reporting and the exclusive-lease race handling are shared with the indoor villagers (aNPC_pc_lease_update in ac_npc_talk.c_inc). */
+static void aNPC_pc_talk_net_edge(NPC_ACTOR* nactorx) {
+    aNPC_pc_lease_update(nactorx);
+}
+
+/* Called from aNPC_actor_dt(): END for a still-outstanding BEGIN of a villager that is being destroyed. */
+static void aNPC_pc_talk_net_on_destroy(NPC_ACTOR* nactorx) {
+    aNPC_pc_lease_on_destroy(nactorx);
+}
+
+/* HOST side: TRUE iff a validated client talk hold is active for this villager AND the host is not itself talking
+ * to it (the host's own vanilla talk always wins). pc_net_game_host_npc_talk_held() is FALSE for single-player and
+ * clients, and the role test comes first, so non-host processes pay and change nothing. While held the caller
+ * skips aNPC_schedule_proc()/aNPC_action_proc()/aNPC_angle_calc() and zeroes the speed in the position integration
+ * (aNPC_pc_host_held_position_move()); position integration, BG checks and NPC_MOVE/NPC_STATE sampling still run. */
+static int aNPC_pc_host_talk_held(NPC_ACTOR* nactorx) {
+    int slot;
+
+    if (pc_net_game_role() != PC_NETGAME_ROLE_HOST || nactorx->npc_info.animal == NULL) {
+        return FALSE;
+    }
+    if (nactorx->condition_info.talk_condition != aNPC_TALK_TYPE_NONE || nactorx->action.idx == aNPC_ACT_TALK) {
+        return FALSE;
+    }
+    slot = aNPC_get_animal_idx(nactorx);
+    if (slot < 0) {
+        return FALSE;
+    }
+    return pc_net_game_host_npc_talk_held(slot, (int)nactorx->npc_info.animal->id.npc_id);
+}
+
+/* The normal aNPC_position_move() with the speed target forced to 0 for this frame: the speed cannot build up, the
+ * NPC stands still, but nothing about its action/step state is touched (so on release the action simply
+ * re-accelerates; calling aNPC_setupAction(WAIT) instead would leave max_speed 0 for a walk action that only
+ * re-runs aNPC_setupAction when its feel changes, i.e. a stuck villager). */
+static void aNPC_pc_host_held_position_move(ACTOR* actorx) {
+    NPC_ACTOR* nactorx = (NPC_ACTOR*)actorx;
+    f32 saved_max = nactorx->movement.speed.max_speed;
+
+    actorx->speed = 0.0f;
+    nactorx->movement.speed.max_speed = 0.0f;
+    actorx->status_data.collision_vec.x = 0.0f; /* a villager a client is talking to is never shoved (host player OC push dropped) */
+    actorx->status_data.collision_vec.z = 0.0f;
+    aNPC_position_move(actorx);
+    nactorx->movement.speed.max_speed = saved_max;
+    {   /* Patch 8: conversation facing -- the held villager turns toward the player that owns the lease (the host's own player is handled by the vanilla talk) */
+        float ox, oz;
+        int slot = aNPC_pc_lease_slot(nactorx);
+        if (slot >= 0 && pc_net_game_npc_talk_owner_pos(slot, &ox, &oz)) {
+            xyz_t to;
+            s16 want, cur, diff;
+            to.x = ox;
+            to.y = actorx->world.position.y;
+            to.z = oz;
+            want = search_position_angleY(&actorx->world.position, &to);
+            cur = actorx->world.angle.y;
+            diff = (s16)(want - cur);
+            if (diff > 0x400) {
+                diff = 0x400;
+            } else if (diff < -0x400) {
+                diff = -0x400;
+            }
+            actorx->world.angle.y = (s16)(cur + diff);
+            actorx->shape_info.rotation.y = actorx->world.angle.y;
+        }
+    }
+}
+
+/* Observation only: one line at hold start/end with the host position of the villager, and (only with
+ * PC_NPC_TALKHOLD_DIAG=1, test) a 1 Hz position line for every shown villager on the host. */
+static void aNPC_pc_host_talk_hold_log(NPC_ACTOR* nactorx, GAME_PLAY* play, int held) {
+    static u32 s_hold_logged_mask = 0;
+    static int s_diag = -1;
+    int slot;
+
+    if (pc_net_game_role() != PC_NETGAME_ROLE_HOST) {
+        return;
+    }
+    if (s_diag < 0) {
+        const char* e = getenv("PC_NPC_TALKHOLD_DIAG");
+        s_diag = (e != NULL && e[0] == '1') ? 1 : 0;
+    }
+    if (!held && s_hold_logged_mask == 0 && !s_diag) {
+        return;
+    }
+    if (nactorx->npc_info.animal == NULL || (slot = aNPC_get_animal_idx(nactorx)) < 0 || slot >= 32) {
+        return;
+    }
+    if (held && !(s_hold_logged_mask & (1u << slot))) {
+        s_hold_logged_mask |= (1u << slot);
+        printf("[NPC][TALKHOLD] begin slot=%d pos=(%.2f,%.2f) action=%d act_idx=%d\n", slot,
+               (double)nactorx->actor_class.world.position.x, (double)nactorx->actor_class.world.position.z,
+               (int)nactorx->condition_info.action, (int)nactorx->action.idx);
+    } else if (!held && (s_hold_logged_mask & (1u << slot))) {
+        s_hold_logged_mask &= ~(1u << slot);
+        printf("[NPC][TALKHOLD] end slot=%d pos=(%.2f,%.2f) action=%d act_idx=%d\n", slot,
+               (double)nactorx->actor_class.world.position.x, (double)nactorx->actor_class.world.position.z,
+               (int)nactorx->condition_info.action, (int)nactorx->action.idx);
+    }
+    if (s_diag && play != NULL && (play->game_frame % 60) == 0) {
+        printf("[NPC][TALKHOLD][DIAG] slot=%d held=%d pos=(%.2f,%.2f) speed=%.2f\n", slot, held,
+               (double)nactorx->actor_class.world.position.x, (double)nactorx->actor_class.world.position.z,
+               (double)nactorx->actor_class.speed);
+    }
+}
+
+/* TEST-ONLY villager-talk driver (off by default; enabled only by the environment variable
+ * PC_FORCE_TALK_VILLAGER=1 on the process under test -- an env var rather than a CLI flag so it adds no
+ * pc_main.c/pc_platform.h hunks). Follows the project's "force-*" convention: it never calls the talk path
+ * directly, it only (1) places the local player facing a villager and (2) injects the A / START button
+ * triggers and left-stick the real controller reads (pc_npc_talk_hook_force_trigger()/_stick(), consumed in
+ * m_controller.c), so the REAL production chain runs: m_demo.c choice_demo_sub() -> demo TALK ->
+ * wait_talk_start -> aNPC_setup_talk_start -> villager talk action -> message window -> wait_talk_end.
+ * Stages: 0 pick a villager, 1 approach + press A, 2 dialogue (press A to advance; STUCK after ~90 s),
+ * 3 walk with the stick, 4 press START (inventory), 9 done. All output is "[NPC][TALKHOOK]". */
+#define aNPC_PC_TH_PULSE_FRAMES 2
+
+static int s_th_enabled = -1;
+static u32 s_th_first = 0xFFFFFFFF;
+static int s_th_stage = 0;
+static ACTOR* s_th_actor = NULL;
+static int s_th_slot = -1;
+static int s_th_cnt = 0;
+static int s_th_idle = 0;
+static int s_th_force_a = 0;   /* remaining frames of a forced A trigger */
+static int s_th_force_b = 0;   /* remaining frames of a forced B trigger (latches fast text, also scrolls) */
+static int s_th_pulse_n = 0;
+static int s_th_inv_pressed = 0;
+static int s_th_force_inv = 0; /* remaining frames of a forced START trigger */
+static int s_th_force_stick = 0;
+static float s_th_x0, s_th_z0;
+static int s_th_talk_frames = 0;
+static int s_th_listen_logged = 0;
+static u32 s_th_last_frame = 0xFFFFFFFF;
+static int s_th_other_logs = 0;
+static int s_th_pulse_logs = 0;
+static int s_th_delay = -1;        /* PC_FORCE_TALK_DELAY_FRAMES (test-only, default 0) */
+static int s_th_hold_ms = -1;     /* PC_FORCE_TALK_HOLD_SECONDS (test-only, default 0): keep the dialogue open this long */
+static u32 s_th_hold_t0 = 0;
+
+static void aNPC_pc_talk_hook_check_inventory(void) {
+    /* Opening the inventory freezes every actor update (so no villager tick runs any more); detect it here,
+     * on the controller read the submenu itself keeps making, and stop forcing START. */
+    if (s_th_stage == 4 && s_th_inv_pressed && gamePT != NULL &&
+        ((GAME_PLAY*)gamePT)->submenu.process_status != mSM_PROCESS_WAIT) {
+        printf("[NPC][TALKHOOK] %s INVENTORY_AFTER opened=1 menu_type=%d process=%d\n",
+               (pc_net_game_role() == PC_NETGAME_ROLE_CLIENT) ? "client" : "host",
+               (int)((GAME_PLAY*)gamePT)->submenu.menu_type, (int)((GAME_PLAY*)gamePT)->submenu.process_status);
+        printf("[NPC][TALKHOOK] %s DONE\n", (pc_net_game_role() == PC_NETGAME_ROLE_CLIENT) ? "client" : "host");
+        s_th_force_inv = 0;
+        s_th_stage = 9;
+    }
+}
+
+int pc_npc_talk_hook_force_trigger(unsigned short mask) {
+    aNPC_pc_talk_hook_check_inventory();
+    if (s_th_force_a > 0 && mask == BUTTON_A) {
+        return TRUE;
+    }
+    if (s_th_force_b > 0 && mask == BUTTON_B) {
+        return TRUE;
+    }
+    if (s_th_force_inv > 0 && (mask == mSM_INV_BUTTON_0)) {
+        return TRUE;
+    }
+    return FALSE;
+}
+
+int pc_npc_talk_hook_force_stick(int* out_y) {
+    aNPC_pc_talk_hook_check_inventory();
+    if (s_th_force_stick) {
+        *out_y = -70; /* away from the villager (the player faces it) */
+        return TRUE;
+    }
+    return FALSE;
+}
+
+static void aNPC_pc_talk_hook(NPC_ACTOR* nactorx, GAME_PLAY* play, int consumer) {
+    ACTOR* actorx = (ACTOR*)nactorx;
+    PLAYER_ACTOR* player;
+    int main_idx;
+    u32 frame;
+    const char* role;
+
+    if (s_th_enabled < 0) {
+        const char* e = getenv("PC_FORCE_TALK_VILLAGER");
+        s_th_enabled = (e != NULL && e[0] == '1') ? 1 : 0;
+    }
+    if (!s_th_enabled || s_th_stage >= 9 || play == NULL) {
+        return;
+    }
+    if (pc_net_game_role() == PC_NETGAME_ROLE_CLIENT && !pc_net_game_world_is_host_authoritative()) {
+        return; /* a client that is not READY yet: wait */
+    }
+    frame = (u32)play->game_frame;
+    role = (pc_net_game_role() == PC_NETGAME_ROLE_CLIENT) ? "client" : "host";
+    player = GET_PLAYER_ACTOR_GAME(play);
+    if (player == NULL) {
+        return;
+    }
+    main_idx = mPlib_get_player_actor_main_index((GAME*)play);
+
+    /* Other villagers (stage 2 only): report whether they are still host-mirrored on the client. */
+    if (s_th_stage == 2 && actorx != s_th_actor) {
+        if ((frame % 120) == 0 && s_th_other_logs < 12) {
+            s_th_other_logs++;
+            printf("[NPC][TALKHOOK] %s other villager slot=%d consumer=%d (talk_cond=%d act_idx=%d)\n", role,
+                   aNPC_get_animal_idx(nactorx), consumer, (int)nactorx->condition_info.talk_condition,
+                   (int)nactorx->action.idx);
+        }
+        return;
+    }
+
+    if (s_th_stage == 0) {
+        static int s_slot_env = -2;
+        if (s_slot_env == -2) {
+            const char* e = getenv("PC_FORCE_TALK_SLOT"); /* test-only: only this animal slot is selected (both processes talk to the SAME villager) */
+            s_slot_env = (e != NULL) ? atoi(e) : -1;
+        }
+        if (s_th_first == 0xFFFFFFFF) {
+            s_th_first = frame;
+        }
+        if (s_slot_env >= 0 && nactorx->npc_info.animal != NULL && aNPC_get_animal_idx(nactorx) != s_slot_env) {
+            return;
+        }
+        if (s_th_delay < 0) {
+            const char* e = getenv("PC_FORCE_TALK_DELAY_FRAMES"); /* test-only (worker 7): extra frames before the host hook starts (a pause can be set first); default 0 = unchanged */
+            s_th_delay = (e != NULL && atoi(e) > 0) ? atoi(e) : 0;
+        }
+        if (frame - s_th_first < (u32)(600 + s_th_delay) || nactorx->npc_info.animal == NULL || aNPC_get_animal_idx(nactorx) < 0 ||
+            nactorx->condition_info.hide_flg || nactorx->condition_info.talk_condition != aNPC_TALK_TYPE_NONE ||
+            main_idx != mPlayer_INDEX_WAIT) {
+            return;
+        }
+        s_th_actor = actorx;
+        s_th_slot = aNPC_get_animal_idx(nactorx);
+        s_th_stage = 1;
+        s_th_cnt = 0;
+        s_th_last_frame = frame;
+        printf("[NPC][TALKHOOK] %s selected villager slot=%d consumer=%d\n", role, s_th_slot, consumer);
+        return;
+    }
+
+    if ((actorx != s_th_actor && s_th_stage < 3) || frame == s_th_last_frame) {
+        return; /* one tick per frame; stages 0-2 are driven by the selected villager's own update, stages 3/4
+                 * (walk/inventory) only need the player and any villager update will do */
+    }
+    s_th_last_frame = frame;
+    if (s_th_force_a > 0) {
+        s_th_force_a--;
+    }
+    if (s_th_force_b > 0) {
+        s_th_force_b--;
+    }
+    if (s_th_force_inv > 0) {
+        s_th_force_inv--;
+    }
+    s_th_cnt++;
+
+    if (s_th_stage == 1) {
+        if (nactorx->condition_info.talk_condition != aNPC_TALK_TYPE_NONE || mDemo_Check(mDemo_TYPE_TALK, actorx)) {
+            s_th_stage = 2;
+            s_th_cnt = 0;
+            s_th_idle = 0;
+            s_th_talk_frames = 0;
+            printf("[NPC][TALKHOOK] %s talk requested (frame %u): talk_cond=%d main=%d consumer=%d\n", role, frame,
+                   (int)nactorx->condition_info.talk_condition, main_idx, consumer);
+            return;
+        }
+        if ((s_th_cnt % 120) == 0) {
+            s16 dy = (s16)(player->actor_class.shape_info.rotation.y - actorx->player_angle_y);
+            printf("[NPC][TALKHOOK] %s approach: dist=%.1f talk_dist=%.1f dy=%.1f ang_diff=%d demo_flg=0x%X "
+                   "force_call=%d main=%d act_idx=%d\n",
+                   role, actorx->player_distance_xz, actorx->talk_distance,
+                   player->actor_class.world.position.y - actorx->world.position.y, (int)dy,
+                   (unsigned)nactorx->condition_info.demo_flg, (int)nactorx->think.force_call_flag, main_idx,
+                   (int)nactorx->action.idx);
+        }
+        if (s_th_cnt > 900) {
+            printf("[NPC][TALKHOOK] %s TRIGGER_TIMEOUT: A never started a talk (main=%d dist=%.1f)\n", role,
+                   main_idx, actorx->player_distance_xz);
+            if (getenv("PC_FORCE_TALK_RETRY") != NULL) { /* test-only: try again (the villager may be owned by another player right now) */
+                s_th_stage = 0;
+                s_th_first = frame - 480; /* re-arm after ~2 s */
+                s_th_force_a = 0;
+                return;
+            }
+            s_th_stage = 9;
+            return;
+        }
+        if (main_idx == mPlayer_INDEX_WAIT && (s_th_cnt == 1 || actorx->player_distance_xz > 50.0f)) {
+            float fx = sin_s(actorx->shape_info.rotation.y);
+            float fz = cos_s(actorx->shape_info.rotation.y);
+            player->actor_class.world.position.x = actorx->world.position.x + fx * 35.0f;
+            player->actor_class.world.position.z = actorx->world.position.z + fz * 35.0f;
+            player->actor_class.world.position.y = actorx->world.position.y;
+        }
+        if (main_idx == mPlayer_INDEX_WAIT) {
+            /* player_angle_y is only refreshed by the villager's own update after the teleport, so keep
+             * facing it every frame until the demo request is accepted */
+            player->actor_class.shape_info.rotation.y = (s16)(actorx->player_angle_y + 0x8000);
+            player->actor_class.world.angle.y = player->actor_class.shape_info.rotation.y;
+        }
+        if (s_th_cnt >= 30 && (s_th_cnt % 12) == 0 && main_idx == mPlayer_INDEX_WAIT) {
+            s_th_force_a = aNPC_PC_TH_PULSE_FRAMES;
+        }
+        return;
+    }
+
+    if (s_th_stage == 2) {
+        int listen = mDemo_Check_ListenAble();
+        int msg_visible = !mMsg_Check_main_hide(mMsg_Get_base_window_p());
+
+        s_th_talk_frames++;
+        if (s_th_hold_ms < 0) {
+            const char* e = getenv("PC_FORCE_TALK_HOLD_SECONDS");
+            s_th_hold_ms = (e != NULL && atoi(e) > 0) ? atoi(e) * 1000 : 0;
+        }
+        if (s_th_hold_ms > 0 && s_th_hold_t0 == 0 && main_idx == mPlayer_INDEX_TALK && msg_visible) {
+            s_th_hold_t0 = pc_net_game_now_ms();
+            printf("[NPC][TALKHOOK] %s holding the dialogue open for %d ms\n", role, s_th_hold_ms);
+        }
+        if (listen && !s_th_listen_logged) {
+            s_th_listen_logged = 1;
+            printf("[NPC][TALKHOOK] %s ListenAble reached after %d frames (act_idx=%d talk_cond=%d)\n", role,
+                   s_th_talk_frames, (int)nactorx->action.idx, (int)nactorx->condition_info.talk_condition);
+        }
+        if (main_idx == mPlayer_INDEX_TALK && msg_visible && (s_th_talk_frames % 20) == 0 &&
+            (s_th_hold_ms <= 0 || (s_th_hold_t0 != 0 && (u32)(pc_net_game_now_ms() - s_th_hold_t0) >= (u32)s_th_hold_ms))) {
+            /* advance the dialogue: alternate A (scroll / choose) and B (scroll + fast text) */
+            if ((s_th_pulse_n++ & 1) == 0) {
+                s_th_force_a = aNPC_PC_TH_PULSE_FRAMES;
+            } else {
+                s_th_force_b = aNPC_PC_TH_PULSE_FRAMES;
+            }
+            if (s_th_pulse_logs < 16) {
+                mMsg_Window_c* mw = mMsg_Get_base_window_p();
+                s_th_pulse_logs++;
+                printf("[NPC][TALKHOOK] %s pulse A: tf=%d msg_idx=%d flags=0x%X cursor_t=%.1f timer=%.1f choice=%d cancelable=%d choice_idx=%d msg_no=%d end_idx=%d hide_t=%d\n",
+                       role, s_th_talk_frames, mw->main_index, (unsigned)mw->status_flags, mw->cursor_timer, mw->timer,
+                       mChoice_check_main_normal(mChoice_Get_base_window_p()), mw->cancelable_flag,
+                       mChoice_check_main_index(mChoice_Get_base_window_p()), mw->msg_no, mw->end_text_cursor_idx,
+                       (int)mw->hide_choice_window_timer);
+            }
+        }
+        if ((s_th_talk_frames % 300) == 1) {
+            printf("[NPC][TALKHOOK] %s talking: frames=%d main=%d listen=%d msg_visible=%d act_idx=%d talk_cond=%d msg_idx=%d "
+                   "consumer=%d\n",
+                   role, s_th_talk_frames, main_idx, listen, msg_visible, (int)nactorx->action.idx,
+                   (int)nactorx->condition_info.talk_condition, mMsg_Get_base_window_p()->main_index, consumer);
+        }
+        if (main_idx != mPlayer_INDEX_TALK && nactorx->condition_info.talk_condition == aNPC_TALK_TYPE_NONE &&
+            !mDemo_Check(mDemo_TYPE_TALK, actorx)) {
+            s_th_idle++;
+        } else {
+            s_th_idle = 0;
+        }
+        if (s_th_idle >= 20) {
+            printf("[NPC][TALKHOOK] %s TALK_END after %d frames (main=%d listen_seen=%d)\n", role, s_th_talk_frames,
+                   main_idx, s_th_listen_logged);
+            s_th_stage = 3;
+            s_th_cnt = 0;
+            return;
+        }
+        if (s_th_talk_frames > (getenv("PC_FORCE_TALK_MAX_FRAMES") != NULL ? atoi(getenv("PC_FORCE_TALK_MAX_FRAMES")) : 5400)) {
+            printf("[NPC][TALKHOOK] %s STUCK: still in talk after %d frames (main=%d listen=%d msg_visible=%d "
+                   "act_idx=%d talk_cond=%d)\n",
+                   role, s_th_talk_frames, main_idx, listen, msg_visible, (int)nactorx->action.idx,
+                   (int)nactorx->condition_info.talk_condition);
+            s_th_stage = 9;
+        }
+        return;
+    }
+
+    if (s_th_stage == 3) {
+        if (s_th_cnt == 40) {
+            s_th_x0 = player->actor_class.world.position.x;
+            s_th_z0 = player->actor_class.world.position.z;
+            s_th_force_stick = 1;
+        } else if (s_th_cnt == 100) {
+            float dx = player->actor_class.world.position.x - s_th_x0;
+            float dz = player->actor_class.world.position.z - s_th_z0;
+            s_th_force_stick = 0;
+            printf("[NPC][TALKHOOK] %s MOVE_AFTER moved=%.1f main=%d\n", role, sqrtf(dx * dx + dz * dz), main_idx);
+            s_th_stage = 4;
+            s_th_cnt = 0;
+        }
+        return;
+    }
+
+    if (s_th_stage == 4) {
+        int opened = play->submenu.process_status != mSM_PROCESS_WAIT;
+
+        if ((s_th_cnt % 100) == 1) {
+            printf("[NPC][TALKHOOK] %s inventory wait: cnt=%d main=%d process=%d start_refuse=%d/%d\n", role, s_th_cnt,
+                   main_idx, (int)play->submenu.process_status, (int)play->submenu.start_refuse,
+                   (int)play->submenu.start_refuse_timer);
+        }
+
+        if (!opened && s_th_cnt >= 40 && s_th_cnt < 400 && (s_th_cnt % 20) == 0 && main_idx != mPlayer_INDEX_TALK) {
+            s_th_force_inv = aNPC_PC_TH_PULSE_FRAMES;
+            s_th_inv_pressed = 1;
+        }
+        if (opened || s_th_cnt >= 420) {
+            printf("[NPC][TALKHOOK] %s INVENTORY_AFTER opened=%d menu_type=%d process=%d main=%d cnt=%d\n", role,
+                   opened, (int)play->submenu.menu_type, (int)play->submenu.process_status, main_idx, s_th_cnt);
+            s_th_stage = 9;
+            printf("[NPC][TALKHOOK] %s DONE\n", role);
+        }
+    }
+}
+
+/* Host side: report this frame's already-resolved position/facing to pc_net_game.c's throttled
+ * NPC_MOVE sender. Called once per frame per on-screen villager NPC_ACTOR immediately after
+ * aNPC_position_move()/aNPC_angle_calc() have finished for the frame (see
+ * aNPC_actor_move_show_before()/aNPC_actor_move_show() below) -- i.e. the exact values the
+ * unmodified host physics/AI just computed, sampled, never decided, by this function.
+ * pc_net_game_notify_npc_move() itself is a no-op for single-player/client and internally throttles
+ * to ~20 Hz, so this is safe and cheap to call every frame for every villager. */
+static void aNPC_pc_host_sample_move(NPC_ACTOR* nactorx) {
+    int slot;
+
+    if (nactorx->npc_info.animal == NULL) {
+        return;
+    }
+    slot = aNPC_get_animal_idx(nactorx);
+    if (slot < 0) {
+        return;
+    }
+    pc_net_game_notify_npc_move(slot, (uint16_t)nactorx->npc_info.animal->id.npc_id,
+                                 nactorx->actor_class.world.position.x, nactorx->actor_class.world.position.y,
+                                 nactorx->actor_class.world.position.z, nactorx->actor_class.world.angle.y,
+                                 (uint8_t)nactorx->condition_info.action);
+}
+
+/* Client side: apply the host's authoritative (delay-interpolated) pose for this villager INSTEAD OF
+ * running aNPC_position_move()'s local physics integration. The position/facing are set directly
+ * (matching pc_remote_player_mv()'s own "hard set, not a chase" pattern -- pc_net_game.c's own
+ * delayed two-snapshot interpolation already provides the smoothing, so a second layer of smoothing
+ * here would only add lag). Walk-vs-idle animation is derived purely from the network layer's
+ * observed-position-delta `moving` flag -- never from aNPC_schedule_proc()/aNPC_action_proc() (this
+ * path replaces both; see aNPC_actor_move_show() below), so no RNG is ever consumed here. If nothing
+ * has been received yet for this villager (actor just created, or the host's own player has never
+ * been near it), the actor's current position/facing/animation is left completely untouched. */
+static void aNPC_pc_client_consume_move(NPC_ACTOR* nactorx, ACTOR* actorx) {
+    int slot;
+    float x, y, z;
+    s16 angle;
+    int moving;
+    uint8_t host_action;
+
+    slot = aNPC_get_animal_idx(nactorx);
+    if (slot < 0) {
+        return;
+    }
+    if (!pc_net_game_get_npc_move_pose(slot, (uint16_t)nactorx->npc_info.animal->id.npc_id, &x, &y, &z, &angle,
+                                        &moving, &host_action)) {
+        return; /* nothing received yet for this slot -- hold current pose/animation */
+    }
+
+    actorx->world.position.x = x;
+    actorx->world.position.y = y;
+    actorx->world.position.z = z;
+    actorx->shape_info.rotation.y = angle;
+    actorx->world.angle.y = angle;
+    actorx->speed = 0.0f; /* N2 carries no speed field on the wire -- position is applied directly
+                           * each frame rather than integrated from a speed/acceleration model; see
+                           * the design note above pc_net_game_notify_npc_move() (pc_net_game.h). */
+
+    {
+        /* N3 Channel A: prefer the host's real, host-authoritative action_type (sampled from the
+         * unmodified host's own aNPC_action_proc()/aNPC_setupAction() selection) over the old
+         * position-delta-only derivation. Range-checked defensively -- aNPC_setupAction() indexes a
+         * fixed-size table with no bounds check of its own, and a malformed/stale action byte must
+         * never be trusted enough to index out of range. Falls back to the walk-vs-idle derivation
+         * only if the received value is out of range (should not happen from a well-behaved host). */
+        u8 desired_action;
+        if (host_action < aNPC_ACTION_TYPE_NUM) {
+            desired_action = host_action;
+        } else {
+            desired_action = (u8)(moving ? aNPC_ACTION_TYPE_WALK : aNPC_ACTION_TYPE_WAIT);
+        }
+        if (nactorx->condition_info.action != desired_action) {
+            aNPC_setupAction(nactorx, desired_action);
+        }
+    }
+}
+
+/* N3 Channel B, host side: report this villager's current is_home/hide/forced-schedule state.
+ * Called unconditionally (pc_net_game_notify_npc_state() itself is a no-op for single-player/client
+ * and internally dirty-checks) once per frame per real villager NPC_ACTOR from BOTH
+ * aNPC_actor_move_hide() and aNPC_actor_move_show_before() below -- this state must be tracked and
+ * broadcast on change regardless of hide status, unlike NPC_MOVE which only ever samples a visible
+ * actor's position. nactorx->npc_info.schedule can legitimately be NULL for a moment (e.g. the very
+ * first frame after a network arrival, before FIX S3's re-registration call has run) -- treated as
+ * "no forced override" rather than skipped, so is_home/hide are still reported even then. */
+static void aNPC_pc_host_check_state(NPC_ACTOR* nactorx) {
+    int slot;
+    mNPS_schedule_c* sched_p;
+    u8 forced_type = 0;
+    int forced_timer = 0;
+
+    if (nactorx->npc_info.animal == NULL) {
+        return;
+    }
+    slot = aNPC_get_animal_idx(nactorx);
+    if (slot < 0) {
+        return;
+    }
+    sched_p = nactorx->npc_info.schedule;
+    if (sched_p != NULL) {
+        forced_type = sched_p->forced_type;
+        forced_timer = sched_p->forced_timer;
+    }
+    pc_net_game_notify_npc_state(slot, (uint16_t)nactorx->npc_info.animal->id.npc_id,
+                                 (uint8_t)nactorx->npc_info.animal->is_home,
+                                 (uint8_t)nactorx->condition_info.hide_flg, forced_type, forced_timer);
+}
+
+/* N3 Channel B, client side: apply the host's authoritative is_home/hide/forced-schedule state
+ * atomically -- is_home, the hide flag (via aNPC_set_hide_flg(), the existing decomp function that
+ * also handles the hide_request/morph-counter/shadow-drawing side effects together), and the
+ * schedule's forced_type/forced_timer are all set from the SAME received NPC_STATE in one place,
+ * never at separate times. Deliberately does NOT re-snap the actor's world position to the house door
+ * on a hidden transition (unlike the audit's original suggestion): while visible, N2's own NPC_MOVE
+ * stream already continuously carries the true position the host walked the villager to (including
+ * through its into-house door animation) before hide ever fires, so the position is already correct
+ * by the time this applies hide=TRUE; for a villager already hidden at snapshot/late-join time, its
+ * exact indoor position has no visible effect on a client (a hidden actor draws nothing) and self-
+ * heals the same way N2's own off-screen position already does the instant the villager is ever shown
+ * again (see PCNetGameNpcMoveMsg's design note on self-healing stale off-screen state). If nothing
+ * has been received yet for this slot, this is a no-op -- the actor's current is_home/hide/schedule
+ * state (from ARRIVAL/SNAPSHOT apply) is left untouched, not zeroed. */
+static void aNPC_pc_client_consume_state(NPC_ACTOR* nactorx) {
+    int slot;
+    uint8_t is_home, hide, forced_type;
+    uint16_t forced_timer_remaining;
+    mNPS_schedule_c* sched_p;
+
+    if (nactorx->npc_info.animal == NULL) {
+        return;
+    }
+    slot = aNPC_get_animal_idx(nactorx);
+    if (slot < 0) {
+        return;
+    }
+    if (!pc_net_game_get_npc_state(slot, (uint16_t)nactorx->npc_info.animal->id.npc_id, &is_home, &hide,
+                                   &forced_type, &forced_timer_remaining)) {
+        return; /* nothing received yet for this slot */
+    }
+
+    nactorx->npc_info.animal->is_home = is_home ? TRUE : FALSE;
+
+    sched_p = nactorx->npc_info.schedule;
+    if (sched_p != NULL) {
+        sched_p->forced_type = forced_type;
+        sched_p->forced_timer = forced_timer_remaining;
+    }
+
+    if (nactorx->condition_info.hide_flg != hide) {
+        aNPC_set_hide_flg(nactorx, hide);
+    }
+}
+#endif
+
+#ifdef TARGET_PC
+static void aNPC_pc_host_apply_home_exit(NPC_ACTOR* nactorx, GAME_PLAY* play); /* ac_npc_schedule_field.c_inc */
+#endif
+
 static void aNPC_actor_move_hide(ACTOR* actorx, GAME* game) {
     NPC_ACTOR* nactorx = (NPC_ACTOR*)actorx;
     GAME_PLAY* play = (GAME_PLAY*)game;
+#ifdef TARGET_PC
+    int pc_client_consumer = aNPC_pc_is_client_consumer(nactorx);
+    int pc_talk_held = aNPC_pc_host_talk_held(nactorx); /* M9-C: host holds a client-talked villager */
 
-    aNPC_schedule_proc(nactorx, play);
-    aNPC_action_proc(nactorx, play);
+    /* N3 Channel B: is_home/hide/forced-schedule state must be tracked/broadcast (host) or applied
+     * (client) regardless of hide status -- unlike NPC_MOVE, which only ever samples a VISIBLE
+     * actor's position, this is exactly the case (a hidden/indoors villager) the audit called out as
+     * needing its own hook independent of aNPC_actor_move_show_before()'s. */
+    if (!pc_client_consumer) {
+        aNPC_pc_host_apply_home_exit(nactorx, play); /* a client's reported house exit, accepted by the host (pc_net_game.c), BEFORE the state is reported below */
+    }
+    if (pc_client_consumer) {
+        aNPC_pc_client_consume_state(nactorx);
+    } else {
+        aNPC_pc_host_check_state(nactorx);
+    }
+#endif
+
+#ifdef TARGET_PC
+    /* N2: a hidden (culled/indoors) villager runs no position integration either way, but
+     * aNPC_schedule_proc()/aNPC_action_proc() are still the same RNG-bearing movement/behavior
+     * decision layer gated in aNPC_actor_move_show() below -- skip them here too on a host-
+     * authoritative client, for the same reason (see aNPC_pc_is_client_consumer()'s doc comment):
+     * this process must never independently consume qrand() entropy deciding what a host-owned
+     * villager would do next, visible or not. There is nothing to replace them with while hidden --
+     * no movement is sampled/consumed and no animation is selected for an actor that isn't drawn. */
+    if (!pc_client_consumer && !pc_talk_held)
+#endif
+    {
+        aNPC_schedule_proc(nactorx, play);
+        aNPC_action_proc(nactorx, play);
+    }
     aNPC_check_feel_tim(nactorx);
 }
+
+#ifdef TARGET_PC
+extern int pc_remote_player_host_npc_push(GAME* game, const ACTOR* npc, float npc_radius, float npc_offset, float npc_height,
+                                          int npc_pipe_flags0, float* out_dx, float* out_dz); /* pc_remote_player.c */
+
+/* HOST (and a client running the villager on its own AI, see the gate below): remote players (puppets) push synchronized villagers. The puppet's OC pipe pairs only with the local player, so
+ * without this a client walking into a villager never moved it on the host, and the client's own local push is overwritten by
+ * the host pose every frame (the villager acted as an unmovable wall). Adds to collision_vec exactly what the vanilla OC pass
+ * would add for a real player pipe at each eligible puppet (pc_remote_player_host_npc_push); aNPC_position_move() then applies
+ * it and aNPC_BGcheck() corrects walls/water, and the new pose reaches clients through NPC_MOVE. Never for a villager that is
+ * talking (host's own talk) or held for a client talk (that path does not call this), or that skips OC this frame. */
+static void aNPC_pc_host_puppet_push(NPC_ACTOR* nactorx, GAME* game) {
+    static int s_diag = -1;
+    float dx, dz;
+    int n;
+
+    /* HOST: every villager it simulates. CLIENT: a villager it runs itself (stale fallback LOCAL mode = the relay owner): the other clients' puppets push it here and
+     * the result reaches them through the relay, so every player can push a client-run villager, not only its relay owner (pc_npc_puppet_push_applies,
+     * kill switch AC_MP_NPC_PUSH_FIX=0). A consumer client never (its pose is the stream's); single player never. */
+    if (nactorx->npc_info.animal == NULL || aNPC_get_animal_idx(nactorx) < 0 || !pc_net_game_npc_puppet_push_ok(aNPC_get_animal_idx(nactorx))) {
+        return;
+    }
+    if (nactorx->condition_info.talk_condition != aNPC_TALK_TYPE_NONE || nactorx->action.idx == aNPC_ACT_TALK ||
+        (nactorx->condition_info.demo_flg & aNPC_COND_DEMO_SKIP_OBJ_COL_CHECK) != 0) {
+        return;
+    }
+    n = pc_remote_player_host_npc_push(game, &nactorx->actor_class, (float)nactorx->collision.pipe.attribute.pipe.radius,
+                                       (float)nactorx->collision.pipe.attribute.pipe.offset,
+                                       (float)nactorx->collision.pipe.attribute.pipe.height,
+                                       (int)nactorx->collision.pipe.collision_obj.collision_flags0, &dx, &dz);
+    if (n <= 0) {
+        return;
+    }
+    nactorx->actor_class.status_data.collision_vec.x += dx;
+    nactorx->actor_class.status_data.collision_vec.z += dz;
+    pc_net_game_npc_note_remote_push(aNPC_get_animal_idx(nactorx), n, nactorx->actor_class.world.position.x, nactorx->actor_class.world.position.z); /* client only */
+    if (s_diag < 0) {
+        const char* e = getenv("PC_NPC_PUSH_DIAG");
+        s_diag = (e != NULL && e[0] == '1') ? 1 : 0;
+    }
+    if (s_diag && (game->frame_counter % 10) == 0) {
+        printf("[NPC][PUPPET_PUSH] slot=%d contacts=%d push=(%.2f,%.2f) pos=(%.2f,%.2f)\n", aNPC_get_animal_idx(nactorx), n,
+               (double)dx, (double)dz, (double)nactorx->actor_class.world.position.x,
+               (double)nactorx->actor_class.world.position.z);
+    }
+}
+#endif
 
 static void aNPC_actor_move_show_before(ACTOR* actorx, GAME* game) {
     NPC_ACTOR* nactorx = (NPC_ACTOR*)actorx;
 
     aNPC_anime_proc(nactorx, game);
     aNPC_tex_anm_ctrl(nactorx);
-    aNPC_position_move(actorx);
+#ifdef TARGET_PC
+    /* N2 central client-side change: a host-authoritative client never runs the local physics
+     * integration for a synchronized villager -- it applies the host's (delay-interpolated)
+     * position/facing instead. The host is unaffected (aNPC_pc_is_client_consumer() is FALSE there)
+     * and keeps running exactly the original, unmodified aNPC_position_move(). */
+    if (aNPC_pc_is_client_consumer(nactorx)) {
+        aNPC_pc_client_consume_move(nactorx, actorx);
+    } else if (aNPC_pc_host_talk_held(nactorx)) {
+        aNPC_pc_host_held_position_move(actorx); /* M9-C: same integration, speed target forced to 0 */
+    } else
+#endif
+    {
+#ifdef TARGET_PC
+        aNPC_pc_host_puppet_push(nactorx, game); /* HOST, or the client running this villager (relay owner): remote players push villagers (no-op otherwise) */
+#endif
+        aNPC_position_move(actorx);
+    }
     aNPC_BGcheck(nactorx, actorx);
     aNPC_entranceCheck(nactorx);
     aNPC_circleRangeRevice(nactorx);
@@ -693,9 +1497,65 @@ static void aNPC_actor_move_show_after(ACTOR* actorx, GAME* game) {
     }
 }
 
+#ifdef TARGET_PC
+/* HOST, hand-over animations (pc_handover.h): a client talking to this (talk-held) villager reported a hand-over (message 103); play the matching
+ * action types here so NPC_MOVE's action_type shows them to every other client. Presentation only; the previous action is restored at the end. */
+static void aNPC_pc_host_handover_tick(NPC_ACTOR* nactorx, GAME* game) {
+    static const u8 act_n[] = { aNPC_ACTION_TYPE_WAIT, aNPC_ACTION_TYPE_TRANSFER, aNPC_ACTION_TYPE_TRANSFER_WAIT, aNPC_ACTION_TYPE_GET, aNPC_ACTION_TYPE_GET_PULL, aNPC_ACTION_TYPE_GET_PUTAWAY };
+    static const u8 act_f[] = { aNPC_ACTION_TYPE_WAIT, aNPC_ACTION_TYPE_TRANSFER_F, aNPC_ACTION_TYPE_TRANSFER_F_WAIT, aNPC_ACTION_TYPE_GET_F, aNPC_ACTION_TYPE_GET_PULL_F, aNPC_ACTION_TYPE_GET_PUTAWAY_F };
+    static u8 s_saved[ANIMAL_NUM_MAX];
+    static u8 s_saved_valid[ANIMAL_NUM_MAX];
+    int slot = aNPC_get_animal_idx(nactorx);
+    int changed = 0, fish = 0, st;
+
+    if (slot < 0 || slot >= ANIMAL_NUM_MAX || nactorx->npc_info.animal == NULL) {
+        return;
+    }
+    st = pc_net_game_host_handover_step(slot, (int)nactorx->npc_info.animal->id.npc_id, nactorx->draw.main_animation_state == cKF_STATE_STOPPED,
+                                        (float)game->graph->dt_num_60fps_frames, &changed, &fish);
+    if (st == PC_HO_ST_NONE) {
+        return;
+    }
+    if (st == PC_HO_ST_DONE) {
+        if (s_saved_valid[slot]) {
+            aNPC_setupAction(nactorx, s_saved[slot]);
+            s_saved_valid[slot] = FALSE;
+        }
+        return;
+    }
+    if (!s_saved_valid[slot]) {
+        s_saved[slot] = nactorx->condition_info.action;
+        s_saved_valid[slot] = TRUE;
+    }
+    if (changed || nactorx->condition_info.action != (fish ? act_f[st] : act_n[st])) {
+        aNPC_setupAction(nactorx, fish ? act_f[st] : act_n[st]);
+    }
+}
+
+/* every role, hand-over animations: this (town) villager starts a VANILLA hand-over with the local player (aNPC_ACT_TRANS / aNPC_ACT_GET, any talk:
+ * gifts, trades, quests, Work Mode). A READY client reports it to the host (message 103) so the other players see the villager do it. */
+static void aNPC_pc_handover_note(NPC_ACTOR* nactorx, int kind, mActor_name_t item) {
+    int slot = aNPC_get_animal_idx(nactorx);
+
+    if (slot < 0 || nactorx->npc_info.animal == NULL || item == EMPTY_NO) {
+        return;
+    }
+    pc_net_game_handover_local(PC_HO_CLASS_VILLAGER, slot, (int)nactorx->npc_info.animal->id.npc_id, kind, (int)item, ITEM_IS_FISH(item) == TRUE);
+}
+#endif
+
 static void aNPC_actor_move_show(ACTOR* actorx, GAME* game) {
     NPC_ACTOR* nactorx = (NPC_ACTOR*)actorx;
     GAME_PLAY* play = (GAME_PLAY*)game;
+#ifdef TARGET_PC
+    int pc_client_consumer = aNPC_pc_is_client_consumer(nactorx);
+    int pc_talk_held = aNPC_pc_host_talk_held(nactorx); /* M9-C: host holds a client-talked villager */
+
+    aNPC_pc_talk_lease_log(nactorx, pc_client_consumer);
+    aNPC_pc_talk_net_edge(nactorx);                       /* M9-C: report this client's lease edges to the host */
+    aNPC_pc_host_talk_hold_log(nactorx, play, pc_talk_held);
+    aNPC_pc_talk_hook(nactorx, play, pc_client_consumer); /* test-only, env-gated (off by default) */
+#endif
 
     aNPC_set_over_friendship(nactorx);
     aNPC_actor_move_show_before(actorx, game);
@@ -706,12 +1566,62 @@ static void aNPC_actor_move_show(ACTOR* actorx, GAME* game) {
         aNPC_talk_area_check(nactorx, play);
     }
 
-    aNPC_schedule_proc(nactorx, play);
-    aNPC_action_proc(nactorx, play);
+#ifdef TARGET_PC
+    /* N2: aNPC_schedule_proc()/aNPC_action_proc() are the movement-TARGET/goal decision layer --
+     * they set movement.target/movement.mv_angl (which aNPC_angle_calc() below turns into) and are
+     * themselves RNG-bearing (greeting/wander/avoid-search behavior, ac_npc_action.c_inc). A
+     * host-authoritative client must not run either: not because their OUTPUT would be wrong to
+     * apply (it's simply never applied -- see aNPC_pc_client_consume_move() above, already called
+     * from _show_before()), but because doing so would still independently consume qrand() entropy
+     * from the single global stream this whole game shares for everything (weather, drop rates,
+     * ...) -- diverging it from the host's for reasons entirely unrelated to villager movement. See
+     * the N2 completion report for the source trace that established this; QRAND_DOMAIN_VILLAGER
+     * (libc64/qrand_domains.h) remains an unused "future" stub, so RANDOM() here still means the one
+     * shared global generator, same as everywhere else pre-N2. aNPC_angle_calc() (which chases
+     * actor_class.shape_info.rotation.y toward movement.mv_angl) is skipped for the same
+     * reason -- its target was already consumed/applied directly, as the interpolated facing, inside
+     * aNPC_pc_client_consume_move(). */
+    if (!pc_client_consumer && !pc_talk_held)
+#endif
+    {
+        aNPC_schedule_proc(nactorx, play);
+        aNPC_action_proc(nactorx, play);
+    }
     aNPC_talk_request_check(actorx, game);
-    aNPC_angle_calc(nactorx);
+#ifdef TARGET_PC
+    if (!pc_client_consumer && !pc_talk_held)
+#endif
+    {
+        aNPC_angle_calc(nactorx);
+    }
+#ifdef TARGET_PC
+    if (pc_talk_held) {
+        aNPC_pc_host_handover_tick(nactorx, game); /* hand-over animations: a client's hand-over with this held villager, shown through NPC_MOVE */
+    }
+#endif
     aNPC_calc_fatigue(nactorx, play);
     aNPC_actor_move_show_after(actorx, game);
+
+#ifdef TARGET_PC
+    /* N2 host sampling point: after every other per-frame movement/AI call above has finished
+     * resolving actorx->world.position/angle.y for this frame exactly as it always has (this branch
+     * only runs when aNPC_pc_is_client_consumer() is FALSE, i.e. single-player or host), report the
+     * result. A no-op on single-player and internally throttled to ~20 Hz on a host -- see
+     * pc_net_game_notify_npc_move()'s doc comment (pc_net_game.h). */
+    if (!pc_client_consumer) {
+        aNPC_pc_host_sample_move(nactorx);
+    }
+
+    /* N3 Channel B: track/broadcast (host) or apply (client) is_home/hide/forced-schedule state for
+     * this VISIBLE villager too -- aNPC_actor_move_hide() above covers the hidden case; together they
+     * cover every frame regardless of hide status, per the design note above
+     * pc_net_game_notify_npc_state() (pc_net_game.h). */
+    if (pc_client_consumer) {
+        aNPC_pc_client_consume_state(nactorx);
+    } else {
+        aNPC_pc_host_check_state(nactorx);
+    }
+#endif
 }
 
 static void aNPC_actor_move(ACTOR* actorx, GAME* game) {

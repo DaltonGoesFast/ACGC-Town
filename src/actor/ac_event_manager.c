@@ -14,6 +14,11 @@
 #include "ac_groundhog_control.h"
 #include "m_bgm.h"
 #include "m_random_field.h"
+#ifdef TARGET_PC
+#include "pc_net_game.h" /* events: pc_net_game_event_client_gate() */
+#include "pc_guest_mail.h" /* guest mailbox: the mail-event window / Valentine's Day for the guests' villager letters */
+#define aEvMgr_HOST_UNBOUNDED(name) pc_net_game_evnpc_host_unbounded((int)(name)) /* Patch 4: the host creates its event NPCs whether or not a player is near */
+#endif
 #include "zurumode.h"
 #include "_mem.h"
 
@@ -1612,11 +1617,11 @@ static mEv_place_data_c* show_actor_at_wade(EVENT_MANAGER_ACTOR* evmgr, aEvMgr_e
                 return aEvMgr_SHOW_ACTOR_RESULT_NOT_SHOWN;
             }
 
-            if (aEvMgr_get_nearby_area_info(&ctrl->block, &quadrant) == FALSE) {
+            if (!aEvMgr_HOST_UNBOUNDED(place_data->actor_name) && aEvMgr_get_nearby_area_info(&ctrl->block, &quadrant) == FALSE) {
                 return aEvMgr_SHOW_ACTOR_RESULT_NOT_SHOWN;
             }
 
-            if (aEvMgr_check_in_nearby_area(&place_data->block, &ctrl->block, quadrant) == FALSE) {
+            if (!aEvMgr_HOST_UNBOUNDED(place_data->actor_name) && aEvMgr_check_in_nearby_area(&place_data->block, &ctrl->block, quadrant) == FALSE) {
                 return aEvMgr_SHOW_ACTOR_RESULT_NOT_SHOWN;
             }
 
@@ -1661,11 +1666,11 @@ static mEv_place_data_c* show_actor_at_wade_checkless(EVENT_MANAGER_ACTOR* evmgr
                 return aEvMgr_SHOW_ACTOR_RESULT_NOT_SHOWN;
             }
 
-            if (aEvMgr_get_nearby_area_info(&ctrl->block, &quadrant) == FALSE) {
+            if (!aEvMgr_HOST_UNBOUNDED(place_data->actor_name) && aEvMgr_get_nearby_area_info(&ctrl->block, &quadrant) == FALSE) {
                 return aEvMgr_SHOW_ACTOR_RESULT_NOT_SHOWN;
             }
 
-            if (aEvMgr_check_in_nearby_area(&place_data->block, &ctrl->block, quadrant) == FALSE) {
+            if (!aEvMgr_HOST_UNBOUNDED(place_data->actor_name) && aEvMgr_check_in_nearby_area(&place_data->block, &ctrl->block, quadrant) == FALSE) {
                 return aEvMgr_SHOW_ACTOR_RESULT_NOT_SHOWN;
             }
 
@@ -1696,12 +1701,12 @@ static mEv_place_data_c* show_actor_at_wade_checkfgcol(EVENT_MANAGER_ACTOR* evmg
                 return aEvMgr_SHOW_ACTOR_RESULT_NOT_SHOWN;
             }
 
-            if (aEvMgr_get_nearby_area_info(&ctrl->block, &quadrant) == FALSE) {
+            if (!aEvMgr_HOST_UNBOUNDED(place_data->actor_name) && aEvMgr_get_nearby_area_info(&ctrl->block, &quadrant) == FALSE) {
                 return aEvMgr_SHOW_ACTOR_RESULT_NOT_SHOWN;
             }
 
-            if (aEvMgr_check_in_nearby_area((const BlockOrUnit_c*)&place_data->block, &ctrl->block, quadrant) ==
-                FALSE) {
+            if (!aEvMgr_HOST_UNBOUNDED(((mEv_place_data_c*)place_data)->actor_name) &&
+                aEvMgr_check_in_nearby_area((const BlockOrUnit_c*)&place_data->block, &ctrl->block, quadrant) == FALSE) {
                 return aEvMgr_SHOW_ACTOR_RESULT_NOT_SHOWN;
             }
 
@@ -4593,6 +4598,11 @@ static int mail_event_check(void) {
             }
         }
 
+#ifdef TARGET_PC
+        /* guest mailbox: the same window for the GUESTS' birthday / Christmas letters (host only; delivered by pc_net_game.c into the host-held guest mailboxes) */
+        pc_net_game_guest_event_window(last_time.raw, date.raw);
+#endif
+
         // Valentine's day
         target_date.month = lbRTC_FEBRUARY;
         target_date.day = 14;
@@ -4637,6 +4647,9 @@ static int vt_wt_mail_check(void) {
 
         if (Save_Get(event_save_common).valentines_day_date <= date.raw) {
             mNpc_SendVtdayMail();
+#ifdef TARGET_PC
+            pc_net_game_guest_vtday_due(); /* guest mailbox: the guests' Valentine's Day letters (host only) */
+#endif
             Save_Get(event_save_common).valentines_day_date = 0;
             ret = TRUE;
         } else if (date.raw < vt_date.raw) {
@@ -4712,6 +4725,9 @@ static void schedule_main(ACTOR* actorx) {
     int nearby_info_valid = FALSE;
 
     if (Save_Get(event_save_common).special_event.flags == 1) {
+#ifdef TARGET_PC
+        if (!pc_net_game_event_client_gate(2)) /* a client never generates the special-event contents (RANDOM items): the host's mirror carries them */
+#endif
         set_special_event_save();
         Save_Get(event_save_common).special_event.flags = 0;
     }

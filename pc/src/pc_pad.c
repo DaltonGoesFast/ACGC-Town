@@ -3,6 +3,7 @@
 #include "pc_typing.h"
 #include "pc_keybindings.h"
 #include "pc_settings.h"
+#include "pc_host_observer.h"
 #include <dolphin/pad.h>
 
 /* analog stick constants */
@@ -51,11 +52,22 @@ BOOL PADInit(void) {
     return TRUE;
 }
 
+#include "pc_tool_wheel.h"
+#include "pc_emote_wheel.h"
+#include "pc_room_ui.h"          /* roommates: TEST-ONLY pad of the gyroid's move-in dialogue */
+#include "pc_net_game.h"
+#include "pc_play_online_menu.h" /* pc_play_online_menu_text_blocking */
+#include "pc_chat.h"             /* chat (worker CH): pc_chat_pad_block */
+#include "pc_touch.h"            /* touch overlay and mouse click-to-move */
+
 u32 PADRead(PADStatus* status) {
     memset(status, 0, sizeof(PADStatus) * 4);
 
     const u8* keys = SDL_GetKeyboardState(NULL);
-    u32 mouse = SDL_GetMouseState(NULL, NULL);
+    int mouse_x = 0, mouse_y = 0;
+    u32 mouse = SDL_GetMouseState(&mouse_x, &mouse_y);
+    int wheel_kb = 0, wheel_pad = 0, wheel_rx = 0, wheel_ry = 0;
+    int emote_kb = 0, emote_pad = 0; /* EMOTE WHEEL (pc_emote_wheel.c): the held Emote key / pad button */
     u16 buttons = 0;
     s8 stickX = 0, stickY = 0;
     s8 cstickX = 0, cstickY = 0;
@@ -90,6 +102,9 @@ u32 PADRead(PADStatus* status) {
         if (INPUT_PRESSED(kb->cstick_down))  cstickY -= STICK_MAGNITUDE;
         if (INPUT_PRESSED(kb->cstick_left))  cstickX -= STICK_MAGNITUDE;
         if (INPUT_PRESSED(kb->cstick_right)) cstickX += STICK_MAGNITUDE;
+
+        wheel_kb = INPUT_PRESSED(kb->wheel) ? 1 : 0;
+        emote_kb = INPUT_PRESSED(kb->emote) ? 1 : 0;
 
         /* D-pad */
         if (INPUT_PRESSED(kb->dpad_up))    buttons |= PAD_BUTTON_UP;
@@ -149,6 +164,10 @@ u32 PADRead(PADStatus* status) {
 
         s16 rx = SDL_GameControllerGetAxis(g_controller, SDL_CONTROLLER_AXIS_RIGHTX);
         s16 ry = SDL_GameControllerGetAxis(g_controller, SDL_CONTROLLER_AXIS_RIGHTY);
+        wheel_pad = pad_code_pressed(pb->wheel) ? 1 : 0;
+        emote_pad = pad_code_pressed(pb->emote) ? 1 : 0;
+        wheel_rx = rx;
+        wheel_ry = ry;
         if (abs(rx) > cstick_dz) {
             int srx = rx >> 8;
             if (srx > 127) srx = 127; else if (srx < -128) srx = -128;
@@ -162,6 +181,75 @@ u32 PADRead(PADStatus* status) {
 
         status[0].triggerLeft  = pad_trigger_value(pb->l);
         status[0].triggerRight = pad_trigger_value(pb->r);
+    }
+
+    /* a text field has the keyboard (the Play Online menu's name / address entry): its letters are TEXT, the wheel key (G by default) must not open the wheel. The in-game editor's typing mode
+     * already cleared wheel_kb above (the whole keyboard mapping is skipped). The controller wheel button is not a letter and is untouched. */
+    if (pc_play_online_menu_text_blocking()) {
+        wheel_kb = 0;
+        emote_kb = 0;
+    }
+
+    { /* TEST-ONLY (AC_TEST_HOOKS=1, AC_TEST_AUTOPILOT=1): an automated test plays through the real game code; 0 / zero stick otherwise */
+        signed char ax = 0, ay = 0;
+        const unsigned af = pc_net_game_test_autopilot_pad(&ax, &ay);
+        if (af & 1u) buttons |= PAD_BUTTON_A;
+        if (af & 2u) buttons |= PAD_BUTTON_RIGHT;
+        if (af & 4u) buttons |= PAD_BUTTON_B; /* "mashm" (guest mailbox real test): B closes the mailbox overlay */
+        if (ax != 0 || ay != 0) { stickX = (s8)ax; stickY = (s8)ay; }
+    }
+    { /* TEST-ONLY (AC_TEST_HOOKS=1, AC_TEST_DRESSER_GYROID=1): the scripted input of the dresser gyroid-overlay UI test; 0 otherwise (never in normal play) */
+        const unsigned df = pc_net_game_test_dresser_pad();
+        if (df & 1u) buttons |= PAD_BUTTON_A;
+        if (df & 2u) buttons |= PAD_BUTTON_RIGHT;
+        if (df & 4u) buttons |= PAD_BUTTON_LEFT;
+        if (df & 8u) buttons |= PAD_BUTTON_B;
+        if (df & 16u) buttons |= PAD_TRIGGER_L;
+        if (df & 32u) buttons |= PAD_TRIGGER_R;
+        if (df & 2u) stickX = (s8)STICK_MAGNITUDE;   /* the menus move the cursor with the stick */
+        if (df & 4u) stickX = (s8)-STICK_MAGNITUDE;
+        if (df & 64u) stickY = (s8)-STICK_MAGNITUDE; /* cursor down (to the pockets) */
+        if (df & 128u) stickY = (s8)STICK_MAGNITUDE; /* cursor up */
+        if (df & 256u) buttons |= PAD_BUTTON_START;
+        if (df & 512u) buttons |= PAD_TRIGGER_Z;
+    }
+    if (pc_chat_pad_block()) { /* chat (worker CH): the chat line is open (its letters are text), or the Enter / Esc that closed it is still held: the local pad reads neutral */
+        buttons = 0;
+        stickX = stickY = cstickX = cstickY = 0;
+        wheel_kb = wheel_pad = 0;
+        emote_kb = emote_pad = 0;
+        status[0].triggerLeft = 0;
+        status[0].triggerRight = 0;
+    }
+    pc_touch_apply(&buttons, &stickX, &stickY, &wheel_kb, &emote_kb, &mouse_x, &mouse_y);
+    pc_tool_wheel_input(wheel_kb, wheel_pad, mouse_x, mouse_y, wheel_rx, wheel_ry, deadzone_threshold(g_pc_settings.stick_deadzone), &buttons, &cstickX, &cstickY);
+
+    if (pc_tool_wheel_is_open()) { /* the analog L/R triggers must not leak into the game while the wheel is up either */
+        status[0].triggerLeft = 0;
+        status[0].triggerRight = 0;
+    }
+    /* EMOTE WHEEL (pc_emote_wheel.c): same contract as the tool wheel (the two exclude each other); its opener, D-pad Up on the pad by
+     * default, never reaches the game while the wheel is up */
+    pc_emote_wheel_input(emote_kb, emote_pad, mouse_x, mouse_y, wheel_rx, wheel_ry, deadzone_threshold(g_pc_settings.stick_deadzone), &buttons,
+                         &stickX, &stickY, &cstickX, &cstickY);
+    if (pc_emote_wheel_is_open()) {
+        status[0].triggerLeft = 0;
+        status[0].triggerRight = 0;
+    }
+    { /* TEST-ONLY (AC_TEST_HOOKS=1, AC_TEST_ROOM_UI): the gyroid's move-in choice windows answered like a player (pc_room_ui.c); 0 otherwise (never in normal play) */
+        const unsigned rf = pc_room_ui_test_pad();
+        if (rf & 1u) buttons |= PAD_BUTTON_A;
+        if (rf & 2u) buttons |= PAD_BUTTON_DOWN;
+        if (rf & 4u) buttons |= PAD_BUTTON_UP;
+    }
+
+    if (pc_host_observer_active()) {
+        /* --host-observer: the hidden observer is NOT controllable. Every keyboard / mouse / gamepad input is dropped here, the single place the
+         * game reads a controller from (PADRead), so neither the avatar, nor a message window, nor any menu can be driven from this process. */
+        buttons = 0;
+        stickX = stickY = cstickX = cstickY = 0;
+        status[0].triggerLeft = 0;
+        status[0].triggerRight = 0;
     }
 
     status[0].button = buttons;

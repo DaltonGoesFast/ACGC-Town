@@ -24,9 +24,12 @@
 #ifdef PC_ENHANCEMENTS
 #include "pc_settings.h"
 #include "pc_settings_menu.h"
+#include "pc_play_online_menu.h"
 #include "pc_menu_util.h"
+#include "pc_pause_menu.h" /* pc_version_corner_draw: the version in the title screen's bottom-right corner */
 #include "main.h"
 #include <stdio.h>
+#include <string.h>
 #endif
 
 #define G_CC_TITLE PRIMITIVE, ENVIRONMENT, TEXEL0, ENVIRONMENT, PRIMITIVE, 0, TEXEL0, 0
@@ -85,11 +88,19 @@ ACTOR_PROFILE Animal_Logo_Profile = {
 static void aAL_setupAction(ANIMAL_LOGO_ACTOR* actor, GAME* game, int action);
 static void aAL_title_decide_p_sel_npc();
 
+#ifdef PC_ENHANCEMENTS
+static int s_aAL_pc_guest_joining = 0; /* Guests G3.2: set once the guest arrival scene change was requested (further presses ignored); cleared in aAL_actor_ct */
+#endif
+
 static void aAL_actor_ct(ACTOR* actor, GAME* game) {
   ANIMAL_LOGO_ACTOR* logo_actor = (ANIMAL_LOGO_ACTOR*)actor;
   GAME_PLAY* play = (GAME_PLAY*)game;
   Clip_c* clip = Common_GetPointer(clip);
   aAL_SkeletonInfo_c* skeleton_info;
+
+#ifdef PC_ENHANCEMENTS
+  s_aAL_pc_guest_joining = 0;
+#endif
 
 #ifdef TARGET_PC
   { extern int g_pc_verbose; if (g_pc_verbose) printf("[LOGO] aAL_actor_ct: Animal Logo actor created\n"); }
@@ -335,6 +346,52 @@ static void aAL_fade_out_start_wait_init(ANIMAL_LOGO_ACTOR* actor, GAME* game) {
 }
 
 #ifdef PC_ENHANCEMENTS
+/* Guests G3.2: the PC title menu items. Without a guest item the menu is exactly the old Start / Options / Quit (ids 0..2 in that order). A network CLIENT
+ * (--connect) gets a 4th item "Join as Guest (NAME)" right after Start: Start Game, Join as Guest, Options, Quit Game. */
+enum {
+  aAL_PC_ITEM_START = 0,
+  aAL_PC_ITEM_OPTIONS = 1,
+  aAL_PC_ITEM_QUIT = 2,
+  aAL_PC_ITEM_GUEST = 3,
+  aAL_PC_ITEM_ONLINE = 4 /* M4: "Play Online" (only when no network role is active) */
+};
+
+/* Fills `items` (max 5) in display order: Start [, Join as Guest (client) | Play Online (no role)], Options, Quit. Returns the count. */
+static int aAL_pc_menu_build(int items[5]) {
+  extern int pc_guest_title_item_visible(void); /* pc_m_card.c: role == CLIENT */
+  int n = 0;
+
+  /* Public beta: multiplayer is Play Online, so the old "Start Game" is only offered to a HOST process (--host: it loads the town it serves). With no role or as a
+   * client the menu is Play Online / Join as Guest, Options, Quit. The single-player start code itself is untouched. */
+  if (!pc_guest_title_item_visible() && !pc_play_online_menu_available()) {
+    items[n++] = aAL_PC_ITEM_START;
+  }
+  if (pc_guest_title_item_visible()) {
+    items[n++] = aAL_PC_ITEM_GUEST;
+  } else if (pc_play_online_menu_available()) {
+    items[n++] = aAL_PC_ITEM_ONLINE;
+  }
+  items[n++] = aAL_PC_ITEM_OPTIONS;
+  items[n++] = aAL_PC_ITEM_QUIT;
+  return n;
+}
+
+static int aAL_pc_menu_count(void) {
+  int items[5];
+
+  return aAL_pc_menu_build(items);
+}
+
+static int aAL_pc_menu_item(int sel) {
+  int items[5];
+  int n = aAL_pc_menu_build(items);
+
+  if (sel < 0 || sel >= n) {
+    sel = 0;
+  }
+  return items[sel];
+}
+
 static void aAL_pc_game_start_wait(ANIMAL_LOGO_ACTOR* actor, GAME* game) {
   GAME_PLAY* play = (GAME_PLAY*)game;
   f32 dt = (f32)game->graph->dt_num_60fps_frames;
@@ -355,6 +412,33 @@ static void aAL_pc_game_start_wait(ANIMAL_LOGO_ACTOR* actor, GAME* game) {
     if (actor->pc_cursor_cooldown < 0.0f) {
       actor->pc_cursor_cooldown = 0.0f;
     }
+  }
+
+  if (pc_play_online_menu_active()) {
+    s8 stick_x = gamePT->pads[PAD0].now.stick_x;
+
+    /* Text entry is fed raw SDL events by pc_main; pad nav stands down meanwhile. */
+    if (pc_play_online_menu_text_blocking()) {
+      return;
+    }
+    if (actor->pc_cursor_cooldown <= 0.0f) {
+      if (on_btn & BUTTON_A || on_btn & BUTTON_START) {
+        pc_play_online_menu_confirm();
+        actor->pc_cursor_cooldown = 10.0f;
+      } else if (on_btn & BUTTON_B) {
+        pc_play_online_menu_cancel();
+        actor->pc_cursor_cooldown = 10.0f;
+      } else if (stick_y > 30 || (on_btn & BUTTON_DUP)) {
+        pc_play_online_menu_nav_up();   actor->pc_cursor_cooldown = 8.0f;
+      } else if (stick_y < -30 || (on_btn & BUTTON_DDOWN)) {
+        pc_play_online_menu_nav_down(); actor->pc_cursor_cooldown = 8.0f;
+      } else if (stick_x > 30 || (on_btn & BUTTON_DRIGHT)) {
+        pc_play_online_menu_nav_right(); actor->pc_cursor_cooldown = 8.0f;
+      } else if (stick_x < -30 || (on_btn & BUTTON_DLEFT)) {
+        pc_play_online_menu_nav_left(); actor->pc_cursor_cooldown = 8.0f;
+      }
+    }
+    return;
   }
 
   if (actor->pc_options_open) {
@@ -388,7 +472,7 @@ static void aAL_pc_game_start_wait(ANIMAL_LOGO_ACTOR* actor, GAME* game) {
     return;
   }
 
-  /* Main menu navigation (3 items: Start / Options / Quit) */
+  /* Main menu navigation (3 items: Start / Options / Quit; 4 for a network client: Start / Join as Guest / Options / Quit) */
   if (actor->pc_cursor_cooldown <= 0.0f) {
     if (stick_y > 30 || (on_btn & BUTTON_DUP)) {
       if (actor->pc_menu_sel > 0) {
@@ -396,7 +480,7 @@ static void aAL_pc_game_start_wait(ANIMAL_LOGO_ACTOR* actor, GAME* game) {
         actor->pc_cursor_cooldown = 10.0f;
       }
     } else if (stick_y < -30 || (on_btn & BUTTON_DDOWN)) {
-      if (actor->pc_menu_sel < 2) {
+      if (actor->pc_menu_sel < aAL_pc_menu_count() - 1) {
         actor->pc_menu_sel++;
         actor->pc_cursor_cooldown = 10.0f;
       }
@@ -405,20 +489,36 @@ static void aAL_pc_game_start_wait(ANIMAL_LOGO_ACTOR* actor, GAME* game) {
 
   /* Select */
   if (on_btn & (BUTTON_A | BUTTON_START)) {
-    switch (actor->pc_menu_sel) {
-      case 0: /* Start Game */
+    switch (aAL_pc_menu_item(actor->pc_menu_sel)) {
+      case aAL_PC_ITEM_START: /* Start Game */
         if (mLd_CheckStartFlag() == TRUE &&
             aAL_wipe_end_check(game) == TRUE &&
             mTD_tdemo_button_ok_check()) {
           aAL_setupAction(actor, game, aAL_ACTION_FADE_OUT_START);
         }
         break;
-      case 1: /* Options */
+      case aAL_PC_ITEM_GUEST: /* Join as Guest (network client only): same readiness conditions as Start Game */
+        if (!s_aAL_pc_guest_joining &&
+            mLd_CheckStartFlag() == TRUE &&
+            aAL_wipe_end_check(game) == TRUE &&
+            mTD_tdemo_button_ok_check()) {
+          extern int pc_guest_title_join(void); /* pc_m_card.c: reloads the save, binds the guest, goes to the station; 0 = failed, message set, we stay here */
+          if (pc_guest_title_join()) {
+            s_aAL_pc_guest_joining = 1;
+          }
+          actor->pc_cursor_cooldown = 10.0f;
+        }
+        break;
+      case aAL_PC_ITEM_ONLINE: /* Play Online: server -> character selection, then an in-process connect (no relaunch: pc_main.c pc_main_play_online_poll) */
+        pc_play_online_menu_enter();
+        actor->pc_cursor_cooldown = 10.0f;
+        break;
+      case aAL_PC_ITEM_OPTIONS: /* Options */
         actor->pc_options_open = 1;
         actor->pc_cursor_cooldown = 10.0f;
         pc_settings_menu_enter();
         break;
-      case 2: /* Quit Game */
+      case aAL_PC_ITEM_QUIT: /* Quit Game */
         g_pc_running = 0;
         actor->pc_cursor_cooldown = 10.0f;
         break;
@@ -800,19 +900,76 @@ static void aAL_pc_menu_draw(ANIMAL_LOGO_ACTOR* actor, GAME* game) {
   f32 y_base = 135.0f;
   f32 line_h = 18.0f;
   int sel = actor->pc_menu_sel;
+  int n_items = aAL_pc_menu_count();
 
   /* Hide the title's main menu items while the Options overlay is open, else
    * Start/Options/Quit bleed through the dimmed backdrop. */
-  if (!actor->pc_options_open) {
-    for (int i = 0; i < 3; i++) {
+  if (!actor->pc_options_open && !pc_play_online_menu_active()) {
+    for (int i = 0; i < n_items; i++) {
       int on = (sel == i);
-      pc_menu_draw_centered(game, labels[i], y_base + i * line_h,
+      int item = aAL_pc_menu_item(i);
+      const char* label = labels[item < 3 ? item : 0];
+
+      if (item == aAL_PC_ITEM_ONLINE) {
+        label = "Play Online";
+      } else if (item == aAL_PC_ITEM_GUEST) {
+        extern const char* pc_guest_title_label(void); /* pc_m_card.c: "Join as Guest (NAME)" */
+        label = pc_guest_title_label();
+      }
+      pc_menu_draw_centered(game, label, y_base + i * line_h,
         on ? sel_r[td] : dim_r[td],
         on ? sel_g[td] : dim_g[td],
         on ? sel_b[td] : dim_b[td],
         on ? 255 : 220,
         on ? PC_MENU_SCALE_SELECTED : 1.0f);
     }
+
+    /* Guests G3.2: why the last "Join as Guest" attempt failed (shown for a few seconds, word wrapped, the title stays up). */
+    {
+      extern const char* pc_guest_title_message(void); /* pc_m_card.c: NULL when there is no (or an expired) message */
+      const char* msg = pc_guest_title_message();
+
+      if (msg != NULL) {
+        f32 y = y_base + n_items * line_h + 10.0f;
+        int pos = 0;
+        int len = (int)strlen(msg);
+        int rows = 0;
+
+        extern const char* pc_guest_title_message_head(void); /* pc_m_card.c: heading of the message */
+        pc_menu_draw_centered(game, pc_guest_title_message_head(), y, 255, 90, 90, 255, 1.0f);
+        y += line_h;
+        while (pos < len && rows < 4) {
+          char row[48];
+          int take = len - pos;
+          int k;
+
+          if (take > 40) {
+            take = 40;
+            for (k = take; k > 20; k--) { /* break at the last blank of the window */
+              if (msg[pos + k] == ' ') {
+                take = k;
+                break;
+              }
+            }
+          }
+          memcpy(row, msg + pos, (size_t)take);
+          row[take] = '\0';
+          pc_menu_draw_centered(game, row, y, 255, 255, 255, 230, 1.0f);
+          y += line_h;
+          pos += take;
+          while (pos < len && msg[pos] == ' ') {
+            pos++;
+          }
+          rows++;
+        }
+      }
+    }
+  }
+
+  /* M4: Play Online (server / character selection). */
+  if (pc_play_online_menu_active()) {
+    pc_play_online_menu_tick();
+    pc_play_online_menu_draw(game, /*with_dim_backdrop=*/1);
   }
 
   /* Options sub-menu, shared with the in-game pause menu. */
@@ -825,6 +982,9 @@ static void aAL_pc_menu_draw(ANIMAL_LOGO_ACTOR* actor, GAME* game) {
       actor->pc_options_open = 0;
     }
   }
+
+  /* The game version (pc_version.h) in the bottom-right corner: the title screen / main menu only (pc_pause_menu.c). */
+  pc_version_corner_draw(game, actor->pc_options_open || pc_play_online_menu_active());
 }
 #endif
 

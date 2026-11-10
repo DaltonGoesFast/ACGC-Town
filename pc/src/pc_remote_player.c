@@ -1,0 +1,7628 @@
+/* pc_remote_player.c - Stage 2/3/4A/4B: visible, movement-synchronized, real-model, animated
+ * representation of a connected remote player.
+ *
+ * See pc_remote_player.h for scope. Design notes carried forward from Stage 2/3 (see those
+ * investigations for the full reasoning -- summarized here so this file is self-contained):
+ *
+ *   - Actor part: ACTOR_PART_UNUSED, not ACTOR_PART_PLAYER. get_player_actor_withoutCheck()
+ *     reads actor_info->list[ACTOR_PART_PLAYER].actor[0], and Actor_info_part_new() prepends new
+ *     actors to a part's list -- putting a remote player in ACTOR_PART_PLAYER risks it being
+ *     picked up as *the* local player by that lookup. ACTOR_PART_UNUSED is an existing,
+ *     correctly-sized Actor_info list slot whose only other reader in the whole codebase is
+ *     ac_insect_move.c_inc's insect "stress" calculation, which just treats anything in it like a
+ *     nearby moving NPC/player for scaring insects away -- a harmless, even mildly thematic, side
+ *     effect for an actor that stands in for another player.
+ *   - Allocation: Actor_malloc_actor_class() dispatches purely on ITEM_NAME_GET_TYPE(name_id), not
+ *     on `part`. NAME_TYPE_PAD15 (m_name_table.h) is an unused decomp name-type value that falls
+ *     through to the `default:` case there -- a plain zelda_malloc(), bypassing both the 9-slot
+ *     NPC pool and the 32-slot structure pool entirely. No pool sizes or dispatch logic change.
+ *   - Culling/persistence: ACTOR_STATE_NO_MOVE_WHILE_CULLED | ACTOR_STATE_NO_DRAW_WHILE_CULLED in
+ *     the profile's initial_flags_state is the exact, already-proven precedent ac_structure.c uses
+ *     (Structure_Profile) so an actor is never skipped by Actor_delete_check()'s block-distance
+ *     deletion, without touching global culling behavior.
+ *   - Creation pipeline: pc_actor_make_from_profile() (src/game/m_actor.c, TARGET_PC-only) runs
+ *     the exact same allocate/init/link/construct sequence as Actor_info_make_actor(), just taking
+ *     an ACTOR_PROFILE/ACTOR_DLFTBL pair directly instead of indexing the decomp's fixed
+ *     actor_dlftbls[] table (which has no slot for a PC-only actor type).
+ *   - Destruction: Actor_delete() only nulls mv_proc/dw_proc; the actor system reaps the memory
+ *     later during its normal per-frame sweep. This file never frees an ACTOR directly.
+ *   - Position: NOT network-synchronized *from* this file -- it comes from Stage 3's delayed
+ *     interpolation over the per-peer snapshot ring buffer, unchanged in Stage 4A.
+ *
+ * Stage 4A replaces the flat-colored pyramid marker with the actual player skeleton/model,
+ * reusing the same exported mPlib_ and cKF_ pipeline the inventory-overlay player preview uses
+ * (src/game/m_inventory_ovl.c's mIV_pl_shape_init/mIV_pl_shape_draw) -- i.e. composition, not a
+ * fake PLAYER_ACTOR: none of Player_actor_ct, Player_actor_move, the per-state main functions, or
+ * the CulcAnimation helpers is ever called, no controller is read, and every mPlib_/cKF_ symbol
+ * used here is already declared extern in m_player_lib.h / c_keyframe.h. See
+ * pc_remote_player_visual_init()/pc_remote_player_dw() below for exactly which calls are made and
+ * why each is safe to make independently of the local player's own state machine.
+ *
+ * Stage 4B drives that skeleton through IDLE/WALK/RUN/DASH using the already-synchronized Stage 3
+ * move_state/speed fields -- no protocol change. It reuses the real player's own verified
+ * animation-selection and playback-speed formulas (see pc_remote_player_mv()'s Stage 4B block for
+ * exact citations); AIRBORNE/TUMBLE/ITEM_USE/OTHER, held items, and appearance sync are explicitly
+ * out of scope and fall back to WAIT1.
+ */
+#include "pc_remote_player.h"
+
+#include "m_actor.h"
+#include "m_play.h"
+#include "m_player_lib.h"
+#include "m_name_table.h"
+#include "m_needlework.h" /* Stage 4C-1: mNW_original_design_c, mNW_CopyOriginalTexture(),
+                            * mNW_CopyOriginalPalette() -- see pc_remote_player_apply_appearance() */
+#include "m_common_data.h" /* Common_Get(player_actor_exists), Now_Private -- see
+                             * pc_remote_player_visual_init()'s readiness gate */
+#include "m_rcp.h"
+#include "sys_matrix.h" /* M9-C Phase 1: Matrix_get/put/push/pull, _Matrix_to_Mtx_new -- held-item draw */
+#include "m_collision_obj.h" /* M9-B: ClObjPipe_c, CollisionCheck_setOC() -- see pc_remote_player_collide_update() */
+#include "m_lib.h"           /* M9-B: _Game_play_isPause() */
+#include "libultra/libultra.h"
+#include "pc_platform.h"     /* M9-B: g_pc_collide_test_* (diagnostic verbosity only) */
+#include "pc_host_observer.h" /* --host-observer: pc_host_observer_active() (the observer registers no collider and is never pushed by puppets) */
+#include "pc_lowaddr.h" /* PC_LOWADDR_LIMIT -- see the guard in pc_remote_player_poll() */
+#include "ac_effectbg.h" /* M9-C Phase 4: EffectBG_EFFECT_SHAKE_LARGE / EffectBG_VARIANT_* (remote tree-shake presentation) */
+#include "ef_effect_control.h" /* M9-C Phase 2a: eEC_EFFECT_TURI_MIZU (alias proof for the relax_rod row); Phase 3: eEC_CLIP + effect ids */
+#include "m_collision_bg.h" /* M9-C Phase 3: mCoBG_Wpos2Attribute() (read-only ground attribute), mCoBG_ATTRIBUTE_* */
+#ifdef TARGET_PC
+#include "ac_structure.h"     /* building doors: STRUCTURE_ACTOR / STRUCTURE_CONTROL_ACTOR */
+#include "ac_house.h"         /* building doors: aHUS_pc_cosmetic_door */
+#include "ac_my_house.h"      /* building doors: aMHS_pc_cosmetic_door */
+#include "ac_post_office.h"   /* building doors: aPOFF_pc_cosmetic_door */
+#include "ac_needlework_shop.h" /* building doors: aNW_pc_cosmetic_door */
+#include "m_train_control.h"          /* T4: mTRC_pc_remote_arrival() (the only train API this file calls, through its guard) */
+#include "pc_remote_arrival_logic.h"  /* T3 / T4: pure per-puppet latch + DEMO_WALK mapping (natively tested) */
+#endif
+#include "m_kankyo.h"        /* M9-C Phase 3: mEnv_NowWeather(), mEnv_WEATHER_* (caller-side effect guard) */
+#include "m_scene_table.h"   /* interiors: SCENE_* ids (shared-interior presence, door class of the scene the owner just left) */
+#define PC_REMOTE_PLAYER_HAVE_EEC_ENUM 1
+#include "audio.h" /* Stage 4B.1: sAdo_OngenTrgStart() -- see the TURN_DASH skid sound in
+                     * pc_remote_player_mv(). Already #include'd elsewhere in pc/ (e.g.
+                     * pc_nes_fixnes.c) and compiles cleanly in the PC build. */
+
+#include "pc_puppet_pool.h" /* capacity phase 6: the slot pool */
+#include "pc_pvp_authority.h" /* player-vs-player tool hits: the read-only puppet queries defined here */
+#include <math.h> /* sqrtf() -- see the Stage 4B animation-speed formula in pc_remote_player_mv() */
+#include <string.h>
+#include <stdio.h>
+#include <stdlib.h>
+
+/* Same two decomp-owned skeleton globals m_player_lib.c's own mPlib_get_player_mdl_p() selects
+ * between (src/data/model/boy_model.c / girl_model.c) -- declared extern here purely for the
+ * diagnostic model-name print below; the actual selection always goes through
+ * mPlib_get_player_mdl_p() itself, never this pointer directly. */
+extern cKF_Skeleton_R_c cKF_bs_r_boy_1;
+extern cKF_Skeleton_R_c cKF_bs_r_grl_1;
+
+/* Capacity phase 6: the puppet slots are a POOL (pc_puppet_pool.h): a slot is allocated on demand for any usable wire id 0..254 (the host's id 8 included: on a client it names the
+ * host), kept while the player is tracked and freed on departure. Before this the table had exactly 9 slots (ids 0..7 + 8) and every id from 9 up was rejected at the door
+ * (pc_remote_player_get_slot returned NULL): the 9th guest (wire id 9) was connected, simulated by the host and able to see everybody, but NO other process could create its puppet.
+ * Three resources are kept apart: the slot STATE (this pool: memory only), the puppet ACTOR (the scene's actor pool, mAc_MAX_ACTORS = 200 shared with everything else: see
+ * pc_remote_player_poll), and the OC collider table (Cl_COLLIDER_NUM = 50, only puppets within PC_REMOTE_PLAYER_COLLIDE_RANGE register). */
+
+/* Stage 3 tuning constants (named so they're easy to find and retune later). */
+#define PC_REMOTE_PLAYER_SNAPSHOT_COUNT 4        /* ring size per peer; 2 is the true minimum for
+                                                   * interpolation, 4 gives slack against jitter */
+#define PC_REMOTE_PLAYER_INTERP_DELAY_FRAMES 9.0 /* ~150ms at 60fps-equivalent units */
+#define PC_REMOTE_PLAYER_TIMEOUT_FRAMES 300.0     /* ~5s; matches pc_net.c's own PCNET_TIMEOUT_MS,
+                                                    * used only for relay-discovered peers (see
+                                                    * pc_remote_player_on_move()) that have no
+                                                    * direct PC_NET_EVENT_PEER_DISCONNECTED */
+#define PC_REMOTE_PLAYER_TELEPORT_DIST_SQ (400.0f * 400.0f) /* squared world units between two
+                                                              * consecutive snapshots; farther than
+                                                              * this is treated as a teleport/
+                                                              * loading-zone jump, not a slide */
+
+/* Stage 4C-1: the local player's own face-texture bank is exactly 8 eye slots + 6 mouth slots at
+ * 256 bytes each (mPlayer_EYE_TEX_NUM/mPlayer_MOUTH_TEX_NUM, include/m_player.h) -- verified via
+ * src/game/m_player_lib.c's mPlib_change_player_face() (a bare 0xE00 literal there; no named
+ * decomp macro exists for it, so this file names its own copy). Every remote player's own face-tex
+ * buffer uses this exact same layout, filled by mPlib_Load_FaceTexAndPallet(). */
+#define PC_REMOTE_PLAYER_FACE_TEX_SIZE 0xE00
+/* P1: bit 7 of PCNetPlayerAppearance::sunburn_rank (a rank is 0..8) = the owner's bee-sting swollen face; pc_net_game.c
+ * (PC_NETGAME_APPEAR_SWELL_BIT) moves it to / from the APPEARANCE flag byte, the wire rank stays clean. */
+#define PC_REMOTE_APPEAR_SWELL_BIT 0x80u
+
+/* M9-C Phase 1: held-item classes (see pc_remote_player_held_class()). PC_HELD_DEFERRED = a kind the puppet
+ * deliberately does NOT present yet (custom/ORG umbrellas, balloons, pinwheels, out-of-range values): it is treated
+ * exactly like "no item" (idle arms, no model) so a puppet never has an item pose without its model. */
+enum {
+    PC_HELD_NONE = 0,
+    PC_HELD_AXE,
+    PC_HELD_NET,
+    PC_HELD_UMBRELLA,
+    PC_HELD_ROD,
+    PC_HELD_SHOVEL,
+    PC_HELD_FAN,
+    PC_HELD_DEFERRED,
+    PC_HELD_BALLOON,   /* P1: the 8 balloons (item skeleton + sway, m_player_item_balloon.c_inc) */
+    PC_HELD_WINDMILL,  /* P1: the 8 pinwheels (item skeleton + spin, m_player_item_windmill.c_inc) */
+};
+
+/* Stage 4A: a remote player's own PC-owned skeleton/animation state, mirroring exactly what
+ * src/game/m_inventory_ovl.c's mIV_pl_shape_init()/mIV_pl_shape_draw() already do for the
+ * inventory's player preview -- two combine-played keyframe layers sharing one joint/morph work
+ * buffer pair, plus a part table. Every field here is per-instance (never shared between remote
+ * players); the skeleton/animation data each keyframe *points to* (cKF_bs_r_boy_1/grl_1, the
+ * mPlib_Get_Pointer_Animation() table) is shared, read-only, compiled-in decomp data. */
+typedef struct PCRemotePlayerVisual {
+    int                   initialized; /* 0 until pc_remote_player_visual_init() has run */
+    cKF_SkeletonInfo_R_c  keyframe0;   /* lower-body/main animation layer */
+    cKF_SkeletonInfo_R_c  keyframe1;   /* upper-body/item animation layer (kept in lockstep with
+                                        * keyframe0 -- see pc_remote_player_mv()'s Stage 4B block) */
+    s_xyz                 joint_data[mPlayer_JOINT_NUM + 1];  /* shared by both layers, matching
+                                                                * PLAYER_ACTOR's own layout */
+    s_xyz                 morph_data[mPlayer_JOINT_NUM + 1];
+    s8                    part_table[mPlayer_JOINT_NUM + 1];
+    int                   current_anim_idx; /* Stage 4B: mPlayer_ANIM_* currently playing on both
+                                              * layers -- per-instance, never static/shared (see
+                                              * pc_remote_player_mv()). Zero-initialized by
+                                              * Actor_init_actor_class()'s mem_clear at creation,
+                                              * which is exactly mPlayer_ANIM_WAIT1's value (0), so
+                                              * a freshly (re)created actor already starts correctly
+                                              * "on WAIT1" without needing an explicit reset here. */
+
+    /* M9-C Phase 1 (remote held-item presentation). All of this is per-actor (zero-initialised at creation,
+     * so a recreated puppet never inherits a previous item) and contains no pointer to anything the local
+     * player owns. */
+    int                   current_anim1_idx;   /* mPlayer_ANIM_* currently bound to keyframe1 (== current_anim_idx
+                                                * unless a held item overrides the upper-body layer) */
+    int                   current_part_table;  /* mPlayer_PART_TABLE_* currently copied into part_table */
+    int                   held_kind;           /* EFFECTIVE held item kind this puppet renders (-1 none/deferred) */
+    int                   held_class;          /* PC_HELD_* of held_kind */
+    int                   diag_valid;          /* PC_PUPPET_DIAG: last logged raw item kind is diag_raw_kind */
+    int                   diag_raw_kind;
+    int                   diag_face_eye;       /* last drawn eye / mouth pattern (face diag: a line on change only) */
+    int                   diag_face_mouth;
+    int                   item_ready;         /* item_keyframe holds a valid net/rod skeleton instance */
+    int                   item_anim_idx;       /* mPlayer_ITEM_DATA_* currently bound on item_keyframe */
+    cKF_SkeletonInfo_R_c  item_keyframe;       /* net / rod skeleton instance (puppet-owned) */
+    s_xyz                 item_joint_data[8];  /* same sizes as PLAYER_ACTOR::item_joint_data / item_morph_data */
+    s_xyz                 item_morph_data[8];
+    s_xyz                 net_angle;           /* net joint-3 rotation (PLAYER_ACTOR::net_angle equivalent) */
+
+    /* M9-C Phase 2a (protocol v7 state rows). Per actor, zero-initialised at creation: a recreated puppet (scene
+     * generation, disconnect/reconnect) starts with no row, no latch and an unknown pair. */
+    int                   pair_known;          /* a (main_index, counter) pair has been adopted */
+    int                   pair_valid;          /* last adopted pair carried action info */
+    uint8_t               pair_idx;            /* last adopted wire main index */
+    uint8_t               pair_ctr;            /* last adopted 4-bit entry counter */
+    int                   row_active;          /* a state row currently drives the body clips */
+    int                   row_idx;             /* its mPlayer_INDEX_* */
+    int                   row_finished;        /* the one-shot clip reached its end */
+    int                   row_chained;         /* switched to the row's chain (REPEAT) clip after the one-shot ended */
+    int                   row_pending;         /* a fallback state arrived while the one-shot was still playing */
+    double                row_pending_since;   /* graph_dt_frame_time() of that edge */
+    double                row_start_time;
+    int                   item_restart;        /* rebind the item clip at the next item tick (row (re)start) */
+    int                   item_carry_ok;       /* a row was active before this one (frame carry-over is meaningful) */
+    int                   item_hidden;         /* row flag: do not draw the carried item */
+    int                   row_held_kind;       /* effective held kind when the row started (chain clip item pose) */
+    int                   row_adopted;         /* M9-C Phase 6a: the active row was adopted on a fresh actor (no entry edge seen) */
+    int                   rebind_from_row;     /* review R1-L3: current_anim_idx was invalidated by a row release (no skid replay) */
+    int                   hidden_door;         /* building interactions: a HIDE_AT_END row (DOOR) finished: the puppet has walked in, do not draw it */
+    double                hidden_door_since;   /* graph_dt_frame_time() when hidden_door was set (600 frame timeout) */
+    double                door_cosm_time;      /* building doors: row_start_time of the DOOR/OUTDOOR run whose cosmetic building door was already tried (once, no retry) */
+    int                   door_cls;            /* building doors: PC_DOOR_* class picked for that run (door_cosm_time): selects the clip (hinged vs shop type) */
+    int                   train_standing_latched; /* T4: this puppet's current 'standing in the train' period was already evaluated
+                                                   * for a local arrival train (cleared when the state ends; zero at creation) */
+    /* P1 (puppet animation coverage). Zero-initialised at creation = no scale curve, no blink in progress. */
+    int                   item_scale_on;       /* draw the carried item at item_scale (take-out / put-in rows only) */
+    f32                   item_scale;          /* vanilla PLAYER_ACTOR::item_scale equivalent while item_scale_on */
+    int                   scale_kind;          /* item kind the take-out / put-in run is about (put-in keeps it if the wire kind clears) */
+    int                   takeout_switched;    /* take-out: the timer-36 switch to the carried pose clip happened */
+    int                   last_held_kind;      /* last effective held kind >= 0 seen (put-in fallback) */
+    f32                   blink_timer;         /* Player_actor_set_eye_pattern_normal: eye_pattern_normal.timer */
+    int                   blink_count;         /* ... player->blink_count */
+    u32                   blink_rng;           /* private LCG (never the global gameplay RNG stream) */
+    double                blink_last;          /* graph_dt_frame_time() of the last blink step */
+    /* P1 held toys (balloon / pinwheel): the PLAYER_ACTOR balloon_* / windmill_* equivalents, puppet-owned */
+    s_xyz                 bal_angle;           /* balloon_angle */
+    f32                   bal_add_rot_z;       /* balloon_add_rot_z */
+    s16                   bal_add_rot_x;       /* ballon_add_rot_x */
+    s16                   bal_counter;         /* balloon_add_rot_x_counter */
+    f32                   bal_speed;           /* the balloon clip's own frame speed (vanilla keeps it in item_keyframe speed) */
+    int                   bal_stop;            /* balloon_stop_movement_flag */
+    xyz_t                 toy_hand_pos;        /* right_hand_pos: hand joint world position of the last draw */
+    xyz_t                 toy_hand_move;       /* right_hand_move: its change since the draw before */
+    int                   toy_hand_valid;
+    xyz_t                 wm_start_pos;        /* other_item_start_pos / other_item_end_pos: the pinwheel fan joint, last two draws */
+    xyz_t                 wm_end_pos;
+    int                   wm_pos_valid;        /* balloon_start_pos_set_flag */
+    s_xyz                 wm_angle;            /* windmill_angle: the fan joint's world rotation */
+    xyz_t                 toy_last_wpos;       /* last_world_position of the previous move (pinwheel 'moving' test) */
+} PCRemotePlayerVisual;
+
+/* M9-C Phase 3 (locomotion cosmetics): per-actor puppet state. Zero-initialised at actor creation (a recreated puppet,
+ * scene generation or reconnect starts with no edge state, no foot data and a full effect bucket). Contains no pointer to
+ * anything the local player owns. */
+typedef struct PCRemotePlayerCosmetic {
+    xyz_t   foot_pos[2];     /* [0] left / [1] right foot world position, captured by THIS puppet's after-draw callback */
+    s16     foot_angle_y[2];
+    u32     foot_frame[2];   /* GAME::frame_counter + 1 at capture; 0 = never captured */
+    int     known;           /* the first state has been adopted (first sight never fires an edge) */
+    int     state;           /* PC_COS_* */
+    int     last_valid;
+    int     last_clip;       /* anim index (or 1000 + row index) the stored frame belongs to */
+    float   last_frame;      /* keyframe0 current_frame seen on the previous puppet move */
+    double  last_row_start;  /* PCRemotePlayerVisual::row_start_time of the run last_frame belongs to (0 = no row) */
+    double  foot_block;      /* graph_dt_frame_time() before which no foot trigger fires (flicker guard) */
+    double  turn_in_block;
+    double  turn_out_block;
+    double  tumble_block;
+    int     bucket_init;
+    float   tokens;          /* per-puppet effect budget (token bucket) */
+    double  bucket_time;
+    float   ripple_accum;
+    int     ripple_foot;
+    unsigned pending;        /* foot-step pieces still to emit (bit = foot * 3 + PC_PIECE_*), retried while the budget is full */
+    int     pending_dash;
+    double  pending_until;
+    /* M9-C Phase 4 (tree shake at SHAKE1 frame 10) */
+    double  tree_row_start;  /* PCRemotePlayerVisual::row_start_time of the SHAKE_TREE run this state belongs to */
+    int     tree_armed;      /* this run has not presented its frame-10 shake yet */
+    int     tree_committed;  /* the shake was accepted (cooldown stamped, sound handled): retries only retry the effect */
+    double  tree_deadline;   /* a presentation denied only by a cap is retried until this time (0 = not yet attempted) */
+    int     tree_have_last;  /* tree_last is valid */
+    double  tree_last;       /* time of the last accepted shake of this puppet (per-puppet 84 frame cooldown) */
+    /* M9-C Phase 5 (pickup): left-hand capture + the flying-item presentation of the current PICKUP run */
+    xyz_t   hand_pos;        /* left hand (joint LARM2, 1100 units along the joint x axis), this puppet's own draw callback */
+    u32     hand_frame;      /* GAME::frame_counter + 1 at capture; 0 = never */
+    double  pk_row_start;    /* PCRemotePlayerVisual::row_start_time of the PICKUP run the fields below belong to (0 = none) */
+    int     pk_bound;        /* this run has consumed its (one) event */
+    int     pk_active;       /* the flying item is being drawn for this run */
+    u16     pk_item;
+    int     pk_ofs_valid;
+    xyz_t   pk_ground;       /* the item's ground position (tile centre + vanilla weed/shell offset) */
+    xyz_t   pk_ofs;          /* vanilla main_pickup_c::item_offset: ground - hand, refreshed while the timer is < 20 */
+    /* M9-C Phase 6a (held-tool actions): net position capture + the one-shot event bookkeeping of the current tool run */
+    xyz_t   net_pos;         /* PLAYER_ACTOR::net_pos equivalent (net item matrix, RotY(3000), 4000 units along z), own draw */
+    u32     net_frame;       /* GAME::frame_counter + 1 at capture; 0 = never */
+    double  tool_row_start;  /* PCRemotePlayerVisual::row_start_time of the tool run the fields below belong to (0 = none) */
+    unsigned tool_done;      /* bit i = event i of the row table was presented/skipped for this run */
+    unsigned tool_due;       /* bit i = event i reached its trigger and still waits for the budget */
+    double  tool_due_time;   /* time the oldest still-due event became due (retry window start) */
+    double  tool_repeat_last;/* last time a repeating event (fan) fired: wrap-alias guard */
+    /* M9-C Phase 6b: FEEL joint (Player_actor_draw_After_feel) capture, this puppet's own draw callback */
+    xyz_t   feel_pos;
+    u32     feel_frame;      /* GAME::frame_counter + 1 at capture; 0 = never */
+    int     sweat_active;    /* review H1: this puppet spawned a (continuous) ASE2 pitfall sweat that it must kill itself */
+    struct {                 /* PC_PUPPET_DIAG rate limit: lines printed per (kind, name, budget) key */
+        char key[40];
+        int  n;
+    } diag[48];
+} PCRemotePlayerCosmetic;
+
+/* Lifetime counters of one player's cosmetics; they live in the slot so they survive a scene-generation recreate and
+ * are dumped (PC_PUPPET_DIAG) when the slot is destroyed. */
+typedef struct PCRemotePlayerCosStats {
+    int spawned;          /* top-level effect spawns through the clip */
+    int capped;           /* skipped by the per-puppet bucket / global per-frame cap */
+    int suppressed;       /* skipped by scene/pause/hidden/null/range/pool/weather */
+    int sounds;
+    int sounds_suppressed;
+    int tree_effects;     /* M9-C Phase 4: EffectBG tree shakes presented */
+    int tree_sounds;      /* ... and their NA_SE_TREE_YURASU one-shots */
+    int tree_skipped;     /* shakes whose effect was denied (notree/cooldown/dup/pool/capped/scene/range/...) */
+    int pk_events;        /* M9-C Phase 5: PLAYER_ACTION pickup events queued */
+    int pk_started;       /* ... presented from the start of the clip */
+    int pk_late;          /* ... presented from a later clip frame */
+    int pk_dropped;       /* ... dropped (clip already past the flight / expired / evicted) */
+    int pk_bell;          /* ... bell items (wallet path: no flying item) */
+    int pk_ignored;       /* ... gated (scene/hidden/pause/range/null) */
+    int pk_sounds;        /* pickup sounds played (ITEM_GET / GASAGOSO) */
+    int tool_effects;     /* M9-C Phase 6a: held-tool effects spawned */
+    int tool_sounds;      /* ... held-tool sounds played */
+    int tool_noop;        /* ... effects skipped because vanilla's init would spawn nothing visible */
+    int tool_dropped;     /* ... events lost to a cap for the whole retry window / run ended while due */
+} PCRemotePlayerCosStats;
+
+/* A remote-player actor is just the generic ACTOR base plus which network player it stands in
+ * for, the last-interpolated cosmetic values Stage 3 already tracked, and (new in Stage 4A) its
+ * own player visual state. ACTOR must be the first member: the whole actor pipeline
+ * (Actor_init_actor_class, Actor_info_part_new, generic mv_proc/dw_proc dispatch, ...) only ever
+ * knows about ACTOR*. */
+typedef struct PCRemotePlayerActor {
+    ACTOR                 actor_class;
+    PCNetPlayerId         peer;
+    float                 cosmetic_speed;      /* last-interpolated speed; Stage 4B uses this to
+                                                 * drive WALK/RUN/DASH animation playback speed */
+    uint8_t               cosmetic_move_state; /* last-interpolated PCMoveState; Stage 4B uses this
+                                                 * to select the IDLE/WALK/RUN/DASH animation */
+    int8_t                cosmetic_item_kind;  /* last-interpolated item_kind; stored correctly,
+                                                 * but Stage 4A does not render a held item */
+    uint8_t               cosmetic_action_index;   /* M9-C v7: last-interpolated wire main index (newer snapshot) */
+    uint8_t               cosmetic_action_counter; /* its 4-bit entry counter */
+    uint8_t               cosmetic_action_valid;   /* 0 = no/invalid action info (fallback mapping only) */
+    PCRemotePlayerVisual  visual;
+    ClObjPipe_c           col_pipe;     /* M9-B: this puppet's own player<->player collision pipe, registered
+                                          * with the vanilla OC pass from pc_remote_player_mv() (see
+                                          * pc_remote_player_collide_update()). Initialised at creation in
+                                          * pc_remote_player_poll() (the puppet's ct_proc is none_proc2). */
+    int                   collide_hold; /* M9-B: frames left during which the pipe is NOT registered (set after
+                                          * an interpolator teleport-snap to avoid a deep-overlap pop) */
+    MtxF                  hand_mtx;       /* M9-C Phase 1: world matrix of the right-hand joint, captured by this
+                                           * puppet's OWN after-draw callback during its own body draw (never the
+                                           * vanilla PLAYER_ACTOR callbacks / right_hand_mtx) */
+    int                   hand_mtx_valid; /* set by the callback, cleared before every body draw */
+    PCRemotePlayerCosmetic cos;           /* M9-C Phase 3: foot capture + cosmetic edge/budget state */
+} PCRemotePlayerActor;
+
+/* M9-B: the puppet pipe. Mirrors Player_actor_OcInfoData_forStand (m_player_common.c_inc) except for the group
+ * flags: flags0 0x09 = CHECK | collides-with GROUP_PLAYER (0x08); flags1 0x10 = this puppet is GROUP_2 and NOT
+ * ClObj_FLAG2_IS_PLAYER (0x08). The local player's pipe is {0x39, 0x08}: 0x39 & 0x10 and 0x08 & 0x09 both pass
+ * CollisionCheck_Check2ClObjNoOC(), so player<->puppet pairs; puppet<->puppet fails (0x09 & 0x10 == 0), and no
+ * other actor sets the 0x08 is-player bit, so nothing else pairs with a puppet. No ClObj_FLAG_COLLISION_PRIORITY. */
+static ClObjPipeData_c s_remote_player_pipe_data = {
+    { 0x09, 0x10, ClObj_TYPE_PIPE }, /* ClObjData_c */
+    { 0x01 },                        /* ClObjElemData_c */
+    { { 16, 60, 0, { 0, 0, 0 } } },  /* ClObjPipeAttrData_c: radius 16 (player 20; easier to pass), height 60 */
+};
+#define PC_REMOTE_PLAYER_PUSH_WEIGHT 2 /* light NORMAL mass type (<0xFE): see puppet ct */
+
+#define PC_REMOTE_PLAYER_COLLIDE_RANGE 150.0f       /* XZ units; only nearby puppets enter the 50-entry OC table */
+#define PC_REMOTE_PLAYER_COLLIDE_SNAP_DIST 80.0f    /* a single-frame puppet XZ jump larger than this = teleport snap */
+#define PC_REMOTE_PLAYER_COLLIDE_SNAP_HOLD_FRAMES 2 /* frames to stay unregistered after such a snap */
+
+typedef struct PCRemotePlayerOffset {
+    f32 x, z;
+} PCRemotePlayerOffset;
+
+/* Small fixed per-peer spawn offsets (world units, relative to the local player), used only as
+ * the actor's initial spawn position before any real movement data has arrived (see
+ * pc_remote_player_mv()) -- not a layout with any other meaning. A wire id past the table (or any id) uses pc_remote_spawn_offset()'s ring pattern. */
+static const PCRemotePlayerOffset s_offset_table[] = {
+    { 60.0f, 0.0f },   { -60.0f, 0.0f },  { 0.0f, 60.0f },   { 0.0f, -60.0f },
+    { 60.0f, 60.0f },  { -60.0f, 60.0f }, { 60.0f, -60.0f }, { -60.0f, -60.0f },
+    { 0.0f, 100.0f },
+};
+#define PC_REMOTE_OFFSET_TABLE_N ((int)(sizeof(s_offset_table) / sizeof(s_offset_table[0])))
+
+/* The spawn offset of slot `id`: the table above for the historical first slots (unchanged), a deterministic ring pattern for any id past it (8 per ring, 40 units
+ * further out per ring), so the slot count is no longer tied to the number of hand-written entries. */
+static PCRemotePlayerOffset pc_remote_spawn_offset(int id) {
+    PCRemotePlayerOffset o;
+    if (id >= 0 && id < PC_REMOTE_OFFSET_TABLE_N) {
+        return s_offset_table[id];
+    }
+    {
+        const int k = id - PC_REMOTE_OFFSET_TABLE_N;
+        const f32 radius = 140.0f + 40.0f * (f32)(k / 8);
+        const f32 ang = (f32)(k % 8) * (6.2831853f / 8.0f);
+        o.x = radius * cosf(ang);
+        o.z = radius * sinf(ang);
+    }
+    return o;
+}
+
+/* One accepted movement sample, timestamped in THIS process's own local clock -- never the
+ * sender's. See pc_net_game.h's PCNetMoveSample doc for why sender_frame itself is not stored
+ * here past the per-slot dedup check (pc_remote_player_on_move() consumes it immediately). */
+typedef struct PCRemoteMoveSnapshot {
+    double  recv_local_frame; /* graph_dt_frame_time() at the moment this sample was accepted */
+    float   pos_x, pos_y, pos_z;
+    int16_t facing_angle;
+    float   speed;
+    uint8_t move_state;
+    int8_t  item_kind;
+    uint8_t action_index;   /* M9-C v7: wire main index (valid only if action_valid) */
+    uint8_t action_counter; /* 4-bit entry counter */
+    uint8_t action_valid;
+} PCRemoteMoveSnapshot;
+
+/* Stage 4C-1: raw appearance data as received over the network for this remote player (see
+ * PCNetPlayerAppearance, pc_net_game.h). Lives in the slot -- not the ACTOR-embedded `visual` --
+ * for exactly the same reason `identity` and the snapshot ring do: it is a function of the network
+ * message, not of any ACTOR, so it must survive scene transitions (Actor_info_dt() sweeping the
+ * ACTOR away) untouched. See pc_remote_player_on_appearance(). */
+typedef struct PCRemotePlayerAppearance {
+    int      valid;              /* 0 until pc_remote_player_on_appearance() has been called */
+    int      pending_resolve;    /* 1 whenever these raw fields hold data that resolved_appearance
+                                   * does not yet (or no longer) reflect. Set unconditionally by
+                                   * pc_remote_player_on_appearance() on every arrival, cleared only
+                                   * by a SUCCESSFUL pc_remote_player_apply_appearance() (one that
+                                   * ran with gamePT != NULL). Deliberately independent of
+                                   * resolved_appearance.ready: `ready` can still be 1 from an
+                                   * earlier, different appearance, so pc_remote_player_poll()'s
+                                   * retry must key off THIS flag, never "!ready" -- see
+                                   * pc_remote_player_apply_appearance()'s doc comment. */
+    uint8_t  gender;              /* mirrors Private_c::gender (mPr_SEX_MALE/FEMALE) */
+    uint8_t  face;                 /* mirrors Private_c::face (mPr_FACE_TYPE0..7) */
+    uint8_t  sunburn_rank;         /* mirrors Private_c::sunburn.rank (0-8) */
+    uint8_t  is_custom_design;     /* 1 if cloth_item is the RSV_CLOTH "one of my own designs" sentinel */
+    uint8_t  bee_swell;            /* P1: the owner's swollen face after a bee sting (APPEARANCE flag; in PCNetPlayerAppearance it rides
+                                    * bit 7 of sunburn_rank = PC_REMOTE_APPEAR_SWELL_BIT, the same bit as pc_net_game.c's
+                                    * PC_NETGAME_APPEAR_SWELL_BIT: the shared header layout stays frozen) */
+    uint16_t cloth_item;           /* mirrors Private_c::cloth.item (mActor_name_t) */
+    mNW_original_design_c design;  /* only meaningful when is_custom_design; the real decomp type
+                                     * (verified POD, no pointers) -- reused directly by
+                                     * mNW_CopyOriginalTexture()/mNW_CopyOriginalPalette() below,
+                                     * rather than hand-copied field by field. */
+} PCRemotePlayerAppearance;
+
+/* Stage 4C-1: this player's fully-resolved, render-ready appearance resources -- built once by
+ * pc_remote_player_apply_appearance() when `appearance` above first arrives (Stage 4C-2 will
+ * re-invoke it on live changes; Stage 4C-1 only ever calls it once). Never touched per-frame or on
+ * scene transitions -- like `appearance`, this lives in the slot specifically so a recreated ACTOR
+ * (see pc_remote_player_poll()'s scene-generation handling) never needs to rebuild it, only to
+ * re-point its own keyframe skeleton at `skeleton` below (see pc_remote_player_visual_init()).
+ *
+ * face_tex/face_pallet/cloth_tex/cloth_pallet are each a DMA destination for
+ * _JW_GetResourceAram() (see pc_remote_player_apply_appearance(), mPlib_Load_FaceTexAndPallet(),
+ * mPlib_Load_PlayerTexAndPallet()), which -- like every other ARAM/DMA destination in the original
+ * decomp (mNW_original_tex_c, include/m_needlework.h; OthersSave_c's keep_mail/keep_original/
+ * keep_diary members, include/m_card.h) -- requires 32-byte alignment. `ready`/`skeleton` above are
+ * ordinary, unaligned fields, so each buffer below gets its OWN ATTRIBUTE_ALIGN(32) rather than
+ * relying on the struct's own (whole-struct) alignment: aligning only the struct type would still
+ * leave each individual member at whatever offset the preceding fields happen to add up to (here,
+ * 16 bytes past a 32-byte boundary from `ready`+padding+`skeleton`) -- exactly what let this slip
+ * through unnoticed until a live runtime appearance test actually exercised the ARAM path (see the
+ * _Static_assert block right after the struct, which now catches this at compile time instead).
+ * This mirrors OthersSave_c's own established pattern (include/m_card.h) of mixing ordinary fields
+ * with several independently ATTRIBUTE_ALIGN(32)'d members in one struct -- the compiler inserts
+ * whatever padding each one individually needs. */
+typedef struct PCRemotePlayerResolvedAppearance {
+    int                ready;                         /* 0 until fully resolved */
+    cKF_Skeleton_R_c*  skeleton;                       /* &cKF_bs_r_boy_1 or &cKF_bs_r_grl_1 --
+                                                         * shared, read-only, compiled-in */
+    u8                 face_tex[PC_REMOTE_PLAYER_FACE_TEX_SIZE] ATTRIBUTE_ALIGN(32);  /* own copy:
+                                                                    * 8 eye slots then 6 mouth
+                                                                    * slots, 256B each -- the exact
+                                                                    * layout mPlib_Get_eye_tex_p()/
+                                                                    * mPlib_Get_mouth_tex_p() slice
+                                                                    * out of the (singleton) local
+                                                                    * bank */
+    u16                face_pallet[mNW_PALETTE_COUNT] ATTRIBUTE_ALIGN(32);
+    u8                 cloth_tex[mNW_DESIGN_TEX_SIZE] ATTRIBUTE_ALIGN(32);
+    u16                cloth_pallet[mNW_PALETTE_COUNT] ATTRIBUTE_ALIGN(32);
+} PCRemotePlayerResolvedAppearance;
+
+/* Compile-time proof, not just an assumption from the ATTRIBUTE_ALIGN annotations above -- verifies
+ * the actual resulting offset of each DMA-destination member is a multiple of 32, exactly what
+ * checkOkAddress()/JKR_ISALIGNED32() (src/static/JSystem/JKernel/JKRAram.cpp,
+ * src/static/JSystem/JKernel/JKRAramPiece.cpp) require of any address passed through
+ * _JW_GetResourceAram(). This is a per-member check because a struct instance's own base address
+ * (a pool slot, see pc_puppet_pool.c: allocated 32-byte aligned) is not otherwise known to be 32-byte aligned by any
+ * other guarantee in this file. */
+_Static_assert(offsetof(PCRemotePlayerResolvedAppearance, face_tex) % 32 == 0,
+              "PCRemotePlayerResolvedAppearance.face_tex is not 32-byte aligned -- ARAM DMA requires it");
+_Static_assert(offsetof(PCRemotePlayerResolvedAppearance, face_pallet) % 32 == 0,
+              "PCRemotePlayerResolvedAppearance.face_pallet is not 32-byte aligned -- ARAM DMA requires it");
+_Static_assert(offsetof(PCRemotePlayerResolvedAppearance, cloth_tex) % 32 == 0,
+              "PCRemotePlayerResolvedAppearance.cloth_tex is not 32-byte aligned -- ARAM DMA requires it");
+_Static_assert(offsetof(PCRemotePlayerResolvedAppearance, cloth_pallet) % 32 == 0,
+              "PCRemotePlayerResolvedAppearance.cloth_pallet is not 32-byte aligned -- ARAM DMA requires it");
+
+/* M9-C Phase 5: queued PLAYER_ACTION pickup events of one puppet (the puppet runs ~9 frames behind the network and a
+ * reliable event can arrive before the MOVE that shows the pickup state, so events wait here for the puppet's own state). */
+#define PC_PUPPET_PK_RING 2
+typedef struct PCRemotePickupEvent {
+    int      valid;
+    uint16_t seq;
+    uint8_t  ux, uz;
+    uint16_t item;
+    double   arrival; /* graph_dt_frame_time() when queued (0 when no game existed) */
+} PCRemotePickupEvent;
+
+typedef struct PCRemotePlayerSlot {
+    int                peer_id;            /* capacity phase 6: this slot's wire id (0..254) */
+    int                in_use;             /* tracked at all (pending creation, or actor already live) */
+    int                pending_create;     /* READY/discovered but actor creation hasn't succeeded yet */
+    int                lazily_discovered;  /* 1 if learned about purely via a relayed movement sample
+                                             * (no direct on_ready()/on_disconnect() for this one --
+                                             * see pc_remote_player_on_move()); only such slots are
+                                             * ever cleaned up by the liveness timeout in poll() */
+    ACTOR*             actor;              /* NULL until pc_actor_make_from_profile() succeeds */
+    uint32_t           scene_generation;   /* s_scene_generation at the moment `actor` was created --
+                                             * see pc_remote_player_poll()'s staleness check. Meaningless
+                                             * while actor == NULL. */
+    PCNetGameIdentity  identity;           /* captured at READY, if any; not yet displayed anywhere */
+
+    int                has_sender_frame;
+    uint32_t           newest_sender_frame; /* highest PCNetMoveMsg.frame accepted from this sender */
+    double             last_move_recv_local_frame; /* for the lazily_discovered timeout */
+
+    PCRemoteMoveSnapshot snapshots[PC_REMOTE_PLAYER_SNAPSHOT_COUNT];
+    int                  snapshot_count; /* 0..PC_REMOTE_PLAYER_SNAPSHOT_COUNT, valid entries */
+    int                  snapshot_head;  /* index the NEXT snapshot will be written to */
+
+    PCRemotePlayerAppearance         appearance;          /* Stage 4C-1: see pc_remote_player_on_appearance() */
+    PCRemotePlayerResolvedAppearance resolved_appearance; /* Stage 4C-1: see pc_remote_player_apply_appearance() */
+
+    PCNetPlayerScene   scene;              /* M9-A: last accepted scene identity of this player (valid == 0 when
+                                             * unknown); cleared on disconnect/ready/timeout, NOT by a local
+                                             * scene-generation change. Presence data only. */
+
+    int                collide_armed;      /* M9-B: 1 while this puppet's collider was registered on the last frame it
+                                             * was evaluated (log state only -- registration itself is stateless) */
+    int                collide_target_ok;  /* M9-B: test-hook accessor input: puppet is live, same-scene, has
+                                             * snapshots and a visual (range/hold ignored) */
+    int                snap_req;           /* building interactions: a scene event was accepted; the puppet stays hidden and its snapshot ring is
+                                             * trimmed to samples received after scene_accept_frame before it is placed again */
+    double             scene_accept_frame; /* graph_dt_frame_time() when that scene event was accepted */
+    uint8_t            prev_scene_id;      /* scene id the player was announced in before the current one (0 = unknown: SCENE_TEST1 is never
+                                             * announced); lets an OUTDOOR row know which interior the owner just left */
+    int                latch_clear_req;    /* M9-C v7: the player's scene presence changed -> the puppet drops any one-shot
+                                             * latch at its next move (consumed by pc_remote_player_row_pre) */
+    PCRemotePlayerCosStats cos_stats;      /* M9-C Phase 3: cosmetic counters (diag) */
+    PCRemotePickupEvent pk_ev[PC_PUPPET_PK_RING]; /* M9-C Phase 5: queued pickup events (cleared with the slot / actor) */
+} PCRemotePlayerSlot;
+
+/* M9-B diagnostics (read-only; never influence behaviour). */
+static int s_collide_peak_colliders = 0; /* highest play->collision_check.collider_num seen at poll time */
+static int s_collide_failed_setoc = 0;   /* CollisionCheck_setOC() returned -1 for a puppet */
+
+static PCPuppetPool s_pool;
+static int          s_pool_ready = 0;
+static int          s_actor_blocked = 0;       /* puppets waiting for actor headroom this poll */
+static unsigned     s_actor_blocked_total = 0; /* polls that left a puppet without an actor for lack of headroom */
+static unsigned     s_actor_create_failed = 0; /* pc_actor_make_from_profile() returned NULL */
+static int          s_actor_peak_total = 0;    /* highest play->actor_info.total_num seen */
+
+static void pc_remote_player_dt(ACTOR* actor, GAME* game); /* review H1: kills the puppet's own pitfall sweat */
+
+static ACTOR_PROFILE s_remote_player_profile;
+static ACTOR_DLFTBL  s_remote_player_dlftbl;
+static int           s_profile_ready = 0;
+
+/* Stage 4A lifecycle fix: title<->town<->house transitions each fully destroy and reconstruct the
+ * whole GAME_PLAY object (Actor_info_dt() unconditionally sweeps and frees every actor in every
+ * part list, including ACTOR_PART_UNUSED -- see src/game/m_actor.c -- immediately followed by a
+ * fresh Actor_info_ct() for the newly-allocated GAME_PLAY; see src/game/m_play.c's
+ * play_cleanup()/play_init()). Any ACTOR* created in the old scene is gone -- not just unlinked,
+ * genuinely freed -- once that happens; Actor_delete() must never be called on it again.
+ *
+ * Detecting this by watching for an observable `gamePT == NULL` window (game_dt() clears it at
+ * the very end of tearing down the old scene, before the next game_ct() sets it to the new one)
+ * was tried and found unreliable by live testing: the free-old/malloc-new/construct-new sequence
+ * (src/graph.c's graph_proc()) can complete between two consecutive pc_remote_player_poll() calls
+ * without this code ever observing gamePT as NULL in between -- confirmed live, where a real
+ * play_cleanup()/play_init() cycle (visible via mCD_toNextLand()'s own log line) produced a stale
+ * dw_proc/mv_proc read one second later with zeroed-then-poisoned field values, despite gamePT
+ * never appearing NULL to this poll loop.
+ *
+ * Instead, every poll() call while gamePT is non-NULL directly compares the CURRENT GAME_PLAY
+ * object's own identity against what was last observed: its pointer value, and its
+ * `frame_counter` (reset to 0 by game_ct() for every newly constructed GAME, src/game.c). Either
+ * one changing unexpectedly -- a different pointer, or a frame_counter that went backwards --
+ * proves the object was replaced, even in the case a straight pointer comparison alone would miss
+ * (the allocator handing back the exact same address for the new GAME_PLAY). */
+static uint32_t s_scene_generation = 0;
+static GAME*    s_last_seen_game = NULL;
+static uint32_t s_last_seen_frame_counter = 0;
+
+static void pc_remote_player_mv(ACTOR* actor, GAME* game);
+static void pc_remote_player_dw(ACTOR* actor, GAME* game);
+
+/* The actor name of the puppet of wire id `id`: the historical 0xF000 | id for the first slots (unchanged), 0xFA00 | id above them (0xF0F3.. are DUMMY_HOUSE names). Never a real item name
+ * the actor code looks up (type PAD15 only needs to stay >= NAME_TYPE_PAD15, see m_actor.c). */
+static mActor_name_t pc_remote_player_actor_name(int id) {
+    return (mActor_name_t)(id <= (int)PC_NETGAME_HOST_WIRE_ID ? ((NAME_TYPE_PAD15 << 12) | (id & 0xFF)) : (0xFA00u | ((unsigned)id & 0xFFu)));
+}
+
+static void pc_remote_player_pool_ensure(void) {
+    if (!s_pool_ready) {
+        pc_puppet_pool_init(&s_pool, sizeof(PCRemotePlayerSlot));
+        s_pool_ready = 1;
+    }
+}
+
+/* The slot of a tracked / known player, or NULL: NEVER allocates (every reader uses this). Any wire id outside 0..254 (0xFF, negative, huge) has no slot. */
+static PCRemotePlayerSlot* pc_remote_player_find_slot(PCNetPlayerId player_id) {
+    if (!s_pool_ready || player_id < 0 || player_id >= PC_PUPPET_ID_LIMIT) {
+        return NULL;
+    }
+    return (PCRemotePlayerSlot*)pc_puppet_pool_find(&s_pool, (int)player_id);
+}
+
+/* The slot of a player the caller learned about (READY / a relayed MOVE / an appearance / a scene), created zeroed on first use. NULL = invalid id or out of memory (counted in
+ * the pool; the player is then simply not representable on this process, every caller treats NULL as "ignore"). */
+static PCRemotePlayerSlot* pc_remote_player_acquire_slot(PCNetPlayerId player_id) {
+    PCRemotePlayerSlot* slot;
+    pc_remote_player_pool_ensure();
+    if (player_id < 0 || player_id >= PC_PUPPET_ID_LIMIT) {
+        s_pool.alloc_failures++;
+        return NULL;
+    }
+    slot = (PCRemotePlayerSlot*)pc_puppet_pool_acquire(&s_pool, (int)player_id);
+    if (slot != NULL) {
+        slot->peer_id = (int)player_id;
+    }
+    return slot;
+}
+
+/* The result of interpolating (or falling back on) a peer's snapshot buffer, ready to apply
+ * directly to an ACTOR. See pc_remote_player_interpolate(). */
+typedef struct PCRemotePlayerRenderState {
+    xyz_t   pos;
+    s16     angle;
+    float   speed;
+    uint8_t move_state;
+    int8_t  item_kind;
+    uint8_t action_index;
+    uint8_t action_counter;
+    uint8_t action_valid;
+} PCRemotePlayerRenderState;
+
+/* Delayed two-snapshot interpolation. `target_time` and every snapshot's recv_local_frame are all
+ * in THIS process's own graph_dt_frame_time() domain -- see pc_net_game.h's PCNetMoveSample doc
+ * for why that matters (the sender's own frame counter never appears here at all; it was already
+ * consumed by pc_remote_player_on_move()'s dedup check).
+ *
+ * Returns 0 if the slot has no snapshots yet (caller should leave the actor's current
+ * position/facing untouched -- e.g. its spawn position from creation time). Otherwise fills *out
+ * and returns 1: interpolated between straddling snapshots, held at the last known one if
+ * target_time is past all of them (packet loss/stall -- never extrapolated), held at the earliest
+ * one if target_time is before all of them (peer just appeared), or snapped straight to the
+ * newer position if the gap between two consecutive snapshots is implausibly large (teleport/
+ * loading-zone jump, not something to slide across). */
+static int pc_remote_player_interpolate(const PCRemotePlayerSlot* slot, double target_time,
+                                         PCRemotePlayerRenderState* out) {
+    int oldest, i, n;
+    const PCRemoteMoveSnapshot* s0 = NULL;
+    const PCRemoteMoveSnapshot* s1 = NULL;
+
+    n = slot->snapshot_count;
+    if (n == 0) {
+        return 0;
+    }
+
+    oldest = (slot->snapshot_head - n + PC_REMOTE_PLAYER_SNAPSHOT_COUNT) % PC_REMOTE_PLAYER_SNAPSHOT_COUNT;
+    for (i = 0; i < n; i++) {
+        int idx = (oldest + i) % PC_REMOTE_PLAYER_SNAPSHOT_COUNT;
+        const PCRemoteMoveSnapshot* snap = &slot->snapshots[idx];
+        if (snap->recv_local_frame <= target_time) {
+            s0 = snap; /* keep advancing -- we want the LATEST one that's still <= target_time */
+        } else if (s1 == NULL) {
+            s1 = snap; /* the FIRST one that's > target_time */
+        }
+    }
+
+    if (s0 != NULL && s1 != NULL) {
+        double span = s1->recv_local_frame - s0->recv_local_frame;
+        float t = (span > 0.0) ? (float)((target_time - s0->recv_local_frame) / span) : 1.0f;
+        float dx = s1->pos_x - s0->pos_x;
+        float dy = s1->pos_y - s0->pos_y;
+        float dz = s1->pos_z - s0->pos_z;
+        s16 angle_delta;
+
+        if (t < 0.0f) t = 0.0f;
+        if (t > 1.0f) t = 1.0f;
+
+        if ((dx * dx + dy * dy + dz * dz) > PC_REMOTE_PLAYER_TELEPORT_DIST_SQ) {
+            /* This straddling pair (s0, s1) stays the same across every frame for as long as
+             * target_time remains between them (up to ~PC_REMOTE_PLAYER_INTERP_DELAY_FRAMES) --
+             * log it once per distinct pair, not once per frame. */
+            static const PCRemoteMoveSnapshot* s_last_logged_s1 = NULL;
+            if (s1 != s_last_logged_s1) {
+                printf("[NET][REMOTE][DIAG] teleport snap: dist_sq=%.1f (%.1f,%.1f,%.1f) -> (%.1f,%.1f,%.1f)\n",
+                       (double)(dx * dx + dy * dy + dz * dz), s0->pos_x, s0->pos_y, s0->pos_z, s1->pos_x, s1->pos_y,
+                       s1->pos_z);
+                s_last_logged_s1 = s1;
+            }
+            out->pos.x = s1->pos_x;
+            out->pos.y = s1->pos_y;
+            out->pos.z = s1->pos_z;
+        } else {
+            out->pos.x = s0->pos_x + dx * t;
+            out->pos.y = s0->pos_y + dy * t;
+            out->pos.z = s0->pos_z + dz * t;
+        }
+
+        /* Shortest-path angle interpolation: (s16)(a - b) wraps correctly at the +/-32768
+         * boundary (the exact idiom already used elsewhere in this codebase, e.g.
+         * Actor_player_look_direction_check() in src/game/m_actor.c) -- a naive linear lerp of
+         * the raw values would rotate the long way around whenever the two angles straddle 0. */
+        angle_delta = (s16)(s1->facing_angle - s0->facing_angle);
+        out->angle = (s16)(s0->facing_angle + (s16)((f32)angle_delta * t));
+        out->speed = s0->speed + (s1->speed - s0->speed) * t;
+        out->move_state = s1->move_state;
+        out->item_kind = s1->item_kind;
+        out->action_index = s1->action_index; /* discrete: from the NEWER snapshot like move_state (never interpolated) */
+        out->action_counter = s1->action_counter;
+        out->action_valid = s1->action_valid;
+    } else if (s0 != NULL) {
+        out->pos.x = s0->pos_x;
+        out->pos.y = s0->pos_y;
+        out->pos.z = s0->pos_z;
+        out->angle = s0->facing_angle;
+        out->speed = s0->speed;
+        out->move_state = s0->move_state;
+        out->item_kind = s0->item_kind;
+        out->action_index = s0->action_index;
+        out->action_counter = s0->action_counter;
+        out->action_valid = s0->action_valid;
+    } else { /* s1 != NULL */
+        out->pos.x = s1->pos_x;
+        out->pos.y = s1->pos_y;
+        out->pos.z = s1->pos_z;
+        out->angle = s1->facing_angle;
+        out->speed = s1->speed;
+        out->move_state = s1->move_state;
+        out->item_kind = s1->item_kind;
+        out->action_index = s1->action_index;
+        out->action_counter = s1->action_counter;
+        out->action_valid = s1->action_valid;
+    }
+
+    return 1;
+}
+
+static void pc_remote_player_init_profile(void) {
+    if (s_profile_ready) {
+        return;
+    }
+
+    memset(&s_remote_player_profile, 0, sizeof(s_remote_player_profile));
+    s_remote_player_profile.id = -1;
+    s_remote_player_profile.part = ACTOR_PART_UNUSED;
+    s_remote_player_profile.initial_flags_state = ACTOR_STATE_NO_MOVE_WHILE_CULLED | ACTOR_STATE_NO_DRAW_WHILE_CULLED;
+    s_remote_player_profile.npc_id = 0;
+    s_remote_player_profile.obj_bank_id = -1;
+    s_remote_player_profile.class_size = sizeof(PCRemotePlayerActor);
+    s_remote_player_profile.ct_proc = none_proc2;
+    s_remote_player_profile.dt_proc = pc_remote_player_dt;
+    s_remote_player_profile.mv_proc = pc_remote_player_mv;
+    s_remote_player_profile.dw_proc = pc_remote_player_dw;
+    s_remote_player_profile.sv_proc = NULL;
+
+    memset(&s_remote_player_dlftbl, 0, sizeof(s_remote_player_dlftbl));
+    s_remote_player_dlftbl.profile = &s_remote_player_profile;
+
+    s_profile_ready = 1;
+}
+
+/* Stage 4C-1: resolve this slot's raw `appearance` into `resolved_appearance`'s render-ready
+ * buffers. Invoked every time new appearance data arrives (see pc_remote_player_on_appearance())
+ * and, if that attempt was deferred, retried from pc_remote_player_poll() once resources become
+ * available -- see the gamePT gate and `pending_resolve` below. Never per-frame otherwise, and
+ * never again on a scene transition (the resolved buffers live in the slot, not the ACTOR, so a
+ * recreated ACTOR needs no rebuilding here, only re-pointing its own keyframe skeleton -- see
+ * pc_remote_player_visual_init()).
+ *
+ * Never touches Now_Private or any Object_Exchange_c bank -- every resource is written directly
+ * into this slot's own buffers via explicit-parameter decomp helpers (see the Stage 4C
+ * investigation): mPlib_Load_FaceTexAndPallet() for the face (a new, small, additive decomp
+ * function -- src/game/m_player_lib.c -- that mirrors mPlib_change_player_face()/
+ * mPlib_Get_UseFacePalletRom_p()'s existing logic with explicit parameters instead of Now_Private
+ * reads), mPlib_Load_PlayerTexAndPallet() (already exported) for catalog clothing, and
+ * mNW_CopyOriginalTexture()/mNW_CopyOriginalPalette() (already exported) for a custom design.
+ *
+ * gamePT gate (real-client crash fix): mPlib_Load_FaceTexAndPallet()/mPlib_Load_PlayerTexAndPallet()
+ * both eventually call JW_GetAramAddress(), which dereferences forest_arc_aram_p -- mounted only by
+ * JW_Init2() (src/static/boot.c, src/static/jsyswrap.cpp). An appearance message can be received
+ * and dispatched here (via pc_net_game_poll(), called unconditionally every VIWaitForRetrace())
+ * during the game's one-time early boot sequence, strictly before JW_Init2() has run -- confirmed
+ * live via GDB as a NULL-`this` crash inside JKRArchive::findTypeResource(). gamePT is the
+ * established, already-relied-upon signal that is only ever non-NULL after JW_Init2() has already
+ * completed (see pc_remote_player_poll()'s own gate), so it is read here purely as a readiness
+ * check -- never written, and Now_Private is still never touched, so this is a deferral, not a
+ * behavior change. mNW_CopyOriginalTexture()/mNW_CopyOriginalPalette() never touch ARAM (a plain
+ * bcopy() from the wire-provided design bytes), so they are not actually at risk, but are kept
+ * behind the same gate for simplicity: this function either fully resolves an appearance or leaves
+ * it exactly as it was, never half of one.
+ *
+ * If gamePT is NULL, the raw `appearance` fields (already updated by the caller) are left
+ * untouched and `a->pending_resolve` (set by every caller before invoking this -- see
+ * pc_remote_player_on_appearance()) is left set, so pc_remote_player_poll() retries this same slot
+ * once gamePT becomes non-NULL -- see its own comment. `pending_resolve`, not
+ * resolved_appearance.ready, is the retry condition specifically because `ready` can already be 1
+ * from a PREVIOUS, different, successful resolution: a slot whose appearance changes again while
+ * gamePT is momentarily NULL must not be mistaken for "up to date" just because it was ready
+ * before. */
+static void pc_remote_player_apply_appearance(PCRemotePlayerSlot* slot) {
+    PCRemotePlayerAppearance* a = &slot->appearance;
+    PCRemotePlayerResolvedAppearance* r = &slot->resolved_appearance;
+    int face;
+    int sunburn_rank;
+
+    if (gamePT == NULL) {
+        return; /* deferred -- see doc comment above; pc_remote_player_poll() retries */
+    }
+
+    face = a->face;
+    sunburn_rank = a->sunburn_rank;
+
+    /* Defensive clamps: a malformed/out-of-range network value must never reach ROM-address
+     * arithmetic. Gender needs no clamp -- mPlib_get_player_mdl_p()'s own real logic already
+     * treats "anything not mPr_SEX_MALE" as female, so any value is inherently safe here too. */
+    if (face < 0 || face >= mPr_FACE_TYPE_NUM) {
+        face = 0;
+    }
+    if (sunburn_rank < 0 || sunburn_rank > mPr_SUNBURN_RANK8) {
+        sunburn_rank = 0;
+    }
+
+    r->skeleton = (a->gender == mPr_SEX_MALE) ? &cKF_bs_r_boy_1 : &cKF_bs_r_grl_1;
+
+    /* P1: swell = the owner's bee-sting face (vanilla mPlib_Get_UseFaceRom_index: the swollen face set, m_player_lib.c:973-990) */
+    mPlib_Load_FaceTexAndPallet(r->face_tex, r->face_pallet, a->gender, face, sunburn_rank, a->bee_swell ? TRUE : FALSE, FALSE);
+
+    memset(r->cloth_tex, 0, sizeof(r->cloth_tex));
+    memset(r->cloth_pallet, 0, sizeof(r->cloth_pallet));
+
+    if (a->is_custom_design) {
+        /* Custom design: the pixel data travels over the network verbatim (it is arbitrary,
+         * player-drawn content that cannot be derived from an id alone -- see the Stage 4C
+         * investigation). mPlib_Load_PlayerTexAndPallet() must NOT be called here: its
+         * custom-design branch reads Now_Private->my_org[], which is the LOCAL player's own
+         * designs, not this remote player's. mNW_CopyOriginalTexture()/mNW_CopyOriginalPalette()
+         * (src/game/m_needlework.c) take the design record directly and need no Now_Private
+         * access at all. */
+        mNW_CopyOriginalTexture(r->cloth_tex, &a->design);
+        mNW_CopyOriginalPalette(r->cloth_pallet, &a->design);
+    } else {
+        /* Catalog item: every instance already has the same compiled-in catalog ROM data, so only
+         * the 2-byte item id needs to have been sent -- resolve it locally via the exact same
+         * pure, Now_Private-independent helper the original game uses. */
+        mPr_cloth_c scratch_cloth;
+        mPlib_change_player_cloth_info(&scratch_cloth, (mActor_name_t)a->cloth_item);
+        mPlib_Load_PlayerTexAndPallet(r->cloth_tex, r->cloth_pallet, scratch_cloth.idx);
+    }
+
+    r->ready = 1;
+    a->pending_resolve = 0;
+}
+
+/* Stage 4A: bring up a remote visual's skeleton/animation state. Mirrors
+ * src/game/m_inventory_ovl.c's mIV_pl_shape_init() exactly: construct BOTH keyframe layers
+ * against the SAME joint_data/morph_data buffers (this is what lets
+ * cKF_SkeletonInfo_R_combine_play() later merge the two layers' contributions per part_table),
+ * copy the "normal" part table row, then init both layers to a standing, looping WAIT1 pose.
+ *
+ * Every symbol called here is declared extern in m_player_lib.h / c_keyframe.h -- no PLAYER_ACTOR
+ * is created, no Player_actor_ct, per-state main function, or CulcAnimation helper runs, no
+ * controller is read.
+ *
+ * Stage 4C-1: the skeleton now comes from this remote player's OWN resolved appearance
+ * (`appearance->skeleton`, selected from its own synchronized gender -- see
+ * pc_remote_player_apply_appearance()) instead of mPlib_get_player_mdl_p() (the LOCAL player's
+ * singleton). The caller (pc_remote_player_mv()) only invokes this once `appearance->ready` is
+ * already true, so `appearance` is guaranteed valid here.
+ *
+ * Safety: called only once player readiness has already been confirmed by the caller (see the
+ * player_actor_exists gate in pc_remote_player_mv()). Still additionally guarded here against
+ * Now_Private being NULL -- belt-and-suspenders, since player_actor_exists should not be TRUE
+ * without a loaded save, but this file never assumes that without checking. */
+static void pc_remote_player_visual_init(PCRemotePlayerVisual* visual,
+                                         const PCRemotePlayerResolvedAppearance* appearance) {
+    cKF_Animation_R_c* wait_anim;
+
+    if (Now_Private == NULL) {
+        return; /* not actually ready despite the caller's check -- retry next frame */
+    }
+
+    wait_anim = mPlib_Get_Pointer_Animation(mPlayer_ANIM_WAIT1);
+
+    cKF_SkeletonInfo_R_ct(&visual->keyframe0, appearance->skeleton, NULL, visual->joint_data, visual->morph_data);
+    cKF_SkeletonInfo_R_ct(&visual->keyframe1, appearance->skeleton, NULL, visual->joint_data, visual->morph_data);
+    mPlib_DMA_player_Part_Table(visual->part_table, mPlayer_PART_TABLE_NORMAL);
+
+    cKF_SkeletonInfo_R_init_standard_repeat_setframeandspeedandmorph(&visual->keyframe0, wait_anim, NULL, 1.0f, 0.5f,
+                                                                     0.0f);
+    cKF_SkeletonInfo_R_init_standard_repeat_setframeandspeedandmorph(&visual->keyframe1, wait_anim, NULL, 1.0f, 0.5f,
+                                                                     0.0f);
+
+    visual->current_anim1_idx = mPlayer_ANIM_WAIT1;
+    visual->current_part_table = mPlayer_PART_TABLE_NORMAL; /* matches the mPlib_DMA_player_Part_Table() above */
+    visual->held_kind = mPlayer_ITEM_KIND_NONE;
+    visual->held_class = PC_HELD_NONE;
+    visual->item_ready = 0;
+
+    visual->initialized = 1;
+    visual->last_held_kind = mPlayer_ITEM_KIND_NONE; /* P1: no item carried yet (0 would be the axe) */
+    visual->scale_kind = mPlayer_ITEM_KIND_NONE;
+    visual->current_anim_idx = mPlayer_ANIM_WAIT1; /* explicit, even though this matches the
+                                                     * zero-init default -- see the struct's doc
+                                                     * comment */
+    printf("[NET][REMOTE][DIAG] visual initialized: model=%s num_shown_joints=%d\n",
+           (appearance->skeleton == &cKF_bs_r_boy_1) ? "boy" : "girl", (int)appearance->skeleton->num_shown_joints);
+}
+
+/* ------------------------------------------------------------------------------------------------------------
+ * M9-C Phase 1: remote held-item presentation (no protocol change: MOVE.item_kind already arrives).
+ *
+ * Everything below is PUPPET-OWNED: it only reads pure compiled-in data (mPlib_* tables, item display lists and
+ * skeletons) and writes only into the PCRemotePlayerActor it is given. It never calls a Player_actor_* function,
+ * never reads Now_Private / the local PLAYER_ACTOR, never touches a vanilla draw callback and never binds a
+ * segment (the tool/umbrella display lists address their textures/palettes directly, verified in
+ * src/data/model/player_tool.c and tol_umb_NN.c). Phase 1 shows the CARRIED pose only; swing/cast poses come
+ * with the main-index sync of a later phase (ITEM_USE currently maps to WAIT1, so the carried pose is shown there).
+ * ------------------------------------------------------------------------------------------------------------ */
+
+/* 1 once, from the environment (PC_PUPPET_DIAG=1): decision lines on item change only. */
+static int pc_remote_player_puppet_diag(void) {
+    static int s_diag = -1;
+    if (s_diag < 0) {
+        const char* e = getenv("PC_PUPPET_DIAG");
+        s_diag = (e != NULL && e[0] == '1') ? 1 : 0;
+    }
+    return s_diag;
+}
+
+static int pc_remote_player_held_class(int kind) {
+    if (kind < 0) {
+        return PC_HELD_NONE;
+    }
+    if (mPlayer_ITEM_IS_AXE(kind)) {
+        return PC_HELD_AXE;
+    }
+    if (mPlayer_ITEM_IS_NET(kind)) {
+        return PC_HELD_NET;
+    }
+    if (kind >= mPlayer_ITEM_KIND_UMBRELLA00 && kind <= mPlayer_ITEM_KIND_UMBRELLA31) {
+        return PC_HELD_UMBRELLA; /* catalog umbrellas only; ORG00..07 (custom designs are not transmitted) fall through */
+    }
+    if (mPlayer_ITEM_IS_ROD(kind)) {
+        return PC_HELD_ROD;
+    }
+    if (mPlayer_ITEM_IS_SHOVEL(kind)) {
+        return PC_HELD_SHOVEL;
+    }
+    if (mPlayer_ITEM_IS_FAN(kind)) {
+        return PC_HELD_FAN;
+    }
+    if (mPlayer_ITEM_IS_BALLOON(kind)) {
+        return PC_HELD_BALLOON; /* P1 */
+    }
+    if (mPlayer_ITEM_IS_WINDMILL(kind)) {
+        return PC_HELD_WINDMILL; /* P1 */
+    }
+    return PC_HELD_DEFERRED; /* ORG umbrellas (custom designs are not transmitted), anything out of range */
+}
+
+static const char* pc_remote_player_held_name(int kind, int cls) {
+    switch (cls) {
+        case PC_HELD_NONE:     return "none";
+        case PC_HELD_AXE:      return (kind == mPlayer_ITEM_KIND_GOLD_AXE) ? "gold_axe" : "axe";
+        case PC_HELD_NET:      return (kind == mPlayer_ITEM_KIND_GOLD_NET) ? "gold_net" : "net";
+        case PC_HELD_UMBRELLA: return "umbrella";
+        case PC_HELD_ROD:      return (kind == mPlayer_ITEM_KIND_GOLD_ROD) ? "gold_rod" : "rod";
+        case PC_HELD_SHOVEL:   return (kind == mPlayer_ITEM_KIND_GOLD_SHOVEL) ? "gold_shovel" : "shovel";
+        case PC_HELD_FAN:      return "fan";
+        case PC_HELD_BALLOON:  return "balloon";
+        case PC_HELD_WINDMILL: return "pinwheel";
+        default:               return "deferred";
+    }
+}
+
+
+/* ------------------------------------------------------------------------------------------------------------
+ * M9-C Phase 2a: STATE ROW TABLE (protocol v7 action_state -> puppet animation).
+ *
+ * One row per vanilla mPlayer_INDEX_* (121). A row with name == NULL is the DEFAULT ("fallback"): no override, the
+ * puppet keeps using the coarse move_state -> animation mapping plus the Phase 1 carried-item pose. A row is filled
+ * ONLY when the animation / part table / mode / speed were confirmed by reading the vanilla
+ * Player_actor_setup_main_<X>() (src/game/m_player_main_<x>.c_inc, cited per row) and the InitAnimation_Base* /
+ * SetupItem_Base* it calls (src/game/m_player_common.c_inc: Base1 1856 = REPEAT, Base2 1885 = explicit mode,
+ * SetupItem_Base0 3911 / Base1 3953 / Base2 3968 = held-item layer).
+ *
+ * Alias trap (decomp naming, verified numerically in include/m_player.h and asserted below): the item clips passed
+ * to SetupItem_Base2()/LoadOrDestruct_Item() use mPlayer_ANIM_* names for mPlayer_ITEM_DATA_* values, e.g.
+ * ANIM_PICKUP1 (7) == ITEM_DATA_NET_SWING, ANIM_HOLD_WAIT1 (6) == ITEM_DATA_NET_GET_M, ANIM_LTURN1 (8) ==
+ * ITEM_DATA_KAMAE_MAIN_M, ANIM_RTURN1 (9) == ITEM_DATA_KOKERU_GETUP_N, ANIM_GET1 (10) == ITEM_DATA_KOKERU_N, rod:
+ * ANIM_TRANS_WAIT1 (15) == ROD_GET_T, UMB_OPEN1 (17) == ROD_SINARI, UMBRELLA1 (18) == ROD_SWING, RUN_SLIP1 (20) ==
+ * ROD_NOT_SWING, and relax_rod passes eEC_EFFECT_TURI_MIZU (70) as a body clip == ANIM_TURI_WAIT1 (70). The rows
+ * below therefore name the ITEM_DATA_* clips explicitly.
+ *
+ * Deliberate approximations (all cosmetic): start frame 1.0 as in vanilla; the net-hit frame hold in swing_net is not
+ * reproduced. P1 (puppet animation coverage): the morph of each state's setup is mirrored (s_row_morph), reverse playback
+ * (PC_ROWF_REVERSE = Base3), the take-out / put-away item_scale curve (PC_ROWF_ITEM_SCALE), the stop_net freeze
+ * (PC_ROWF_FREEZE) and a per-state root pin mask (s_row_pin: TRANS_XZ / TRANS_Y / ROT_Y as vanilla ct_base) exist.
+ * ------------------------------------------------------------------------------------------------------------ */
+
+#define PC_ROW_A1_SAME (-1)             /* anim1 == anim0 */
+#define PC_ROW_A1_ITEM (-2)             /* anim1 == held-item pose clip when an item is carried, else anim0 */
+#define PC_ROW_ANIM_TUMBLE (-10)        /* anim0 chosen by item kind (m_player_main_tumble.c_inc:42) */
+#define PC_ROW_ANIM_TUMBLE_GETUP (-11)  /* anim0 chosen by item kind (m_player_main_tumble_getup.c_inc:58) */
+#define PC_ROW_ANIM_FALL_PITFALL (-12)  /* P1: OTIRU2 with an umbrella, else OTIRU1 (m_player_main_fall_pitfall.c_inc:10-16) */
+#define PC_ROW_ANIM_CLIMBUP_PITFALL (-13) /* P1: DERU2 with an umbrella, else DERU1 (m_player_main_climbup_pitfall.c_inc:10-16) */
+#define PC_ROW_ANIM_TAKEOUT (-14)       /* P1: UMB_OPEN1 for an umbrella, else PUTAWAY1 reversed (m_player_main_takeout_item.c_inc:31-43) */
+#define PC_ROW_ANIM_PUTIN (-15)         /* P1: UMB_CLOSE1 for an umbrella, else PUTAWAY1 (m_player_main_putin_item.c_inc:32-51) */
+
+enum {
+    PC_ROWF_BODY_CONTINUE = 1 << 0,   /* vanilla does NOT re-init the body clips: keep them if already playing anim0 */
+    PC_ROWF_PT_NET_IF_ITEM = 1 << 2,  /* part table NET when an item is carried (pickup_exchange.c_inc:31) */
+    PC_ROWF_BODY_CARRY = 1 << 3,      /* start the body clips at the previous row's current frame (vanilla passes it) */
+    PC_ROWF_ITEM_CARRY = 1 << 4,      /* same for the item clip */
+    PC_ROWF_PT_FROM_ANIM1 = 1 << 5,   /* part table = mPlib_Get_BasicPartTableIndex_fromAnimeIndex(anim1), i.e. the
+                                       * SetupItem_Base1() out-parameter the vanilla state passes on (Phase 2b) */
+    PC_ROWF_CHAIN_STOP = 1 << 6,      /* the chain clip is a STOP clip (stays on its last frame), not REPEAT (stung_bee) */
+    PC_ROWF_HIDE_BODY = 1 << 7,       /* vanilla draw type NONE (m_player.c Player_actor_draw): draw neither body nor item */
+    PC_ROWF_ROOT_PIN = 1 << 8,        /* building interactions: the state runs under AnimationMove ct_base (TRANS_XZ|ROT_Y) in vanilla, i.e. the
+                                       * clip's root translation is NOT applied (the synced world.position already contains the motion): pin
+                                       * the puppet's root with cKF_SkeletonInfo_R_Animation_Set_base_shape_trs(0,1000,0,0,0,0x4000) +
+                                       * animation_enabled = TRANS_XZ|ROT_Y so the clip is not added on top of the position (no double root motion) */
+    PC_ROWF_HIDE_AT_END = 1 << 9,     /* the body has walked inside when the clip ends (DOOR): hide the puppet (v->hidden_door) until the scene
+                                       * event / snap / 600 frame timeout, so it never stands outside the closed door */
+    PC_ROWF_SCENE_ENTRY = 1 << 10,    /* OUTDOOR: the first state of a scene arrival; may start from the scene-change clear and is not released by it */
+    /* ---- P1 (puppet animation coverage): row infrastructure ---- */
+    PC_ROWF_REVERSE = 1 << 11,        /* vanilla InitAnimation_Base3: both layers play the clip BACKWARDS from its last frame
+                                       * (cKF_SkeletonInfo_R_init_reverse_setspeedandmorphandmode; mail_land, take-out PUTAWAY1) */
+    PC_ROWF_FREEZE = 1 << 12,         /* stop_net: binds NO body clip, freezes the clips already playing (speed 0) */
+    PC_ROWF_ITEM_SCALE = 1 << 13,     /* takeout/putin: the carried item is drawn at the vanilla item_scale curve (pc_remote_player_row_tick) */
+};
+
+/* P1: vanilla root pin of each state that runs under cKF_SkeletonInfo_R_AnimationMove_ct_base (mask = cKF_ANIMATION_* bits:
+ * 1 TRANS_XZ, 2 TRANS_Y, 4 ROT_Y) together with its cKF_SkeletonInfo_R_Animation_Set_base_shape_trs translation z (200 for the
+ * furniture push/pull/open/close states, 0 otherwise; x 0, y 1000, rotation (0, 0, 0x4000) for every state). Parsed back out of the
+ * vanilla .c_inc files by test_puppet_rows_batchA_src.py, which asserts this table == the vanilla masks. A filled row of one of these
+ * states pins the masked root components (pc_remote_player_row_start), so the clip's own root translation / rotation is never added
+ * on top of the MOVE-synced position / facing (the puppet never runs AnimationMove_base). Indexes of other workers' states are
+ * listed too so their rows inherit the right pin. */
+typedef struct PCRowPin {
+    u8  mask;   /* cKF_ANIMATION_TRANS_XZ | cKF_ANIMATION_TRANS_Y | cKF_ANIMATION_ROT_Y subset; 0 = no pin */
+    s16 base_z; /* Set_base_shape_trs translation z */
+} PCRowPin;
+#define PC_PIN_XZ cKF_ANIMATION_TRANS_XZ
+#define PC_PIN_Y cKF_ANIMATION_TRANS_Y
+#define PC_PIN_RY cKF_ANIMATION_ROT_Y
+static const PCRowPin s_row_pin[mPlayer_INDEX_NUM] = {
+    [mPlayer_INDEX_DOOR] = { PC_PIN_XZ | PC_PIN_RY, 0 },                           /* door.c_inc:30-32 (5) */
+    [mPlayer_INDEX_PUSH] = { PC_PIN_XZ, 200 },                                     /* push.c_inc:44-46 (1) */
+    [mPlayer_INDEX_PULL] = { PC_PIN_XZ, 200 },                                     /* pull.c_inc:54-56 (1) */
+    [mPlayer_INDEX_OPEN_FURNITURE] = { PC_PIN_XZ, 200 },                           /* open_furniture.c_inc:43-45 (1) */
+    [mPlayer_INDEX_WAIT_OPEN_FURNITURE] = { PC_PIN_XZ, 200 },                      /* wait_open_furniture.c_inc:34-36 (1) */
+    [mPlayer_INDEX_CLOSE_FURNITURE] = { PC_PIN_XZ, 200 },                          /* close_furniture.c_inc:41-43 (1) */
+    [mPlayer_INDEX_LIE_BED] = { PC_PIN_XZ | PC_PIN_Y, 0 },                         /* lie_bed.c_inc:87-89 (3) */
+    [mPlayer_INDEX_ROLL_BED] = { PC_PIN_XZ, 0 },                                   /* roll_bed.c_inc:75-77 (1) */
+    [mPlayer_INDEX_STANDUP_BED] = { PC_PIN_XZ | PC_PIN_Y, 0 },                     /* standup_bed.c_inc:125-128 (3) */
+    [mPlayer_INDEX_SITDOWN] = { PC_PIN_XZ | PC_PIN_RY, 0 },                        /* sitdown.c_inc:58-60 (5) */
+    [mPlayer_INDEX_STANDUP] = { PC_PIN_XZ, 0 },                                    /* standup.c_inc:31-33 (1) */
+    [mPlayer_INDEX_DEMO_GETON_TRAIN] = { PC_PIN_XZ | PC_PIN_Y | PC_PIN_RY, 0 },    /* demo_geton_train.c_inc:22-26 (7) */
+    [mPlayer_INDEX_DEMO_GETOFF_TRAIN] = { PC_PIN_XZ | PC_PIN_Y | PC_PIN_RY, 0 },   /* demo_getoff_train.c_inc:22-26 (7) */
+    [mPlayer_INDEX_ROTATE_OCTAGON] = { PC_PIN_XZ | PC_PIN_RY, 0 },                 /* rotate_octagon.c_inc:32-35 (5) */
+    [mPlayer_INDEX_THROW_MONEY] = { PC_PIN_XZ | PC_PIN_RY, 0 },                    /* throw_money.c_inc:23-26 (5) */
+    [mPlayer_INDEX_PRAY] = { PC_PIN_XZ | PC_PIN_RY, 0 },                           /* pray.c_inc:23-26 (5) */
+    [mPlayer_INDEX_MAIL_JUMP] = { PC_PIN_XZ | PC_PIN_RY, 0 },                      /* mail_jump.c_inc:29-32 (5) */
+    [mPlayer_INDEX_READY_PITFALL] = { PC_PIN_XZ | PC_PIN_Y, 0 },                   /* ready_pitfall.c_inc:42-45 (3) */
+    [mPlayer_INDEX_FALL_PITFALL] = { PC_PIN_XZ | PC_PIN_Y, 0 },                    /* fall_pitfall.c_inc:27-30 (3) */
+    [mPlayer_INDEX_CLIMBUP_PITFALL] = { PC_PIN_XZ | PC_PIN_Y, 0 },                 /* climbup_pitfall.c_inc:41-44 (3) */
+    [mPlayer_INDEX_NOTICE_BEE] = { PC_PIN_RY, 0 },                                 /* notice_bee.c_inc:20-23 (4) */
+    [mPlayer_INDEX_KNOCK_DOOR] = { PC_PIN_XZ | PC_PIN_RY, 0 },                     /* knock_door.c_inc:28-31 (5) */
+    [mPlayer_INDEX_SWITCH_ON_LIGHTHOUSE] = { PC_PIN_XZ | PC_PIN_RY, 0 },           /* switch_on_lighthouse.c_inc:33-36 (5) */
+    [mPlayer_INDEX_DEMO_GETON_BOAT] = { PC_PIN_XZ | PC_PIN_Y | PC_PIN_RY, 0 },     /* demo_geton_boat.c_inc:24-27 (7) */
+    [mPlayer_INDEX_DEMO_GETOFF_BOAT_STANDUP] = { PC_PIN_XZ | PC_PIN_Y | PC_PIN_RY, 0 }, /* demo_getoff_boat_standup.c_inc:33-36 (7) */
+    [mPlayer_INDEX_DEMO_GETOFF_BOAT] = { PC_PIN_XZ | PC_PIN_Y | PC_PIN_RY, 0 },    /* demo_getoff_boat.c_inc:47-50 (7) */
+};
+
+/* P1: vanilla morph_counter of each state's setup InitAnimation_Base* call (m_player_main_<x>.c_inc setup_main_<X>): the puppet
+ * blends from the pose it is drawing into the new clip exactly like vanilla (negative = blend while the clip plays, positive = hold
+ * the clip's first frame while blending; c_keyframe.c cKF_SkeletonInfo_R_combine_play). 0 = snap (vanilla 0 or not listed). Kind-
+ * dependent states (take-out / put-in) pick theirs in pc_remote_player_row_start. Asserted against the .c_inc files by
+ * test_puppet_rows_batchA_src.py. */
+static const s8 s_row_morph[mPlayer_INDEX_NUM] = {
+    [mPlayer_INDEX_DOOR] = -9, [mPlayer_INDEX_TUMBLE] = -5, [mPlayer_INDEX_TUMBLE_GETUP] = -5, [mPlayer_INDEX_PUSH] = -5,
+    [mPlayer_INDEX_PULL] = -5, [mPlayer_INDEX_SITDOWN] = -3, [mPlayer_INDEX_SITDOWN_WAIT] = -5, [mPlayer_INDEX_STANDUP] = -3,
+    [mPlayer_INDEX_PICKUP] = -6, [mPlayer_INDEX_PICKUP_EXCHANGE] = -5, [mPlayer_INDEX_SWING_AXE] = -5, [mPlayer_INDEX_AIR_AXE] = -5,
+    [mPlayer_INDEX_REFLECT_AXE] = -5, [mPlayer_INDEX_BROKEN_AXE] = -5, [mPlayer_INDEX_SLIP_NET] = -5, [mPlayer_INDEX_READY_NET] = -5,
+    [mPlayer_INDEX_READY_WALK_NET] = -5, [mPlayer_INDEX_SWING_NET] = -5, [mPlayer_INDEX_PULL_NET] = 10, [mPlayer_INDEX_PUTAWAY_NET] = -5,
+    [mPlayer_INDEX_READY_ROD] = -5, [mPlayer_INDEX_RELAX_ROD] = -3, [mPlayer_INDEX_VIB_ROD] = -3, [mPlayer_INDEX_NOTICE_ROD] = -3,
+    [mPlayer_INDEX_PUTAWAY_ROD] = -3, [mPlayer_INDEX_DIG_SCOOP] = -5, [mPlayer_INDEX_FILL_SCOOP] = -5, [mPlayer_INDEX_REFLECT_SCOOP] = -5,
+    [mPlayer_INDEX_AIR_SCOOP] = -5, [mPlayer_INDEX_GET_SCOOP] = -5, [mPlayer_INDEX_PUTAWAY_SCOOP] = -3, [mPlayer_INDEX_PUTIN_SCOOP] = -5,
+    [mPlayer_INDEX_DEMO_GETON_TRAIN] = -5, [mPlayer_INDEX_DEMO_GETON_TRAIN_WAIT] = -5, [mPlayer_INDEX_DEMO_GETOFF_TRAIN] = -5,
+    [mPlayer_INDEX_ROTATE_OCTAGON] = -5, [mPlayer_INDEX_THROW_MONEY] = -5, [mPlayer_INDEX_PRAY] = -5, [mPlayer_INDEX_SHAKE_TREE] = -5,
+    [mPlayer_INDEX_MAIL_JUMP] = -8, [mPlayer_INDEX_MAIL_LAND] = -5, [mPlayer_INDEX_READY_PITFALL] = -5, [mPlayer_INDEX_FALL_PITFALL] = -5,
+    [mPlayer_INDEX_STRUGGLE_PITFALL] = -5, [mPlayer_INDEX_CLIMBUP_PITFALL] = -5, [mPlayer_INDEX_STUNG_BEE] = -5,
+    [mPlayer_INDEX_NOTICE_BEE] = -5, [mPlayer_INDEX_REMOVE_GRASS] = -6, [mPlayer_INDEX_KNOCK_DOOR] = -5,
+    [mPlayer_INDEX_PUSH_SNOWBALL] = -5, [mPlayer_INDEX_ROTATE_UMBRELLA] = -5, [mPlayer_INDEX_STUNG_MOSQUITO] = -5,
+    [mPlayer_INDEX_NOTICE_MOSQUITO] = -5, [mPlayer_INDEX_SWING_FAN] = -5, [mPlayer_INDEX_SWITCH_ON_LIGHTHOUSE] = 9,
+    [mPlayer_INDEX_SHOCK] = -5,
+};
+#define PC_ROW_CHAIN_MORPH (-5.0f)    /* the chain clips (AXE_BREAKWAIT1, HATI2, GAAAN2) are bound with morph -5 by their states */
+#define PC_FALLBACK_MORPH (-5.0f)     /* locomotion / idle rebinds: the -5 every vanilla request_main_wait/walk passes after an action */
+
+enum { PC_NETANG_DEFAULT = 0, PC_NETANG_RESET, PC_NETANG_READY, PC_NETANG_READY_WALK, PC_NETANG_SLIP,
+       PC_NETANG_SWING, PC_NETANG_ZERO, PC_NETANG_WALK };
+enum { PC_TEMPO_FIXED = 0, PC_TEMPO_READY_WALK_NET };
+
+typedef struct PCStateRow {
+    const char* name;     /* NULL = fallback row (no override) */
+    s16         anim0;    /* mPlayer_ANIM_* (or PC_ROW_ANIM_*) on keyframe0 */
+    s16         anim1;    /* mPlayer_ANIM_* or PC_ROW_A1_* on keyframe1 */
+    s8          part_table;
+    u8          mode;     /* cKF_FRAMECONTROL_STOP (one-shot: latched) / REPEAT */
+    f32         speed;
+    f32         start_frame;
+    u16         flags;    /* PC_ROWF_* */
+    s16         chain_anim; /* body clip (REPEAT, 0.5x, frame 1) the vanilla state switches to when the STOP clip ends; -1 none */
+    s16         item_clip;  /* mPlayer_ITEM_DATA_* net/rod clip on the puppet item skeleton, -1 = carried default */
+    u8          item_mode;
+    f32         item_start;
+    u8          net_angle;  /* PC_NETANG_* (Player_actor_Item_net_CulcJointAngle_dummy_net table, m_player_item_net.c_inc:125) */
+    u8          tempo;      /* PC_TEMPO_* */
+} PCStateRow;
+
+#define PC_STOP cKF_FRAMECONTROL_STOP
+#define PC_REPEAT cKF_FRAMECONTROL_REPEAT
+#define PC_NORMAL mPlayer_PART_TABLE_NORMAL
+#define PCROW(nm, a0, a1, pt, md, spd, st, fl, chain, ic, im, is, na, tp) \
+    { nm, a0, a1, pt, md, spd, st, fl, chain, ic, im, is, na, tp }
+/* common shapes */
+#define PCROW_BODY(nm, a0, md, na) PCROW(nm, a0, PC_ROW_A1_SAME, PC_NORMAL, md, 0.5f, 1.0f, 0, -1, -1, 0, 1.0f, na, PC_TEMPO_FIXED)
+/* Reaction shape: anim1 = SetupItem_Base1() item pose (or the clip itself), explicit part table, speed 0.5, start frame 1. */
+#define PCROW_ITEM(nm, a0, pt, md, fl, chain, na) PCROW(nm, a0, PC_ROW_A1_ITEM, pt, md, 0.5f, 1.0f, fl, chain, -1, 0, 1.0f, na, PC_TEMPO_FIXED)
+/* EXPLICIT FALLBACK row: no override, the coarse move_state mapping + Phase 1 carried pose apply. The string states why
+ * and is dropped by the preprocessor (it is documentation that the table test greps). */
+#define PCFB(why) { NULL }
+
+/* Alias-trap proofs (compile-time): the item-clip names the vanilla code passes as mPlayer_ANIM_* are these ITEM_DATA ids. */
+_Static_assert((int)mPlayer_ANIM_PICKUP1 == (int)mPlayer_ITEM_DATA_NET_SWING, "alias: ANIM_PICKUP1 is ITEM_DATA_NET_SWING");
+_Static_assert((int)mPlayer_ANIM_HOLD_WAIT1 == (int)mPlayer_ITEM_DATA_NET_GET_M, "alias: ANIM_HOLD_WAIT1 is ITEM_DATA_NET_GET_M");
+_Static_assert((int)mPlayer_ANIM_LTURN1 == (int)mPlayer_ITEM_DATA_KAMAE_MAIN_M, "alias: ANIM_LTURN1 is ITEM_DATA_KAMAE_MAIN_M");
+_Static_assert((int)mPlayer_ANIM_RTURN1 == (int)mPlayer_ITEM_DATA_KOKERU_GETUP_N, "alias: ANIM_RTURN1 is ITEM_DATA_KOKERU_GETUP_N");
+_Static_assert((int)mPlayer_ANIM_GET1 == (int)mPlayer_ITEM_DATA_KOKERU_N, "alias: ANIM_GET1 is ITEM_DATA_KOKERU_N");
+_Static_assert((int)mPlayer_ANIM_GET_CHANGE1 == (int)mPlayer_ITEM_DATA_SWING_WAIT, "alias: ANIM_GET_CHANGE1 is ITEM_DATA_SWING_WAIT");
+_Static_assert((int)mPlayer_ANIM_TRANS_WAIT1 == (int)mPlayer_ITEM_DATA_ROD_GET_T, "alias: ANIM_TRANS_WAIT1 is ITEM_DATA_ROD_GET_T");
+_Static_assert((int)mPlayer_ANIM_UMB_OPEN1 == (int)mPlayer_ITEM_DATA_ROD_SINARI, "alias: ANIM_UMB_OPEN1 is ITEM_DATA_ROD_SINARI");
+_Static_assert((int)mPlayer_ANIM_UMBRELLA1 == (int)mPlayer_ITEM_DATA_ROD_SWING, "alias: ANIM_UMBRELLA1 is ITEM_DATA_ROD_SWING");
+_Static_assert((int)mPlayer_ANIM_RUN_SLIP1 == (int)mPlayer_ITEM_DATA_ROD_NOT_SWING, "alias: ANIM_RUN_SLIP1 is ITEM_DATA_ROD_NOT_SWING");
+#ifdef PC_REMOTE_PLAYER_HAVE_EEC_ENUM
+_Static_assert((int)eEC_EFFECT_TURI_MIZU == (int)mPlayer_ANIM_TURI_WAIT1, "alias: relax_rod's eEC_EFFECT_TURI_MIZU is ANIM_TURI_WAIT1");
+#endif
+
+static const PCStateRow s_state_rows[mPlayer_INDEX_NUM] = {
+    /* TUMBLE 11 / TUMBLE_GETUP 12: clip by item kind (tumble.c_inc:68 setup_main_Tumble: InitAnimation_Base2(anim, anim,
+     * 1, 1, speed 0.5, morph -5, mode 0 STOP, table 0); getup.c_inc:96 identical). Nets also play the net item clip
+     * KOKERU_N / KOKERU_GETUP_N in STOP mode (setup_Item_Tumble tumble.c_inc:11 -> ANIM_GET1, getup.c_inc:52 -> ANIM_RTURN1);
+     * every other kind keeps its default carried item clip. Item net angle: dummy_net table = zero for both states. */
+    [mPlayer_INDEX_TUMBLE] = PCROW("tumble", PC_ROW_ANIM_TUMBLE, PC_ROW_A1_SAME, PC_NORMAL, PC_STOP, 0.5f, 1.0f, 0, -1,
+                                   mPlayer_ITEM_DATA_KOKERU_N, PC_STOP, 1.0f, PC_NETANG_ZERO, PC_TEMPO_FIXED),
+    [mPlayer_INDEX_TUMBLE_GETUP] = PCROW("tumble_getup", PC_ROW_ANIM_TUMBLE_GETUP, PC_ROW_A1_SAME, PC_NORMAL, PC_STOP, 0.5f,
+                                         1.0f, 0, -1, mPlayer_ITEM_DATA_KOKERU_GETUP_N, PC_STOP, 1.0f, PC_NETANG_ZERO,
+                                         PC_TEMPO_FIXED),
+
+    /* PICKUP 30 (m_player_main_pickup.c_inc:20,74,182): SetupItem_Base1(PICKUP1) gives layer 1 the carried-item pose
+     * (PICKUP1 itself when nothing is carried); InitAnimation_Base2(PICKUP1, anim1, 1, 1, 0.5, morph -6, STOP,
+     * PART_TABLE_PICK_UP). Net angle: dummy_net table = reset.
+     * PICKUP_JUMP 31: room-only, left to the fallback; PICKUP_FURNITURE 32: P1 row below. */
+    [mPlayer_INDEX_PICKUP] = PCROW("pickup", mPlayer_ANIM_PICKUP1, PC_ROW_A1_ITEM, mPlayer_PART_TABLE_PICK_UP, PC_STOP, 0.5f,
+                                   1.0f, 0, -1, -1, 0, 1.0f, PC_NETANG_RESET, PC_TEMPO_FIXED),
+    /* PICKUP_EXCHANGE 33 (m_player_main_pickup_exchange.c_inc:17,29-36): Base1 REPEAT, anim0 PICKUP_WAIT1, anim1 =
+     * item pose (PICKUP_WAIT1 when nothing carried), part table NET when anim1 != PICKUP_WAIT1 (an item is carried). */
+    [mPlayer_INDEX_PICKUP_EXCHANGE] = PCROW("pickup_exchange", mPlayer_ANIM_PICKUP_WAIT1, PC_ROW_A1_ITEM, PC_NORMAL,
+                                            PC_REPEAT, 0.5f, 1.0f, PC_ROWF_PT_NET_IF_ITEM, -1, -1, 0, 1.0f, PC_NETANG_RESET,
+                                            PC_TEMPO_FIXED),
+
+    /* AXE 37..40: Base2(clip, clip, 1, 1, 0.5, -5, STOP, table 0): swing_axe.c_inc:38,45 AXE_SWING1; air_axe.c_inc:11,16
+     * AXE_SUKA1; reflect_axe.c_inc:32,39 AXE_HANE1; broken_axe.c_inc:32,54 AXE_BREAK1, then (broken_axe.c_inc:121) the state
+     * itself switches to AXE_BREAKWAIT1 via Base1 = REPEAT when AXE_BREAK1 has stopped -> chain_anim. The axe is a plain
+     * display list (Phase 1) so there is no item clip. */
+    [mPlayer_INDEX_SWING_AXE] = PCROW_BODY("swing_axe", mPlayer_ANIM_AXE_SWING1, PC_STOP, PC_NETANG_RESET),
+    [mPlayer_INDEX_AIR_AXE] = PCROW_BODY("air_axe", mPlayer_ANIM_AXE_SUKA1, PC_STOP, PC_NETANG_RESET),
+    [mPlayer_INDEX_REFLECT_AXE] = PCROW_BODY("reflect_axe", mPlayer_ANIM_AXE_HANE1, PC_STOP, PC_NETANG_RESET),
+    [mPlayer_INDEX_BROKEN_AXE] = PCROW("broken_axe", mPlayer_ANIM_AXE_BREAK1, PC_ROW_A1_SAME, PC_NORMAL, PC_STOP, 0.5f, 1.0f, 0,
+                                       mPlayer_ANIM_AXE_BREAKWAIT1, -1, 0, 1.0f, PC_NETANG_RESET, PC_TEMPO_FIXED),
+
+    /* NET 41..48 (net item clips via SetupItem_Base2: only applied when the carried item is a net, Check_ItemAnimationToItemKind
+     * item_common.c_inc:412). 41 SLIP_NET slip_net.c_inc:21,30-31: Base1 (REPEAT) KAMAE_SLIP_M1 both layers, table 0, default
+     * net item clip. 42 READY_NET ready_net.c_inc:11,16-17: KAMAE_WAIT_M1 REPEAT. 43 READY_WALK_NET ready_walk_net.c_inc:11,
+     * 16-17: KAMAE_MOVE_M1 REPEAT with a movement-driven tempo (main: CulcAnimation_Ready_walk_net, speed = 0.252 *
+     * sqrt(actor->speed * over_norm / 1.8), min 0.22; over_norm = 1 here). 44 SWING_NET swing_net.c_inc:21,28-30: body
+     * NET_SWING1 Base2 STOP 0.5; item ITEM_DATA_NET_SWING in REPEAT mode (SetupItem_Base2 mode arg 1). 45 PULL_NET
+     * pull_net.c_inc:21,28-30: body GET_M1 STOP; item NET_GET_M (alias ANIM_HOLD_WAIT1) STOP. 48 PUTAWAY_NET
+     * putaway_net.c_inc:15,23-25: body PUTAWAY_M1 STOP; item KAMAE_MAIN_M (alias ANIM_LTURN1) STOP.
+     * STOP_NET 46 (only freezes the previous clips, speed 0, stop_net.c_inc:11): P1 FREEZE row below. NOTICE_NET 47 (no clip in setup,
+     * YATTA2 is started later inside the message state machine, notice_net.c_inc:270) is left to the fallback. */
+    [mPlayer_INDEX_SLIP_NET] = PCROW_BODY("slip_net", mPlayer_ANIM_KAMAE_SLIP_M1, PC_REPEAT, PC_NETANG_SLIP),
+    [mPlayer_INDEX_READY_NET] = PCROW_BODY("ready_net", mPlayer_ANIM_KAMAE_WAIT_M1, PC_REPEAT, PC_NETANG_READY),
+    [mPlayer_INDEX_READY_WALK_NET] = PCROW("ready_walk_net", mPlayer_ANIM_KAMAE_MOVE_M1, PC_ROW_A1_SAME, PC_NORMAL, PC_REPEAT,
+                                           0.5f, 1.0f, 0, -1, -1, 0, 1.0f, PC_NETANG_READY_WALK, PC_TEMPO_READY_WALK_NET),
+    [mPlayer_INDEX_SWING_NET] = PCROW("swing_net", mPlayer_ANIM_NET_SWING1, PC_ROW_A1_SAME, PC_NORMAL, PC_STOP, 0.5f, 1.0f, 0, -1,
+                                      mPlayer_ITEM_DATA_NET_SWING, PC_REPEAT, 1.0f, PC_NETANG_SWING, PC_TEMPO_FIXED),
+    [mPlayer_INDEX_PULL_NET] = PCROW("pull_net", mPlayer_ANIM_GET_M1, PC_ROW_A1_SAME, PC_NORMAL, PC_STOP, 0.5f, 1.0f, 0, -1,
+                                     mPlayer_ITEM_DATA_NET_GET_M, PC_STOP, 1.0f, PC_NETANG_ZERO, PC_TEMPO_FIXED),
+    [mPlayer_INDEX_PUTAWAY_NET] = PCROW("putaway_net", mPlayer_ANIM_PUTAWAY_M1, PC_ROW_A1_SAME, PC_NORMAL, PC_STOP, 0.5f, 1.0f,
+                                        0, -1, mPlayer_ITEM_DATA_KAMAE_MAIN_M, PC_STOP, 1.0f, PC_NETANG_RESET,
+                                        PC_TEMPO_FIXED),
+
+    /* ROD 49..57 (rod item clips via SetupItem_Base2, applied only for a carried rod). 49 READY_ROD ready_rod.c_inc:11,15-17:
+     * body SAO_SWING1 Base2 STOP; item ROD_SWING (alias ANIM_UMBRELLA1). 50 CAST_ROD cast_rod.c_inc:14,23: NO body re-init (the
+     * READY clip keeps playing, BODY_CONTINUE; ready_rod hands over at frame >= 10, ready_rod.c_inc request_proc), item
+     * ROD_SWING restarted at its current frame (ITEM_CARRY). 51 AIR_ROD air_rod.c_inc:11,20-22: body NOT_SAO_SWING1 from
+     * kf0's current frame (BODY_CARRY), item ROD_NOT_SWING (alias ANIM_RUN_SLIP1) from the item's current frame.
+     * 52 RELAX_ROD relax_rod.c_inc:11,19-21: body TURI_WAIT1 (eEC_EFFECT_TURI_MIZU == 70, see the assert above) Base2 mode 1
+     * REPEAT; item ROD_SINARI (alias ANIM_UMB_OPEN1) REPEAT from frame 180. 53 COLLECT_ROD collect_rod.c_inc:11,15-17: body
+     * NOT_GET_T1 STOP; item ROD_GET_T. 54 VIB_ROD vib_rod.c_inc:11,16-18: body TURI_HIKI1 REPEAT; item ROD_SINARI REPEAT from
+     * its current frame. 55 FLY_ROD fly_rod.c_inc:11,15-17: body GET_T1 STOP; item ROD_GET_T. 56 NOTICE_ROD
+     * notice_rod.c_inc:15,167: body GET_T2 STOP (item clip left as it was: ROD_GET_T; the later YATTA2 of the 'already
+     * collected' branch, notice_rod.c_inc:352, is not reproduced). 57 PUTAWAY_ROD putaway_rod.c_inc:17,27-29: body PUTAWAY_T1
+     * STOP; item ROD_GET_T. Worker P3: the bobber is drawn from BOBBER_VIEW (id 97, the vanilla tol_uki model at the relayed position, no UKI actor)
+     * and the caught fish + killifish YAJIRUSHI from PLAYER_ACTION kind 2 CATCH by the P3 FISHING VIEW block; vanilla draws no fishing line. */
+    [mPlayer_INDEX_READY_ROD] = PCROW("ready_rod", mPlayer_ANIM_SAO_SWING1, PC_ROW_A1_SAME, PC_NORMAL, PC_STOP, 0.5f, 1.0f, 0, -1,
+                                      mPlayer_ITEM_DATA_ROD_SWING, PC_STOP, 1.0f, PC_NETANG_DEFAULT, PC_TEMPO_FIXED),
+    [mPlayer_INDEX_CAST_ROD] = PCROW("cast_rod", mPlayer_ANIM_SAO_SWING1, PC_ROW_A1_SAME, PC_NORMAL, PC_STOP, 0.5f, 10.0f,
+                                     PC_ROWF_BODY_CONTINUE | PC_ROWF_ITEM_CARRY, -1, mPlayer_ITEM_DATA_ROD_SWING, PC_STOP, 10.0f,
+                                     PC_NETANG_DEFAULT, PC_TEMPO_FIXED),
+    [mPlayer_INDEX_AIR_ROD] = PCROW("air_rod", mPlayer_ANIM_NOT_SAO_SWING1, PC_ROW_A1_SAME, PC_NORMAL, PC_STOP, 0.5f, 1.0f,
+                                    PC_ROWF_BODY_CARRY | PC_ROWF_ITEM_CARRY, -1, mPlayer_ITEM_DATA_ROD_NOT_SWING, PC_STOP, 1.0f,
+                                    PC_NETANG_DEFAULT, PC_TEMPO_FIXED),
+    [mPlayer_INDEX_RELAX_ROD] = PCROW("relax_rod", mPlayer_ANIM_TURI_WAIT1, PC_ROW_A1_SAME, PC_NORMAL, PC_REPEAT, 0.5f, 1.0f, 0,
+                                      -1, mPlayer_ITEM_DATA_ROD_SINARI, PC_REPEAT, 180.0f, PC_NETANG_DEFAULT, PC_TEMPO_FIXED),
+    [mPlayer_INDEX_COLLECT_ROD] = PCROW("collect_rod", mPlayer_ANIM_NOT_GET_T1, PC_ROW_A1_SAME, PC_NORMAL, PC_STOP, 0.5f, 1.0f, 0,
+                                        -1, mPlayer_ITEM_DATA_ROD_GET_T, PC_STOP, 1.0f, PC_NETANG_DEFAULT, PC_TEMPO_FIXED),
+    [mPlayer_INDEX_VIB_ROD] = PCROW("vib_rod", mPlayer_ANIM_TURI_HIKI1, PC_ROW_A1_SAME, PC_NORMAL, PC_REPEAT, 0.5f, 1.0f,
+                                    PC_ROWF_ITEM_CARRY, -1, mPlayer_ITEM_DATA_ROD_SINARI, PC_REPEAT, 1.0f, PC_NETANG_DEFAULT,
+                                    PC_TEMPO_FIXED),
+    [mPlayer_INDEX_FLY_ROD] = PCROW("fly_rod", mPlayer_ANIM_GET_T1, PC_ROW_A1_SAME, PC_NORMAL, PC_STOP, 0.5f, 1.0f, 0, -1,
+                                    mPlayer_ITEM_DATA_ROD_GET_T, PC_STOP, 1.0f, PC_NETANG_DEFAULT, PC_TEMPO_FIXED),
+    [mPlayer_INDEX_NOTICE_ROD] = PCROW("notice_rod", mPlayer_ANIM_GET_T2, PC_ROW_A1_SAME, PC_NORMAL, PC_STOP, 0.5f, 1.0f, 0, -1,
+                                       mPlayer_ITEM_DATA_ROD_GET_T, PC_STOP, 1.0f, PC_NETANG_DEFAULT, PC_TEMPO_FIXED),
+    [mPlayer_INDEX_PUTAWAY_ROD] = PCROW("putaway_rod", mPlayer_ANIM_PUTAWAY_T1, PC_ROW_A1_SAME, PC_NORMAL, PC_STOP, 0.5f, 1.0f, 0,
+                                        -1, mPlayer_ITEM_DATA_ROD_GET_T, PC_STOP, 1.0f, PC_NETANG_DEFAULT, PC_TEMPO_FIXED),
+
+    /* SCOOP 58..64: all Base2(clip, clip, 1, 1, 0.5, morph, STOP, table 0), no item clip (the shovel is a display list):
+     * dig_scoop.c_inc:16,37 DIG1 (P1: a tree-stump target uses DIG_KABU1 at :31; row_start reconstructs the shovel target tile with the
+     * Phase 6b pc_puppet_scoop_target, the same PC_TCOND_STUMP test the tool table uses, and swaps the clip);
+     * fill_scoop.c_inc:15,22 FILL_UP1; reflect_scoop.c_inc:18,27 NOT_DIG1; air_scoop.c_inc:11,14 DIG_SUKA1; get_scoop.c_inc:16,53
+     * GET_D1; putaway_scoop.c_inc:19,29 PUTAWAY_D1; putin_scoop.c_inc:26,39 FILL_UP_I1. */
+    [mPlayer_INDEX_DIG_SCOOP] = PCROW_BODY("dig_scoop", mPlayer_ANIM_DIG1, PC_STOP, PC_NETANG_RESET),
+    [mPlayer_INDEX_FILL_SCOOP] = PCROW_BODY("fill_scoop", mPlayer_ANIM_FILL_UP1, PC_STOP, PC_NETANG_RESET),
+    [mPlayer_INDEX_REFLECT_SCOOP] = PCROW_BODY("reflect_scoop", mPlayer_ANIM_NOT_DIG1, PC_STOP, PC_NETANG_RESET),
+    [mPlayer_INDEX_AIR_SCOOP] = PCROW_BODY("air_scoop", mPlayer_ANIM_DIG_SUKA1, PC_STOP, PC_NETANG_RESET),
+    [mPlayer_INDEX_GET_SCOOP] = PCROW_BODY("get_scoop", mPlayer_ANIM_GET_D1, PC_STOP, PC_NETANG_RESET),
+    [mPlayer_INDEX_PUTAWAY_SCOOP] = PCROW_BODY("putaway_scoop", mPlayer_ANIM_PUTAWAY_D1, PC_STOP, PC_NETANG_RESET),
+    [mPlayer_INDEX_PUTIN_SCOOP] = PCROW_BODY("putin_scoop", mPlayer_ANIM_FILL_UP_I1, PC_STOP, PC_NETANG_RESET),
+
+    /* ROTATE_UMBRELLA 103 (m_player_main_rotate_umbrella.c_inc:10-12): Base2(UMB_ROT1, UMB_ROT1, 1, 1, speed 1.0 (not 0.5),
+     * morph -5, STOP, PART_TABLE_NORMAL). */
+    [mPlayer_INDEX_ROTATE_UMBRELLA] = PCROW("rotate_umbrella", mPlayer_ANIM_UMB_ROT1, PC_ROW_A1_SAME, PC_NORMAL, PC_STOP, 1.0f,
+                                            1.0f, 0, -1, -1, 0, 1.0f, PC_NETANG_RESET, PC_TEMPO_FIXED),
+
+    /* SWING_FAN 109 (m_player_main_swing_fan.c_inc:14,29-30): Base2(anim0 UTIWA_D1, anim1 WAIT1, frame0 1, frame1 1 (a
+     * continued swing keeps kf1's frame; the puppet restarts it), speed 0.5, morph -5/0, mode REPEAT, PART_TABLE_FAN).
+     * TAKEOUT_ITEM 72 / PUTIN_ITEM 73: P1 rows (kind-dependent clip, reverse playback, item_scale curve, mid-state switch). */
+    [mPlayer_INDEX_SWING_FAN] = PCROW("swing_fan", mPlayer_ANIM_UTIWA_D1, mPlayer_ANIM_WAIT1, mPlayer_PART_TABLE_FAN, PC_REPEAT,
+                                      0.5f, 1.0f, 0, -1, -1, 0, 1.0f, PC_NETANG_RESET, PC_TEMPO_FIXED),
+
+    /* ===== M9-C Phase 2b: the remaining rows. Every index 0..120 is either a filled row (name) or an EXPLICIT fallback (PCFB, with the
+     * reason). Filled here (cites in the row comments below): WAIT_BED 27, SITDOWN_WAIT 35, HIDE 81, TIRED 85, SHAKE_TREE 89,
+     * STRUGGLE_PITFALL 94, STUNG_BEE 96, REMOVE_GRASS 98, PUSH_SNOWBALL 102, COMPLETE_PAYMENT 105, STUNG_MOSQUITO 107,
+     * NOTICE_MOSQUITO 108. States that call cKF_SkeletonInfo_R_AnimationMove_ct_base(): the puppet never runs AnimationMove_base, so
+     * a row of such a state pins the masked root components (s_row_pin, c_keyframe.c:788-816 draws base_model_translation / rotation
+     * for them) and the MOVE-synced position / facing carries the motion (P1 generalized the TRANS_XZ|ROT_Y-only pin). ===== */
+    [mPlayer_INDEX_DMA] = PCFB("index 0 = no info (also the boot DMA wait, vanilla draw type NONE): nothing to override; cannot be told from 'unknown'"),
+    [mPlayer_INDEX_INTRO] = PCFB("m_player_main_intro.c_inc:14-16: Base1 WAIT1 REPEAT speed 0.5 + SetupItem_Base1 pose = the idle fallback (a 4-frame boot state)"),
+    [mPlayer_INDEX_REFUSE] = PCFB("m_player_main_refuse.c_inc:14-16: WAIT1 REPEAT 0.5 + item pose = idle fallback (input-blocked stand)"),
+    [mPlayer_INDEX_REFUSE_PICKUP] = PCFB("m_player_main_refuse_pickup.c_inc: message/demo-driven refusal stand (setup binds WAIT1-class idle); no distinct clip"),
+    [mPlayer_INDEX_RETURN_DEMO] = PCFB("m_player_main_return_demo.c_inc:21-26: WAIT1 REPEAT 0.5 + item pose = idle fallback (scene-return arrival, timer driven)"),
+    [mPlayer_INDEX_RETURN_OUTDOOR] = PCFB("m_player_main_return_outdoor.c_inc:23-27: WAIT1 REPEAT 0.5 + item pose = idle fallback (scene-return arrival)"),
+    [mPlayer_INDEX_RETURN_OUTDOOR2] = PCFB("m_player_main_return_outdoor2.c_inc:24-29: WAIT1 REPEAT 0.5 + item pose = idle fallback (scene-return arrival)"),
+    [mPlayer_INDEX_WAIT] = PCFB("locomotion basic: the move_state mapping (IDLE -> WAIT1 + carried pose, Phase 1/Stage 4B) IS the vanilla clip (wait.c_inc)"),
+    [mPlayer_INDEX_WALK] = PCFB("locomotion basic: move_state WALK -> WALK1 + tempo formula + carried pose (Stage 4B, walk.c_inc)"),
+    [mPlayer_INDEX_RUN] = PCFB("locomotion basic: move_state RUN -> RUN1 + tempo formula + carried pose (Stage 4B, run.c_inc)"),
+    [mPlayer_INDEX_DASH] = PCFB("locomotion basic: move_state DASH -> DASH1 + tempo formula + carried pose (Stage 4B, dash.c_inc)"),
+    [mPlayer_INDEX_TURN_DASH] = PCFB("locomotion basic: move_state TURN_DASH -> RUN_SLIP1 at fixed 0.5 + skid sound (Stage 4B.1, turn_dash.c_inc)"),
+    [mPlayer_INDEX_FALL] = PCFB("m_player_main_fall.c_inc:26-28: WAIT1 REPEAT 0.5 + item pose = idle fallback (airborne stand; position synced by MOVE)"),
+    [mPlayer_INDEX_WADE] = PCFB("m_player_main_wade.c_inc:32-34: WAIT1 REPEAT 0.5 + item pose = idle fallback (the slide across the wade tiles is position-synced)"),
+    /* DOOR 16 (m_player_main_door.c_inc:22-37): clip OPEN1 (type 0, houses) or INTO_S1 (shops) on BOTH layers (no item pose), STOP 0.5, morph -9, ct_base TRANS_XZ|ROT_Y (flags 5) with Set_base_shape_trs(0,1000,0,0,0,0x4000): the walk-in is the synced position, so the row pins the clip root (ROOT_PIN). The door type is not on the wire: the table clip is OPEN1 (hinged buildings); row_start swaps it for INTO_S1 when the nearest door point in the town is a type-1 (shop-style) building (pc_remote_player_door_pick). The puppet is hidden when the clip ends (HIDE_AT_END); the building actor's own door open/close is not synced. */
+    [mPlayer_INDEX_DOOR] = PCROW("door", mPlayer_ANIM_OPEN1, PC_ROW_A1_SAME, PC_NORMAL, PC_STOP, 0.5f, 1.0f, PC_ROWF_ROOT_PIN | PC_ROWF_HIDE_AT_END, -1, -1, 0, 1.0f, PC_NETANG_RESET, PC_TEMPO_FIXED),
+    /* OUTDOOR 17 (m_player_main_outdoor.c_inc:23-43): GO_OUT_O1 (GO_OUT_S1 for the start demo) on BOTH layers, STOP 0.5, start frame 25 (type 0) or 1; NO ct_base: world.position stays where the state put it and the clip's own root translation walks the body out. Start frame 1.0 / GO_OUT_O1 is the table default (the type is not on the wire): row_start overrides it from the interior the owner just left or the nearest door point: shop-style buildings GO_OUT_S1 from frame 1, hinged buildings GO_OUT_O1 from frame 25 (pc_remote_player_door_pick). The row is SCENE_ENTRY: it starts when the puppet re-appears in the town and is not released by that scene change. */
+    [mPlayer_INDEX_OUTDOOR] = PCROW("outdoor", mPlayer_ANIM_GO_OUT_O1, PC_ROW_A1_SAME, PC_NORMAL, PC_STOP, 0.5f, 1.0f, PC_ROWF_SCENE_ENTRY, -1, -1, 0, 1.0f, PC_NETANG_RESET, PC_TEMPO_FIXED),
+    [mPlayer_INDEX_INVADE] = PCFB("m_player_main_invade.c_inc:19-20: WAIT1 REPEAT 0.5 + item pose (entering a building) = idle fallback"),
+    [mPlayer_INDEX_HOLD] = PCFB("interior furniture grab: clip depends on furniture class (hold.c_inc:58,139-151 HOLD_WAIT1/_O1/_H1), not transmitted"),
+    /* PUSH 20 / PULL 21 (P1; m_player_main_push.c_inc:44-48, pull.c_inc:54-58): Base2(PUSH1 / PULL1 on both layers, 1, 1, 0.5, morph -5, STOP,
+     * table 0) under ct_base TRANS_XZ with base trs (0, 1000, 200): the furniture slide is the synced position, the row pins the clip root
+     * x/z (s_row_pin: mask 1, z 200). The state hands back to HOLD (P2's region) when the clip ends. */
+    [mPlayer_INDEX_PUSH] = PCROW("push", mPlayer_ANIM_PUSH1, PC_ROW_A1_SAME, PC_NORMAL, PC_STOP, 0.5f, 1.0f, PC_ROWF_ROOT_PIN, -1, -1, 0, 1.0f, PC_NETANG_RESET, PC_TEMPO_FIXED),
+    [mPlayer_INDEX_PULL] = PCROW("pull", mPlayer_ANIM_PULL1, PC_ROW_A1_SAME, PC_NORMAL, PC_STOP, 0.5f, 1.0f, PC_ROWF_ROOT_PIN, -1, -1, 0, 1.0f, PC_NETANG_RESET, PC_TEMPO_FIXED),
+    [mPlayer_INDEX_ROTATE_FURNITURE] = PCFB("interior furniture: clip by rotation kind (rotate_furniture.c_inc:58), furniture-only"),
+    [mPlayer_INDEX_OPEN_FURNITURE] = PCFB("interior furniture: KAGU_OPEN_D/H/K by furniture class + AnimationMove root motion"),
+    [mPlayer_INDEX_WAIT_OPEN_FURNITURE] = PCFB("interior furniture: KAGU_WAIT_D/H/K by furniture class (wait_open_furniture.c_inc:37), not transmitted"),
+    [mPlayer_INDEX_CLOSE_FURNITURE] = PCFB("interior furniture: KAGU_CLOSE_D/H/K by furniture class + AnimationMove root motion"),
+    [mPlayer_INDEX_LIE_BED] = PCFB("interior bed entry: AnimationMove root motion (lie_bed.c_inc, ct_base)"),
+    /* WAIT_BED 27 (m_player_main_wait_bed.c_inc:34-35): Base1 BED_WAIT1 on both layers REPEAT 0.5 morph 0, table 0. In place: the state never calls AnimationMove (the lie_bed entry that does is a fallback), settle_main resets animation_enabled via AnimationMove_dt. */
+    [mPlayer_INDEX_WAIT_BED] = PCROW_BODY("wait_bed", mPlayer_ANIM_BED_WAIT1, PC_REPEAT, PC_NETANG_RESET),
+    [mPlayer_INDEX_ROLL_BED] = PCFB("interior bed turn: AnimationMove root motion (roll_bed.c_inc, ct_base)"),
+    [mPlayer_INDEX_STANDUP_BED] = PCFB("interior bed exit: AnimationMove root motion (standup_bed.c_inc, ct_base)"),
+    [mPlayer_INDEX_PICKUP_JUMP] = PCFB("room-only (pickup_jump.c_inc:50-68: furniture/room jump pickup, morph 0, item-dependent a1)"),
+    /* PICKUP_FURNITURE 32 (P1; m_player_main_pickup_furniture.c_inc:37-47): SetupItem_Base1(PICKUP1) + Base2(PICKUP1, item pose, 1, 1, 0.5,
+     * morph 0, STOP, PART_TABLE_PICK_UP). ITEM_GET at frame 10 / GASAGOSO at 20 (:146-152) are tool-table events. The furniture item's
+     * disappearance is the room sync (not this row). */
+    [mPlayer_INDEX_PICKUP_FURNITURE] = PCROW_ITEM("pickup_furniture", mPlayer_ANIM_PICKUP1, mPlayer_PART_TABLE_PICK_UP, PC_STOP, 0, -1, PC_NETANG_RESET),
+    /* SITDOWN 34 (P1; m_player_main_sitdown.c_inc:56-64): Base2(SITDOWN1 both layers, 1, 1, 0.5, morph -3, STOP, table 0) under ct_base
+     * TRANS_XZ|ROT_Y (5): pinned (the hop onto the chair and the turn are the synced position / facing; the sender sends the true facing
+     * for every ROT_Y state). JUMP on entry, the chair SIT sound at frame 18 (:74-76; the chair's own SE is not on the wire: the default
+     * HARD_CHAIR_SIT). Then SITDOWN_WAIT (row 35). */
+    [mPlayer_INDEX_SITDOWN] = PCROW("sitdown", mPlayer_ANIM_SITDOWN1, PC_ROW_A1_SAME, PC_NORMAL, PC_STOP, 0.5f, 1.0f, PC_ROWF_ROOT_PIN, -1, -1, 0, 1.0f, PC_NETANG_RESET, PC_TEMPO_FIXED),
+    /* SITDOWN_WAIT 35 (m_player_main_sitdown_wait.c_inc:22-23): Base1 SITDOWN_WAIT1 both layers REPEAT 0.5 table 0, no AnimationMove (same reasoning as wait_bed). The chair entry/exit are root-motion fallbacks. */
+    [mPlayer_INDEX_SITDOWN_WAIT] = PCROW_BODY("sitdown_wait", mPlayer_ANIM_SITDOWN_WAIT1, PC_REPEAT, PC_NETANG_RESET),
+    /* STANDUP 36 (P1; m_player_main_standup.c_inc:31-37): Base2(STANDUP1 both layers, 1, 1, 0.5, morph -3, STOP, table 0) under ct_base
+     * TRANS_XZ (1): pinned x/z. Chair STANDUP sound on entry (default HARD_CHAIR_STANDUP), LANDING at frame 17 (:59-61). */
+    [mPlayer_INDEX_STANDUP] = PCROW("standup", mPlayer_ANIM_STANDUP1, PC_ROW_A1_SAME, PC_NORMAL, PC_STOP, 0.5f, 1.0f, PC_ROWF_ROOT_PIN, -1, -1, 0, 1.0f, PC_NETANG_RESET, PC_TEMPO_FIXED),
+    /* STOP_NET 46 (P1; m_player_main_stop_net.c_inc:11-22): binds NO body clip: keyframe0/1 speed = 0 (the swing that hit something freezes
+     * where it is: also the player-vs-player net hit), the net item clip SWING_WAIT (alias ANIM_GET_CHANGE1) from its current frame in STOP
+     * mode (SetupItem_Base2(..., -5, -1, 0)). FREEZE row: row_start keeps the running clips; REPEAT = steady, no latch. */
+    [mPlayer_INDEX_STOP_NET] = PCROW("stop_net", mPlayer_ANIM_WAIT1, PC_ROW_A1_SAME, PC_NORMAL, PC_REPEAT, 0.0f, 1.0f, PC_ROWF_FREEZE | PC_ROWF_ITEM_CARRY, -1, mPlayer_ITEM_DATA_SWING_WAIT, PC_STOP, 1.0f, PC_NETANG_ZERO, PC_TEMPO_FIXED),
+    /* NOTICE_NET 47 (worker P3; m_player_main_notice_net.c_inc:15-181): setup binds NO clip, so PULL_NET's clips keep running/holding: body GET_M1 STOP
+     * held at its end, item NET_GET_M STOP (BODY_CONTINUE + ITEM_CARRY keep the pull_net clips when that row is active; a puppet that missed PULL_NET
+     * plays GET_M1 once and holds it). The caught insect (PLAYER_ACTION kind 2 CATCH) and the ant / mosquito YAJIRUSHI are drawn by the P3 FISHING VIEW
+     * block. YATTA2 (:284-292) is only the 'completes the encyclopedia' branch, started when the player closes a message: not reproduced. */
+    [mPlayer_INDEX_NOTICE_NET] = PCROW("notice_net", mPlayer_ANIM_GET_M1, PC_ROW_A1_SAME, PC_NORMAL, PC_STOP, 0.5f, 1.0f, PC_ROWF_BODY_CONTINUE | PC_ROWF_ITEM_CARRY, -1,
+                                       mPlayer_ITEM_DATA_NET_GET_M, PC_STOP, 1.0f, PC_NETANG_ZERO, PC_TEMPO_FIXED),
+    [mPlayer_INDEX_TALK] = PCFB("talk.c_inc:34-36: WAIT1 REPEAT 0.5 + item pose = idle fallback; GAAAN1/2/BIKU1 are switched by demo orders from the talk script (:93-145), not synced"),
+    [mPlayer_INDEX_RECIEVE_WAIT] = PCFB("recieve_wait.c_inc:26-33: WAIT1 REPEAT 0.5 + item pose = idle fallback (trade handover, scripted)"),
+    [mPlayer_INDEX_RECIEVE_STRETCH] = PCFB("recieve_stretch.c_inc:35-45: clip depends on the traded item (fish GET_F1 / mail RETURN_MAIL1 / GET1) and a surface flag, not synced"),
+    [mPlayer_INDEX_RECIEVE] = PCFB("recieve.c_inc:43-45: clip depends on the traded item kind (fish/mail/other), not synced"),
+    [mPlayer_INDEX_RECIEVE_PUTAWAY] = PCFB("recieve_putaway.c_inc:42-44: clip depends on the traded item kind, not synced"),
+    [mPlayer_INDEX_GIVE] = PCFB("give.c_inc:64-73: clip depends on the traded item (TRANSFER_F1 / SEND_MAIL1 / TRANSFER1), not synced; the item actor is not reproduced"),
+    [mPlayer_INDEX_GIVE_WAIT] = PCFB("give_wait.c_inc:35-44: clip depends on the traded item (TRANS_WAIT_F1 / WAIT1 / TRANS_WAIT1), not synced"),
+    /* TAKEOUT_ITEM 72 (P1; m_player_main_takeout_item.c_inc:14-47,75-102): kind-dependent (PC_ROW_ANIM_TAKEOUT, the MOVE item_kind is the kind
+     * being taken out, player->item_kind = item_kind at setup): umbrella Base2(UMB_OPEN1, 0.5, morph -5, STOP) with item_scale 1; anything
+     * else Base3 = PUTAWAY1 REVERSED (0.5, morph 9, STOP) with item_scale 0, then at state timer 36 the carried pose clip Base1 (REPEAT,
+     * morph 9) and item_scale 0 -> 1 linearly until 54 (get_percent_forAccelBrake(t, 36, 54, 0, 0)): pc_remote_player_row_tick. GASAGOSO on
+     * entry (:46). */
+    [mPlayer_INDEX_TAKEOUT_ITEM] = PCROW("takeout_item", PC_ROW_ANIM_TAKEOUT, PC_ROW_A1_SAME, PC_NORMAL, PC_STOP, 0.5f, 1.0f, PC_ROWF_ITEM_SCALE, -1, -1, 0, 1.0f, PC_NETANG_RESET, PC_TEMPO_FIXED),
+    /* PUTIN_ITEM 73 (P1; m_player_main_putin_item.c_inc:14-57,75-89): umbrella Base2(UMB_CLOSE1, 0.5, morph -5, STOP); anything else
+     * Base2(PUTAWAY1, 0.5, morph 9, STOP) with item_scale 1 -> 0 over the first 18 frames. The kind is the one being put away (MOVE item_kind,
+     * or the puppet's last carried kind if the sender already cleared it). GASAGOSO on entry (:56). */
+    [mPlayer_INDEX_PUTIN_ITEM] = PCROW("putin_item", PC_ROW_ANIM_PUTIN, PC_ROW_A1_SAME, PC_NORMAL, PC_STOP, 0.5f, 1.0f, PC_ROWF_ITEM_SCALE, -1, -1, 0, 1.0f, PC_NETANG_RESET, PC_TEMPO_FIXED),
+    [mPlayer_INDEX_DEMO_WAIT] = PCFB("m_player_main_demo_wait.c_inc:38-40: WAIT1 REPEAT 0.5 + item pose = idle fallback (scripted demo)"),
+    [mPlayer_INDEX_DEMO_WALK] = PCFB("demo_walk.c_inc:21-41: WALK1 (or WAIT1 near the goal) REPEAT with a demo-driven tempo (CulcAnimation_Demo_walk); scripted, kept on the fallback block, which maps it to WALK1 (T3: pcarr_demo_walk_plays_walk, the sender classifies it OTHER)"),
+    /* DEMO_GETON_TRAIN 76 / DEMO_GETOFF_TRAIN 78 (P1; demo_geton_train.c_inc:18-31, demo_getoff_train.c_inc:18-31): Base2(INTRAIN1 / OUTTRAIN1
+     * both layers, 1, 1, 0.5, morph -5, STOP, NORMAL) under ct_base TRANS_XZ|TRANS_Y|ROT_Y (7). The T3 objection (the clip's root translation
+     * would be drawn on top of the synced position) is answered by the generalized root pin: all three components are pinned (s_row_pin), so
+     * the climb in / out is the MOVE-synced position and facing only. DEMO_GETON_TRAIN_WAIT 77 (demo_geton_train_wait.c_inc:11-12): Base1
+     * INTRAIN_WAIT1 REPEAT 0.5 morph -5 (no ct_base). */
+    [mPlayer_INDEX_DEMO_GETON_TRAIN] = PCROW("geton_train", mPlayer_ANIM_INTRAIN1, PC_ROW_A1_SAME, PC_NORMAL, PC_STOP, 0.5f, 1.0f, PC_ROWF_ROOT_PIN, -1, -1, 0, 1.0f, PC_NETANG_RESET, PC_TEMPO_FIXED),
+    [mPlayer_INDEX_DEMO_GETON_TRAIN_WAIT] = PCROW_BODY("geton_train_wait", mPlayer_ANIM_INTRAIN_WAIT1, PC_REPEAT, PC_NETANG_RESET),
+    [mPlayer_INDEX_DEMO_GETOFF_TRAIN] = PCROW("getoff_train", mPlayer_ANIM_OUTTRAIN1, PC_ROW_A1_SAME, PC_NORMAL, PC_STOP, 0.5f, 1.0f, PC_ROWF_ROOT_PIN, -1, -1, 0, 1.0f, PC_NETANG_RESET, PC_TEMPO_FIXED),
+    /* DEMO_STANDING_TRAIN (m_player_main_demo_standing_train.c_inc: WAIT1, forced by the ride-off demo to caboose + (60, 20, 20) every frame, ac_train1_move.c_inc:83-95). T3: HIDDEN while the state lasts (PC_ROWF_HIDE_BODY, the HIDE row's mechanism and clears: snap / gap / scene / any other state). The guest is carried by a train this process does not have (or has a few seconds off); the T4 arrival train (mTRC_pc_remote_arrival) is started from the entry of this state. */
+    [mPlayer_INDEX_DEMO_STANDING_TRAIN] = PCROW("standing_train", mPlayer_ANIM_WAIT1, PC_ROW_A1_SAME, PC_NORMAL, PC_REPEAT, 0.5f, 1.0f, PC_ROWF_HIDE_BODY, -1, -1, 0, 1.0f, PC_NETANG_RESET, PC_TEMPO_FIXED),
+    [mPlayer_INDEX_DEMO_WADE] = PCFB("demo_wade.c_inc:27-28: WAIT1 REPEAT 0.5 + item pose = idle fallback (scripted)"),
+    /* HIDE 81 (m_player_main_hide.c_inc:10-12 binds no clip; m_player.c Player_actor_draw: draw type table index 81 == mPlayer_DRAW_TYPE_NONE): the row exists only for the HIDE_BODY flag (body + item not drawn). Cleared by the usual scene/snap/gap/edge releases. */
+    [mPlayer_INDEX_HIDE] = PCROW("hide", mPlayer_ANIM_WAIT1, PC_ROW_A1_SAME, PC_NORMAL, PC_REPEAT, 0.5f, 1.0f, PC_ROWF_HIDE_BODY, -1, -1, 0, 1.0f, PC_NETANG_RESET, PC_TEMPO_FIXED),
+    [mPlayer_INDEX_GROUNDHOG] = PCFB("groundhog.c_inc:14-16: WAIT1 REPEAT 0.5 + item pose = idle fallback (New Year's event stand)"),
+    [mPlayer_INDEX_RELEASE_CREATURE] = PCFB("release_creature.c_inc:90-92: WAIT1 REPEAT 0.5 + item pose = idle fallback; the balloon/creature release is a scripted actor interaction"),
+    [mPlayer_INDEX_WASH_CAR] = PCFB("wash_car.c_inc:18-37,59-79: scripted car-wash event (position set from the car actor, WASH1..5 clips cycled by an internal counter/effect flag, speed starts 0)"),
+    /* TIRED 85 (m_player_main_tired.c_inc:11-12): Base1 TIRED1 both layers REPEAT 0.5 morph 0 table NORMAL (the frame-10 araiiki sound + dust effect are presented by the Phase 6b tool table; eye/mouth patterns are not reproduced). */
+    [mPlayer_INDEX_TIRED] = PCROW_BODY("tired", mPlayer_ANIM_TIRED1, PC_REPEAT, PC_NETANG_RESET),
+    /* ROTATE_OCTAGON 86 / THROW_MONEY 87 / PRAY 88 (P1; rotate_octagon.c_inc:32-39, throw_money.c_inc:23-30, pray.c_inc:23-30): Base2(FUKUBIKI1 /
+     * SAISEN1 / OMAIRI_US1 both layers, 1, 1, 0.5, morph -5, STOP, NORMAL) under ct_base TRANS_XZ|ROT_Y (5): pinned. THROW_MONEY: COIN_GASAGOSO
+     * at frame 9 + the COIN effect at frame 33 (:72-84) are tool-table events. The lottery drum / offering box props are not reproduced. */
+    [mPlayer_INDEX_ROTATE_OCTAGON] = PCROW("rotate_octagon", mPlayer_ANIM_FUKUBIKI1, PC_ROW_A1_SAME, PC_NORMAL, PC_STOP, 0.5f, 1.0f, PC_ROWF_ROOT_PIN, -1, -1, 0, 1.0f, PC_NETANG_RESET, PC_TEMPO_FIXED),
+    [mPlayer_INDEX_THROW_MONEY] = PCROW("throw_money", mPlayer_ANIM_SAISEN1, PC_ROW_A1_SAME, PC_NORMAL, PC_STOP, 0.5f, 1.0f, PC_ROWF_ROOT_PIN, -1, -1, 0, 1.0f, PC_NETANG_RESET, PC_TEMPO_FIXED),
+    [mPlayer_INDEX_PRAY] = PCROW("pray", mPlayer_ANIM_OMAIRI_US1, PC_ROW_A1_SAME, PC_NORMAL, PC_STOP, 0.5f, 1.0f, PC_ROWF_ROOT_PIN, -1, -1, 0, 1.0f, PC_NETANG_RESET, PC_TEMPO_FIXED),
+    /* SHAKE_TREE 89 (m_player_main_shake_tree.c_inc:33-35): SetupItem_Base1(SHAKE1) + Base2(SHAKE1, anim1 = item pose, 1, 1, 0.5, morph -5, STOP, part table from SetupItem). The tree shake itself fires at SHAKE1 frame 10 (:55, Check_AnimationFrame 10.0): Phase 4 keys the canopy effect on this row at kf0 frame 10. */
+    [mPlayer_INDEX_SHAKE_TREE] = PCROW_ITEM("shake_tree", mPlayer_ANIM_SHAKE1, PC_NORMAL, PC_STOP, PC_ROWF_PT_FROM_ANIM1, -1, PC_NETANG_RESET),
+    /* MAIL_JUMP 90 (P1; m_player_main_mail_jump.c_inc:23-35): SetupItem_Base1(CONFIRM1) (part table forced NET when not NORMAL) + Base2(CONFIRM1,
+     * item pose, 1, 1, 0.5, morph -8, STOP) under ct_base ROT_Y|TRANS_XZ (5): pinned. MAIL_LAND 91 (mail_land.c_inc:14-21): the same pose
+     * played BACKWARDS (Base3 CONFIRM1, item pose, 0.5, morph -5, STOP, part table from SetupItem): REVERSE row, no ct_base. */
+    [mPlayer_INDEX_MAIL_JUMP] = PCROW_ITEM("mail_jump", mPlayer_ANIM_CONFIRM1, PC_NORMAL, PC_STOP, PC_ROWF_PT_FROM_ANIM1 | PC_ROWF_PT_NET_IF_ITEM | PC_ROWF_ROOT_PIN, -1, PC_NETANG_RESET),
+    [mPlayer_INDEX_MAIL_LAND] = PCROW_ITEM("mail_land", mPlayer_ANIM_CONFIRM1, PC_NORMAL, PC_STOP, PC_ROWF_PT_FROM_ANIM1 | PC_ROWF_REVERSE, -1, PC_NETANG_RESET),
+    /* READY_PITFALL 92 (P1; m_player_main_ready_pitfall.c_inc:39-49,70-79): SetupItem_Base1(GURATUKU1) + Base2(GURATUKU1, item pose, 1, 1, 0.5,
+     * morph -5, STOP, table from SetupItem) under ct_base TRANS_XZ|TRANS_Y (3): pinned x/y/z. ASE2 sweat at frame 5 (draw_effect_idx, spawned at
+     * the FEEL joint), killed when the state ends (:56). FALL_PITFALL 93 (fall_pitfall.c_inc:10-35): OTIRU1 (OTIRU2 with an umbrella) both
+     * layers, 0.5, morph -5, STOP, NORMAL, ct_base 3. CLIMBUP_PITFALL 95 (climbup_pitfall.c_inc:10-48): DERU1 (DERU2 with an umbrella) both
+     * layers, speed 1.0 (not 0.5), morph -5, STOP, ct_base 3. The fall into / climb out of the hole is the synced position (y included). */
+    [mPlayer_INDEX_READY_PITFALL] = PCROW_ITEM("ready_pitfall", mPlayer_ANIM_GURATUKU1, PC_NORMAL, PC_STOP, PC_ROWF_PT_FROM_ANIM1 | PC_ROWF_ROOT_PIN, -1, PC_NETANG_RESET),
+    [mPlayer_INDEX_FALL_PITFALL] = PCROW("fall_pitfall", PC_ROW_ANIM_FALL_PITFALL, PC_ROW_A1_SAME, PC_NORMAL, PC_STOP, 0.5f, 1.0f, PC_ROWF_ROOT_PIN, -1, -1, 0, 1.0f, PC_NETANG_RESET, PC_TEMPO_FIXED),
+    /* STRUGGLE_PITFALL 94 (m_player_main_struggle_pitfall.c_inc:19-21): Base1 MOGAKU1 on BOTH layers (anim1 is NOT the item pose here), REPEAT 0.5, table NORMAL. No AnimationMove (the entry/exit pitfall states have it). The clip speed is input driven 0.5..1.0 (:34-87), not synced: 0.5 is shown. */
+    [mPlayer_INDEX_STRUGGLE_PITFALL] = PCROW_BODY("struggle_pitfall", mPlayer_ANIM_MOGAKU1, PC_REPEAT, PC_NETANG_RESET),
+    [mPlayer_INDEX_CLIMBUP_PITFALL] = PCROW("climbup_pitfall", PC_ROW_ANIM_CLIMBUP_PITFALL, PC_ROW_A1_SAME, PC_NORMAL, PC_STOP, 1.0f, 1.0f, PC_ROWF_ROOT_PIN, -1, -1, 0, 1.0f, PC_NETANG_RESET, PC_TEMPO_FIXED),
+    /* STUNG_BEE 96 (m_player_main_stung_bee.c_inc:27-29, 56-67): SetupItem_Base1(HATI1) + Base2(HATI1, item pose, 0.5, STOP, part table from SetupItem); when HATI1 has stopped the state binds HATI2 the same way (STOP, so it holds its last frame) -> chain_anim HATI2 with CHAIN_STOP. The mNpc side effect at HATI2 frame 21 (:77-82) stays local; P1: the swollen face it switches on (player_bee_swell_flag) reaches the puppets through the APPEARANCE flag (PC_NETGAME_APPEAR_FLAG_BEE_SWELL, resent on change). */
+    [mPlayer_INDEX_STUNG_BEE] = PCROW_ITEM("stung_bee", mPlayer_ANIM_HATI1, PC_NORMAL, PC_STOP, PC_ROWF_PT_FROM_ANIM1 | PC_ROWF_CHAIN_STOP, mPlayer_ANIM_HATI2, PC_NETANG_RESET),
+    /* NOTICE_BEE 97 (P1; m_player_main_notice_bee.c_inc:17-27): SetupItem_Base1(HATI3) + Base2(HATI3, item pose, 1, 1, 0.5, morph -5, STOP, table
+     * from SetupItem) under ct_base ROT_Y only (4): the clip's root ROTATION is pinned (the turn is the synced facing: ROT_Y states send
+     * shape_info.rotation.y), its root translation is drawn as authored. Face: the HATI3 clip table, then normal (blink) after the clip. */
+    [mPlayer_INDEX_NOTICE_BEE] = PCROW_ITEM("notice_bee", mPlayer_ANIM_HATI3, PC_NORMAL, PC_STOP, PC_ROWF_PT_FROM_ANIM1 | PC_ROWF_ROOT_PIN, -1, PC_NETANG_RESET),
+    /* REMOVE_GRASS 98 (m_player_main_remove_grass.c_inc:25-27): SetupItem_Base1(ZASSOU1) + Base2(ZASSOU1, item pose, 1, 1, 0.5, morph -6, STOP, PART_TABLE_PICK_UP (explicit, not the item's)). The frame-17 weed-pull presentation (grass_mud effect + zassou_nuku sound, only while the target tile still holds grass) is the Phase 6b tool table; the weed removal itself is a world change and stays host-authoritative. */
+    [mPlayer_INDEX_REMOVE_GRASS] = PCROW_ITEM("remove_grass", mPlayer_ANIM_ZASSOU1, mPlayer_PART_TABLE_PICK_UP, PC_STOP, 0, -1, PC_NETANG_RESET),
+    /* SHOCK 99 (m_player_main_shock.c_inc:19-38,84-115): WAIT1 until the request's start_time, then SetupItem_Base1(GAAAN1) + Base2(GAAAN1, item pose, 1, 1, 0.5, -5, STOP, part
+     * table from SetupItem); when GAAAN1 has stopped the state binds GAAAN2 the same way in REPEAT -> chain_anim GAAAN2. The start_time is not on the wire: the row is the
+     * start_time 0 form a player-vs-player hit requests (pc_pvp_authority.h); a bee / axe-bounce shock (start 20/24/60) just skips its short WAIT1 lead-in on the puppet. */
+    [mPlayer_INDEX_SHOCK] = PCROW_ITEM("shock", mPlayer_ANIM_GAAAN1, PC_NORMAL, PC_STOP, PC_ROWF_PT_FROM_ANIM1, mPlayer_ANIM_GAAAN2, PC_NETANG_RESET),
+    /* KNOCK_DOOR 100 (m_player_main_knock_door.c_inc:27-33): SetupItem_Base1(KNOCK1) + Base2(KNOCK1, item pose, 1, 1, 0.5, morph -5, STOP, part table from SetupItem), under ct_base ROT_Y|TRANS_XZ: the synced position is already the knock position, so ROOT_PIN. P1: the knock SE at frames 13 / 20 is a tool-table event. */
+    [mPlayer_INDEX_KNOCK_DOOR] = PCROW_ITEM("knock_door", mPlayer_ANIM_KNOCK1, PC_NORMAL, PC_STOP, PC_ROWF_PT_FROM_ANIM1 | PC_ROWF_ROOT_PIN, -1, PC_NETANG_RESET),
+    [mPlayer_INDEX_CHANGE_CLOTH] = PCFB("change_cloth.c_inc:49-62: clip/speed by try_on_flag (MENU_CHANGE1 @1.0 vs ITAZURA1 @0.5), not synced"),
+    /* PUSH_SNOWBALL 102 (m_player_main_push_snowball.c_inc:43-50): SetupItem_Base1(PUSH_YUKI1), part table from the item pose but forced to NET when anim1 != PUSH_YUKI1; Base1 REPEAT, start frames 0.0/0.0 (not 1.0), speed 0.5. Net carried angle: dummy_net table entry 102 = walk (m_player_item_net.c_inc table, 2 entries/line from index 0 at line 8 -> line 59). */
+    [mPlayer_INDEX_PUSH_SNOWBALL] = PCROW("push_snowball", mPlayer_ANIM_PUSH_YUKI1, PC_ROW_A1_ITEM, PC_NORMAL, PC_REPEAT, 0.5f, 0.0f, PC_ROWF_PT_FROM_ANIM1 | PC_ROWF_PT_NET_IF_ITEM, -1, -1, 0, 1.0f, PC_NETANG_WALK, PC_TEMPO_FIXED),
+    /* WADE_SNOWBALL 104 (P1; m_player_main_wade_snowball.c_inc:19-69): setup binds NO clip: the PUSH_YUKI1 clip of push_snowball keeps playing
+     * (BODY_CONTINUE: kept if already running, else started like push_snowball); the WAIT1 switch on a crash (:62-67) is not on the wire. */
+    [mPlayer_INDEX_WADE_SNOWBALL] = PCROW("wade_snowball", mPlayer_ANIM_PUSH_YUKI1, PC_ROW_A1_ITEM, PC_NORMAL, PC_REPEAT, 0.5f, 0.0f, PC_ROWF_BODY_CONTINUE | PC_ROWF_PT_FROM_ANIM1 | PC_ROWF_PT_NET_IF_ITEM, -1, -1, 0, 1.0f, PC_NETANG_RESET, PC_TEMPO_FIXED),
+    /* COMPLETE_PAYMENT 105 (m_player_main_complete_payment.c_inc:22-23, the #else branch: the PC build is VERSION=0 < VER_GAFU01_00, whose branch :19 would use 0.6): Base2 YATTA1 both layers STOP speed 0.5 morph 0 table NORMAL. Net carried angle table entry 105 = zero (item_net.c_inc table line 60). */
+    [mPlayer_INDEX_COMPLETE_PAYMENT] = PCROW_BODY("complete_payment", mPlayer_ANIM_YATTA1, PC_STOP, PC_NETANG_ZERO),
+    [mPlayer_INDEX_FAIL_EMU] = PCFB("fail_emu.c_inc:17-18: WAIT1 REPEAT 0.5 = idle fallback (message-driven stand)"),
+    /* STUNG_MOSQUITO 107 (m_player_main_stung_mosquito.c_inc:47-49): SetupItem_Base1(MOSQUITO1) + Base2(MOSQUITO1, item pose, 1, 1, 0.5, -5, STOP, PART_TABLE_PICK_UP (explicit)). */
+    [mPlayer_INDEX_STUNG_MOSQUITO] = PCROW_ITEM("stung_mosquito", mPlayer_ANIM_MOSQUITO1, mPlayer_PART_TABLE_PICK_UP, PC_STOP, 0, -1, PC_NETANG_RESET),
+    /* NOTICE_MOSQUITO 108 (m_player_main_notice_mosquito.c_inc:25-27): SetupItem_Base1(MOSQUITO2) + Base1 (REPEAT) MOSQUITO2, item pose on layer 1, 0.5, explicit PART_TABLE_PICK_UP. (Idle message state: the steady pose repeats until the state ends.) */
+    [mPlayer_INDEX_NOTICE_MOSQUITO] = PCROW_ITEM("notice_mosquito", mPlayer_ANIM_MOSQUITO2, mPlayer_PART_TABLE_PICK_UP, PC_REPEAT, 0, -1, PC_NETANG_RESET),
+    /* SWITCH_ON_LIGHTHOUSE 110 (P1; m_player_main_switch_on_lighthouse.c_inc:30-40): Base2(LIGHT_ON1 both layers, 1, 1, 0.5, morph +9 (holds the
+     * first frame while blending), STOP, NORMAL) under ct_base TRANS_XZ|ROT_Y (5): pinned. The lamp itself is the lighthouse actor (not synced). */
+    [mPlayer_INDEX_SWITCH_ON_LIGHTHOUSE] = PCROW("switch_on_lighthouse", mPlayer_ANIM_LIGHT_ON1, PC_ROW_A1_SAME, PC_NORMAL, PC_STOP, 0.5f, 1.0f, PC_ROWF_ROOT_PIN, -1, -1, 0, 1.0f, PC_NETANG_RESET, PC_TEMPO_FIXED),
+    [mPlayer_INDEX_RADIO_EXERCISE] = PCFB("radio_exercise.c_inc:15-65,83-130: clip chosen by the radio command and speed by the radio tempo/sound frame counter, both local audio state"),
+    [mPlayer_INDEX_DEMO_GETON_BOAT] = PCFB("scripted boat demo with AnimationMove root motion (demo_geton_boat.c_inc, ct_base)"),
+    [mPlayer_INDEX_DEMO_GETON_BOAT_SITDOWN] = PCFB("scripted boat demo: RIDE2 (demo_geton_boat_sitdown.c_inc:16-18), boat-actor coupled"),
+    [mPlayer_INDEX_DEMO_GETON_BOAT_WAIT] = PCFB("scripted boat demo: RIDEWAIT REPEAT (demo_geton_boat_wait.c_inc:15), boat-actor coupled"),
+    [mPlayer_INDEX_DEMO_GETON_BOAT_WADE] = PCFB("scripted boat demo: RIDEWAIT REPEAT (demo_geton_boat_wade.c_inc:28), boat-actor coupled"),
+    [mPlayer_INDEX_DEMO_GETOFF_BOAT_STANDUP] = PCFB("scripted boat demo with AnimationMove root motion (demo_getoff_boat_standup.c_inc, ct_base)"),
+    [mPlayer_INDEX_DEMO_GETOFF_BOAT] = PCFB("scripted boat demo with AnimationMove root motion (demo_getoff_boat.c_inc, ct_base)"),
+    [mPlayer_INDEX_DEMO_GET_GOLDEN_ITEM] = PCFB("scripted golden-tool demo: clip chosen by the tool (demo_get_golden_item.c_inc:45-53)"),
+    [mPlayer_INDEX_DEMO_GET_GOLDEN_ITEM2] = PCFB("scripted golden-tool demo (demo_get_golden_item2.c_inc)"),
+    [mPlayer_INDEX_DEMO_GET_GOLDEN_AXE_WAIT] = PCFB("demo_get_golden_axe_wait.c_inc:19-21: WAIT1 REPEAT 0.5 + item pose = idle fallback (scripted)"),
+};
+
+/* kind -> tumble clip class, copied from the vanilla tables (m_player_main_tumble.c_inc:42 / tumble_getup.c_inc:58, which
+ * are identical): 'A' = KOKERU_A1 / KOKERU_GETUP_A1 (axes 0..8, shovels 53,54, fans 71..78), 'N' = KOKERU_N1 /
+ * KOKERU_GETUP_N1 (everything else 0..78: nets, umbrellas, rods, balloons, pinwheels). Anything else (kind -1 / out of range):
+ * KOKERU1 / KOKERU_GETUP1. */
+static const char s_tumble_class[] =
+    "AAAAAAAAANNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNAANNNNNNNNNNNNNNNNAAAAAAAA";
+_Static_assert(sizeof(s_tumble_class) - 1 == mPlayer_ITEM_KIND_NUM, "tumble class table must cover every item kind");
+
+static int pc_remote_player_row_anim0(const PCStateRow* row, int raw_kind) {
+    if (row->anim0 == PC_ROW_ANIM_TUMBLE || row->anim0 == PC_ROW_ANIM_TUMBLE_GETUP) {
+        int getup = (row->anim0 == PC_ROW_ANIM_TUMBLE_GETUP);
+        if (raw_kind >= 0 && raw_kind < mPlayer_ITEM_KIND_NUM) {
+            if (s_tumble_class[raw_kind] == 'A') {
+                return getup ? mPlayer_ANIM_KOKERU_GETUP_A1 : mPlayer_ANIM_KOKERU_A1;
+            }
+            return getup ? mPlayer_ANIM_KOKERU_GETUP_N1 : mPlayer_ANIM_KOKERU_N1;
+        }
+        return getup ? mPlayer_ANIM_KOKERU_GETUP1 : mPlayer_ANIM_KOKERU1;
+    }
+    {
+        int umb = mPlayer_ITEM_IS_UMBRELLA(raw_kind) ? 1 : 0; /* catalog and custom-design umbrellas alike, as vanilla */
+
+        switch (row->anim0) {
+            case PC_ROW_ANIM_FALL_PITFALL:
+                return umb ? mPlayer_ANIM_OTIRU2 : mPlayer_ANIM_OTIRU1;
+            case PC_ROW_ANIM_CLIMBUP_PITFALL:
+                return umb ? mPlayer_ANIM_DERU2 : mPlayer_ANIM_DERU1;
+            case PC_ROW_ANIM_TAKEOUT:
+                return umb ? mPlayer_ANIM_UMB_OPEN1 : mPlayer_ANIM_PUTAWAY1;
+            case PC_ROW_ANIM_PUTIN:
+                return umb ? mPlayer_ANIM_UMB_CLOSE1 : mPlayer_ANIM_PUTAWAY1;
+            default:
+                break;
+        }
+    }
+    return row->anim0;
+}
+
+/* P1: 1 = the row plays its clip backwards (vanilla Base3): the REVERSE rows, and take-out of anything but an umbrella
+ * (takeout_item.c_inc:40). */
+static int pc_remote_player_row_reverse(const PCStateRow* row, int raw_kind) {
+    if (row->flags & PC_ROWF_REVERSE) {
+        return 1;
+    }
+    return row->anim0 == PC_ROW_ANIM_TAKEOUT && !mPlayer_ITEM_IS_UMBRELLA(raw_kind);
+}
+
+/* P1: the morph_counter the vanilla setup of `idx` passes (s_row_morph; take-out / put-in: umbrella -5, else +9). */
+static f32 pc_remote_player_row_morph(int idx, const PCStateRow* row, int raw_kind) {
+    if (row->anim0 == PC_ROW_ANIM_TAKEOUT || row->anim0 == PC_ROW_ANIM_PUTIN) {
+        return mPlayer_ITEM_IS_UMBRELLA(raw_kind) ? -5.0f : 9.0f;
+    }
+    if (idx <= 0 || idx >= mPlayer_INDEX_NUM) {
+        return 0.0f;
+    }
+    return (f32)s_row_morph[idx];
+}
+
+/* The row of a wire main index, or NULL (fallback). Index 0 (DMA) and out-of-range never have a row. */
+static const PCStateRow* pc_remote_player_row_for(int idx) {
+    if (idx <= 0 || idx >= mPlayer_INDEX_NUM || s_state_rows[idx].name == NULL) {
+        return NULL;
+    }
+    return &s_state_rows[idx];
+}
+
+/* Building interactions: the puppet's body (and carried item) is not drawn and spawns no effects/sounds: the HIDE_BODY row
+ * (hide / standing_train) or the walked-in door state (v->hidden_door, set when a HIDE_AT_END row ended). */
+static int pc_remote_player_body_hidden(const PCRemotePlayerActor* self) {
+    const PCRemotePlayerVisual* v = &self->visual;
+
+    if (v->hidden_door) {
+        return 1;
+    }
+    if (v->row_active) {
+        const PCStateRow* hrow = pc_remote_player_row_for(v->row_idx);
+        if (hrow != NULL && (hrow->flags & PC_ROWF_HIDE_BODY)) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+/* Catalog umbrella display lists: the same {handle, canopy} pairs ac_t_umbrella.c's draw_dt[] and the inventory
+ * preview use, indexed by (kind - mPlayer_ITEM_KIND_UMBRELLA00) == tool_name. */
+extern Gfx e_umb01_model[];
+extern Gfx kasa_umb01_model[];
+extern Gfx e_umb02_model[];
+extern Gfx kasa_umb02_model[];
+extern Gfx e_umb03_model[];
+extern Gfx kasa_umb03_model[];
+extern Gfx e_umb04_model[];
+extern Gfx kasa_umb04_model[];
+extern Gfx e_umb05_model[];
+extern Gfx kasa_umb05_model[];
+extern Gfx e_umb06_model[];
+extern Gfx kasa_umb06_model[];
+extern Gfx e_umb07_model[];
+extern Gfx kasa_umb07_model[];
+extern Gfx e_umb08_model[];
+extern Gfx kasa_umb08_model[];
+extern Gfx e_umb09_model[];
+extern Gfx kasa_umb09_model[];
+extern Gfx e_umb10_model[];
+extern Gfx kasa_umb10_model[];
+extern Gfx e_umb11_model[];
+extern Gfx kasa_umb11_model[];
+extern Gfx e_umb12_model[];
+extern Gfx kasa_umb12_model[];
+extern Gfx e_umb13_model[];
+extern Gfx kasa_umb13_model[];
+extern Gfx e_umb14_model[];
+extern Gfx kasa_umb14_model[];
+extern Gfx e_umb15_model[];
+extern Gfx kasa_umb15_model[];
+extern Gfx e_umb16_model[];
+extern Gfx kasa_umb16_model[];
+extern Gfx e_umb17_model[];
+extern Gfx kasa_umb17_model[];
+extern Gfx e_umb18_model[];
+extern Gfx kasa_umb18_model[];
+extern Gfx e_umb19_model[];
+extern Gfx kasa_umb19_model[];
+extern Gfx e_umb20_model[];
+extern Gfx kasa_umb20_model[];
+extern Gfx e_umb21_model[];
+extern Gfx kasa_umb21_model[];
+extern Gfx e_umb22_model[];
+extern Gfx kasa_umb22_model[];
+extern Gfx e_umb23_model[];
+extern Gfx kasa_umb23_model[];
+extern Gfx e_umb24_model[];
+extern Gfx kasa_umb24_model[];
+extern Gfx e_umb25_model[];
+extern Gfx kasa_umb25_model[];
+extern Gfx e_umb26_model[];
+extern Gfx kasa_umb26_model[];
+extern Gfx e_umb27_model[];
+extern Gfx kasa_umb27_model[];
+extern Gfx e_umb28_model[];
+extern Gfx kasa_umb28_model[];
+extern Gfx e_umb29_model[];
+extern Gfx kasa_umb29_model[];
+extern Gfx e_umb30_model[];
+extern Gfx kasa_umb30_model[];
+extern Gfx e_umb31_model[];
+extern Gfx kasa_umb31_model[];
+extern Gfx e_umb32_model[];
+extern Gfx kasa_umb32_model[];
+typedef struct PCRemoteUmbrellaModel {
+    Gfx* model_e;
+    Gfx* model_kasa;
+} PCRemoteUmbrellaModel;
+
+static const PCRemoteUmbrellaModel s_remote_umbrella_models[32] = {
+    { e_umb01_model, kasa_umb01_model },
+    { e_umb02_model, kasa_umb02_model },
+    { e_umb03_model, kasa_umb03_model },
+    { e_umb04_model, kasa_umb04_model },
+    { e_umb05_model, kasa_umb05_model },
+    { e_umb06_model, kasa_umb06_model },
+    { e_umb07_model, kasa_umb07_model },
+    { e_umb08_model, kasa_umb08_model },
+    { e_umb09_model, kasa_umb09_model },
+    { e_umb10_model, kasa_umb10_model },
+    { e_umb11_model, kasa_umb11_model },
+    { e_umb12_model, kasa_umb12_model },
+    { e_umb13_model, kasa_umb13_model },
+    { e_umb14_model, kasa_umb14_model },
+    { e_umb15_model, kasa_umb15_model },
+    { e_umb16_model, kasa_umb16_model },
+    { e_umb17_model, kasa_umb17_model },
+    { e_umb18_model, kasa_umb18_model },
+    { e_umb19_model, kasa_umb19_model },
+    { e_umb20_model, kasa_umb20_model },
+    { e_umb21_model, kasa_umb21_model },
+    { e_umb22_model, kasa_umb22_model },
+    { e_umb23_model, kasa_umb23_model },
+    { e_umb24_model, kasa_umb24_model },
+    { e_umb25_model, kasa_umb25_model },
+    { e_umb26_model, kasa_umb26_model },
+    { e_umb27_model, kasa_umb27_model },
+    { e_umb28_model, kasa_umb28_model },
+    { e_umb29_model, kasa_umb29_model },
+    { e_umb30_model, kasa_umb30_model },
+    { e_umb31_model, kasa_umb31_model },
+    { e_umb32_model, kasa_umb32_model },
+};
+
+#define PC_NET_ANGLE_FRAC 0.2f
+
+static void pc_remote_player_net_angle_step(s_xyz* angle, const s_xyz* base) {
+    /* identical to Player_actor_Item_net_CulcJointAngle_dummy_net_base(angle, base, 2730, 100, 0.2f) */
+    f32 frac = 1.0f - sqrtf(1.0f - PC_NET_ANGLE_FRAC);
+    add_calc_short_angle2(&angle->x, base->x, frac, 2730 >> 1, 100 >> 1);
+    add_calc_short_angle2(&angle->y, base->y, frac, 2730 >> 1, 100 >> 1);
+    add_calc_short_angle2(&angle->z, base->z, frac, 2730 >> 1, 100 >> 1);
+}
+
+/* Per-frame net carried angle from the puppet's (interpolated) move state; mirrors m_player_item_net.c_inc:
+ * dummy_net_reset (idle), dummy_net_walk (walk/run/dash, blended by keyframe0's playback speed exactly like
+ * dummy_net_common minus the turn-rate term) and dummy_net_turn (skid). */
+static void pc_remote_player_net_angle_update(PCRemotePlayerActor* self) {
+    static const s_xyz reset_angle = { 0, 182, -7281 };
+    s_xyz base;
+    const PCStateRow* row = self->visual.row_active ? pc_remote_player_row_for(self->visual.row_idx) : NULL;
+    int row_mode = (row != NULL) ? (int)row->net_angle : PC_NETANG_DEFAULT;
+
+    /* M9-C Phase 2a: a state row selects the vanilla per-main-index branch of the dummy_net table (m_player_item_net.c_inc:
+     * 125): reset / ready (0,364,-11832) / ready_walk (tempo blend) / slip (z -65deg) / swing (ready until frame 5, then
+     * zero) / zero. DEFAULT keeps the Phase 1 move-state mapping below. */
+    if (row_mode != PC_NETANG_DEFAULT) {
+        switch (row_mode) {
+            case PC_NETANG_READY:
+                base.x = 0; base.y = 364; base.z = -11832;
+                break;
+            case PC_NETANG_SLIP:
+                base.x = 0; base.y = 0; base.z = (s16)(int)DEG2SHORT_ANGLE3(-65.0f);
+                break;
+            case PC_NETANG_SWING:
+                if (self->visual.keyframe0.frame_control.current_frame >= 5.0f) {
+                    base.x = 0; base.y = 0; base.z = 0;
+                } else {
+                    base.x = 0; base.y = 364; base.z = -11832;
+                }
+                break;
+            case PC_NETANG_READY_WALK: {
+                f32 sp = (self->visual.keyframe0.frame_control.speed - 0.22f) / 0.37999996f;
+                f32 start_y = DEG2SHORT_ANGLE3(2.0f);
+                f32 start_z = DEG2SHORT_ANGLE3(-65.0f);
+                if (sp > 1.0f) {
+                    sp = 1.0f;
+                } else if (sp < 0.0f) {
+                    sp = 0.0f;
+                }
+                base.x = 0;
+                base.y = (s16)(int)(start_y + (sp * (0.0f - start_y)));
+                base.z = (s16)(int)(start_z + (sp * (0.0f - start_z)));
+                break;
+            }
+            case PC_NETANG_ZERO:
+                base.x = 0; base.y = 0; base.z = 0;
+                break;
+            case PC_NETANG_WALK: { /* dummy_net_walk (push_snowball): the Phase 1 walk blend by keyframe0's tempo */
+                f32 sp = (self->visual.keyframe0.frame_control.speed - 0.22f) / 0.37999996f;
+                f32 start_y = DEG2SHORT_ANGLE3(1.0f);
+                f32 start_z = DEG2SHORT_ANGLE3(-40.0f);
+                if (sp > 1.0f) {
+                    sp = 1.0f;
+                } else if (sp < 0.0f) {
+                    sp = 0.0f;
+                }
+                base.x = 0;
+                base.y = (s16)(int)(start_y + (sp * (0.0f - start_y)));
+                base.z = (s16)(int)(start_z + (sp * (0.0f - start_z)));
+                break;
+            }
+            default: /* PC_NETANG_RESET */
+                base = reset_angle;
+                break;
+        }
+        pc_remote_player_net_angle_step(&self->visual.net_angle, &base);
+        return;
+    }
+
+    switch (self->cosmetic_move_state) {
+        case PC_MOVE_STATE_WALK:
+        case PC_MOVE_STATE_RUN:
+        case PC_MOVE_STATE_DASH: {
+            f32 sp = (self->visual.keyframe0.frame_control.speed - 0.22f) / 0.37999996f;
+            f32 start_y = DEG2SHORT_ANGLE3(1.0f);
+            f32 start_z = DEG2SHORT_ANGLE3(-40.0f);
+            if (sp > 1.0f) {
+                sp = 1.0f;
+            } else if (sp < 0.0f) {
+                sp = 0.0f;
+            }
+            base.x = 0;
+            base.y = (s16)(int)(start_y + (sp * (0.0f - start_y)));
+            base.z = (s16)(int)(start_z + (sp * (0.0f - start_z)));
+            break;
+        }
+        case PC_MOVE_STATE_TURN_DASH:
+            base.x = 0;
+            base.y = (s16)(int)DEG2SHORT_ANGLE3(-25.0f);
+            base.z = (s16)(int)DEG2SHORT_ANGLE3(-25.0f);
+            break;
+        default:
+            base = reset_angle;
+            break;
+    }
+    pc_remote_player_net_angle_step(&self->visual.net_angle, &base);
+}
+
+/* (Re)builds the puppet-owned net/rod skeleton instance for `kind`. Mirrors Player_actor_Item_DMA_Data():
+ * ct against the item skeleton with the puppet's own joint/morph work buffers, then a repeating item clip at 0.5x
+ * (kamae_main_m for nets; ROD_WAIT for the idle SetupItem_Base1 and ROD_MOVE for the walk/run/dash
+ * SetupItem_Base3 for rods). On any missing pointer item_ready stays 0 and nothing is drawn. */
+static void pc_remote_player_item_skeleton_setup(PCRemotePlayerVisual* v, int kind, int cls, int moving) {
+    int shape = mPlib_Get_BasicItemShapeIndex_fromItemKind(kind);
+    cKF_Skeleton_R_c* skl = (cKF_Skeleton_R_c*)mPlib_Get_Item_DataPointer(shape);
+    int anim_idx;
+    cKF_Animation_R_c* anim;
+
+    v->item_ready = 0;
+    if (cls == PC_HELD_NET) {
+        anim_idx = mPlayer_ITEM_DATA_KAMAE_MAIN_M;
+    } else if (cls == PC_HELD_BALLOON || cls == PC_HELD_WINDMILL) {
+        /* P1: Player_actor_LoadOrDestruct_Item(kind, mPlib_Get_BasicItemAnimeIndex_fromItemKind(kind), ...) of the take-out */
+        anim_idx = mPlib_Get_BasicItemAnimeIndex_fromItemKind(kind);
+    } else {
+        anim_idx = moving ? mPlayer_ITEM_DATA_ROD_MOVE : mPlayer_ITEM_DATA_ROD_WAIT;
+    }
+    anim = (anim_idx >= 0) ? (cKF_Animation_R_c*)mPlib_Get_Item_DataPointer(anim_idx) : NULL;
+    if (skl == NULL || anim == NULL || mPlib_Get_Item_DataPointerType(shape) == mPlayer_ITEM_DATA_TYPE_GFX ||
+        skl->num_joints + 1 > (int)(sizeof(v->item_joint_data) / sizeof(v->item_joint_data[0]))) {
+        return;
+    }
+    memset(v->item_joint_data, 0, sizeof(v->item_joint_data));
+    memset(v->item_morph_data, 0, sizeof(v->item_morph_data));
+    cKF_SkeletonInfo_R_ct(&v->item_keyframe, skl, NULL, v->item_joint_data, v->item_morph_data);
+    cKF_SkeletonInfo_R_init_standard_setframeandspeedandmorphandmode(&v->item_keyframe, anim, NULL, 1.0f, 0.5f, 0.0f,
+                                                                     cKF_FRAMECONTROL_REPEAT);
+    v->item_anim_idx = anim_idx;
+    v->net_angle.x = 0;
+    v->net_angle.y = 182;
+    v->net_angle.z = -7281;
+    if (cls == PC_HELD_BALLOON) {
+        /* Player_actor_Item_Setup_main_balloon_normal (m_player_item_balloon.c_inc:5-22), a fresh balloon: the clip parked on its last
+         * frame, speed 0, lean / sway zero, add_rot_z 30, the first move skips the hand-driven sway (stop flag). */
+        v->item_keyframe.frame_control.current_frame = v->item_keyframe.frame_control.max_frames;
+        v->item_keyframe.frame_control.speed = 0.0f;
+        v->bal_speed = 0.0f;
+        v->bal_add_rot_z = 30.0f;
+        v->bal_add_rot_x = 0;
+        v->bal_counter = 0;
+        v->bal_angle.x = v->bal_angle.y = v->bal_angle.z = 0;
+        v->bal_stop = 1;
+    } else if (cls == PC_HELD_WINDMILL) {
+        /* Player_actor_SetupItem_Base_windmill of a new kind: SetupItem_Base0(speed 0, frame 1) */
+        v->item_keyframe.frame_control.current_frame = 1.0f;
+        v->item_keyframe.frame_control.speed = 0.0f;
+        v->wm_pos_valid = 0;
+    }
+    v->toy_hand_valid = 0;
+    v->item_ready = 1;
+}
+
+/* Puppet-owned cKF_Si3_draw_R_SV after-callback (signature = cKF_draw_callback). `arg` is ALWAYS the
+ * PCRemotePlayerActor passed by pc_remote_player_dw(); it is never cast to PLAYER_ACTOR. Phase 3 also captures the
+ * left/right foot (joints LFOOT3/RFOOT3) position + angle. Captures the world matrix
+ * of the right-hand joint (mPlayer_JOINT_HAND == 20, the joint the vanilla Player_actor_draw_After_hand,
+ * m_player_draw.c_inc, and mIV_pl_shape_after_draw, m_inventory_ovl.c, both use) into the puppet's own MtxF. */
+static int pc_remote_player_draw_after(GAME* game, cKF_SkeletonInfo_R_c* kf, int joint_no, Gfx** gfx_pp, u8* work_flag,
+                                       void* arg, s_xyz* rot, xyz_t* pos) {
+    PCRemotePlayerActor* self = (PCRemotePlayerActor*)arg;
+
+    if (joint_no == mPlayer_JOINT_HAND && self != NULL) {
+        Matrix_get(&self->hand_mtx);
+        self->hand_mtx_valid = 1;
+    } else if (joint_no == mPlayer_JOINT_LARM2 && self != NULL) {
+        /* M9-C Phase 5: Player_actor_draw_After_Larm2 (m_player_draw.c_inc:95) left_hand_pos, into this puppet's storage. */
+        Matrix_Position_VecX(1100.0f, &self->cos.hand_pos);
+        self->cos.hand_frame = game->frame_counter + 1u;
+    } else if (joint_no == mPlayer_JOINT_FEEL && self != NULL) {
+        /* M9-C Phase 6b: Player_actor_draw_After_feel (m_player_draw.c_inc:106) feel_pos = Matrix_Position_Zero, into this
+         * puppet's storage only. The vanilla body (draw_effect_idx effect, wash-car effect) is NOT run: the puppet spawns
+         * those effects itself from its move (pc_puppet_tool_tick), budgeted. */
+        Matrix_Position_Zero(&self->cos.feel_pos);
+        self->cos.feel_frame = game->frame_counter + 1u;
+    } else if ((joint_no == mPlayer_JOINT_LFOOT3 || joint_no == mPlayer_JOINT_RFOOT3) && self != NULL) {
+        /* M9-C Phase 3: same conversion as Player_actor_draw_After_{L,R}foot3 -> Player_actor_draw_After_Culc_FootMarkPos
+         * (m_player_draw.c_inc:60-78,99-104), but into this puppet's own storage. */
+        int fi = (joint_no == mPlayer_JOINT_RFOOT3) ? 1 : 0;
+        s_xyz frot;
+
+        Matrix_Position_Zero(&self->cos.foot_pos[fi]);
+        Matrix_to_rotate_new(get_Matrix_now(), &frot, MTX_LOAD);
+        self->cos.foot_angle_y[fi] = frot.y;
+        self->cos.foot_frame[fi] = game->frame_counter + 1u;
+    }
+    return TRUE;
+}
+
+/* Net skeleton after-callback: joint 3 gets the carried angle (Player_actor_Item_draw_net_After_dummy_net). */
+static int pc_remote_player_item_net_after(GAME* game, cKF_SkeletonInfo_R_c* kf, int joint_no, Gfx** gfx_pp,
+                                           u8* work_flag, void* arg, s_xyz* rot, xyz_t* pos) {
+    PCRemotePlayerActor* self = (PCRemotePlayerActor*)arg;
+
+    if (joint_no == 3 && self != NULL) {
+        Matrix_rotateXYZ(self->visual.net_angle.x, self->visual.net_angle.y, self->visual.net_angle.z, MTX_MULT);
+    }
+    return TRUE;
+}
+
+/* ---- P1: held toys (balloons, pinwheels). Puppet-owned ports of m_player_item_balloon.c_inc / m_player_item_windmill.c_inc: they
+ * read only this puppet's own visual state, its own hand position (captured by its own draw) and the global wind (mEnv, read-only).
+ * Not reproduced: the pinwheel's whirr (sAdo_kazagurumaLevel is ONE global level owned by the local player's pinwheel), the
+ * balloon's player-lean coupling (the puppet has no lean: 0), the wade exception of the pinwheel spin. ---- */
+
+/* Once per puppet move (vanilla: CulcAnimation_balloon_normal in the item main + Movement/PlayAnimation_balloon_normal in the draw). */
+static void pc_remote_player_toy_tick(PCRemotePlayerActor* self) {
+    PCRemotePlayerVisual* v = &self->visual;
+    cKF_FrameControl_c* fc = &v->item_keyframe.frame_control;
+    ACTOR* actor = &self->actor_class;
+
+    if (v->held_class == PC_HELD_BALLOON) {
+        f32 max = fc->max_frames;
+        f32 cur = fc->current_frame + v->bal_speed; /* CulcAnimation_balloon_normal (:30-47) */
+
+        if (max <= 1.0f) {
+            return;
+        }
+        if (cur > max) {
+            cur = max;
+        } else if (cur < 0.5f * max) {
+            cur = 0.5f * max;
+        }
+        if (!v->item_scale_on || v->item_scale == 1.0f) { /* Movement_balloon_normal (:49-157) */
+            f32 speed = (26.0f * (cur - 1.0f)) / (max - 1.0f);
+            f32 pos_y = 0.0f;
+
+            if (!v->bal_stop && v->toy_hand_valid) {
+                s16 rot = actor->shape_info.rotation.y;
+                f32 s = sin_s(rot);
+                f32 c = cos_s(rot);
+                xyz_t rhm = v->toy_hand_move;
+                f32 side = (s * rhm.x) + (c * rhm.z);
+                f32 add_z_f;
+                int add_z;
+                s16 target;
+                s16 tz = (s16)(-1200.0f * side);
+
+                pos_y -= rhm.y;                               /* cos(lean 0) */
+                pos_y -= side * cos_s(DEG2SHORT_ANGLE2(90.0f)); /* cos(90 - lean) */
+                add_z_f = v->bal_add_rot_z - (0.0014f * v->bal_angle.z);
+                add_z = v->bal_angle.z + (int)add_z_f;
+                if (add_z > 0x800) {
+                    add_z = 0x800;
+                } else if (add_z < -0x800) {
+                    add_z = -0x800;
+                }
+                v->bal_angle.z = (s16)add_z;
+                v->bal_add_rot_z = add_z_f;
+                if (ABS(tz) - ABS(v->bal_angle.x) < 0) {
+                    add_calc_short_angle2(&v->bal_angle.x, tz, 1.0f - sqrtf(0.9f), 2500, 0);
+                } else {
+                    add_calc_short_angle2(&v->bal_angle.x, tz, 1.0f - sqrtf(0.6f), 2500, 0);
+                }
+                if (self->cosmetic_move_state == PC_MOVE_STATE_WALK || self->cosmetic_move_state == PC_MOVE_STATE_RUN) {
+                    v->bal_counter += (s16)(400.0f * self->cosmetic_speed);
+                    target = (s16)(1000.0f * sin_s(v->bal_counter));
+                } else {
+                    target = 0;
+                }
+                add_calc_short_angle2(&v->bal_add_rot_x, target, 1.0f - sqrtf(0.6f), 2500, 0);
+            }
+            speed += pos_y;
+            if (speed < 13.0f) {
+                speed = 13.0f;
+            } else if (speed > 26.0f) {
+                speed = 26.0f;
+            }
+            cur = 1.0f + ((speed * (max - 1.0f)) / 26.0f);
+        } else {
+            v->bal_angle.z = 0;
+        }
+        if (cur >= max) {
+            v->bal_speed = -0.085f;
+        } else if (v->bal_speed <= 0.0f && cur <= 0.7f * max) {
+            v->bal_speed = 0.0f;
+        } else {
+            v->bal_speed += 0.0039585f;
+        }
+        v->bal_stop = 0;
+        fc->current_frame = cur; /* PlayAnimation_balloon_normal: the pose of exactly this frame */
+        fc->speed = 0.0f;
+        cKF_SkeletonInfo_R_play(&v->item_keyframe);
+    } else if (v->held_class == PC_HELD_WINDMILL) {
+        f32 dist = 0.0f;
+        s16 param_x = 0, param_y = 0;
+        f32 target = 0.0f;
+        f32 power;
+        f32 speed;
+        f32 fracmv, minm, maxm;
+        int moving;
+
+        if (v->wm_pos_valid) { /* windmill_CulcParam (:1-33): the fan joint's travel between the last two draws */
+            f32 dx = v->wm_end_pos.x - v->wm_start_pos.x;
+            f32 dy = v->wm_end_pos.y - v->wm_start_pos.y;
+            f32 dz = v->wm_end_pos.z - v->wm_start_pos.z;
+
+            if (dx != 0.0f || dy != 0.0f || dz != 0.0f) {
+                f32 len = (dx * dx) + (dz * dz);
+
+                dist = sqrtf(len + (dy * dy));
+                param_x = atans_table(sqrtf(len), dy);
+                param_y = atans_table(dz, dx);
+            }
+        }
+        moving = (actor->world.position.x != v->toy_last_wpos.x || actor->world.position.y != v->toy_last_wpos.y ||
+                  actor->world.position.z != v->toy_last_wpos.z);
+        if (moving && dist != 0.0f) { /* windmill_CulcRotationSpeed (:34-100) */
+            s16 y_diff = (s16)(param_y - v->wm_angle.y);
+            s16 x_diff = (s16)(param_x - v->wm_angle.x);
+            f32 cx = cos_s(x_diff);
+
+            target += 8.0f * (dist * ((cx < 0.0f ? -cx : cx) * cos_s(y_diff)));
+        }
+        power = mEnv_GetWindPowerF_Windmill();
+        if (power != 0.0f) {
+            s16 ty = (s16)((s16)mEnv_GetWindAngleS() - v->wm_angle.y);
+            s16 tx = (s16)(0 - v->wm_angle.x);
+            f32 cx = cos_s(tx);
+            f32 targetm = 10.0f * (power * (cos_s(ty) * (cx < 0.0f ? -cx : cx)));
+
+            if (target * targetm >= 0.0f) {
+                target += targetm;
+            }
+        }
+        fracmv = 0.005f * target;
+        minm = 0.005f * target;
+        maxm = 0.03f * target;
+        fracmv = (fracmv < 0.0f ? -fracmv : fracmv) + 0.02f;
+        minm = (minm < 0.0f ? -minm : minm) + 0.1f;
+        maxm = (maxm < 0.0f ? -maxm : maxm) + 0.3f;
+        speed = fc->speed;
+        add_calc(&speed, target, 1.0f - sqrtf(1.0f - fracmv), maxm * 0.5f, minm * 0.5f);
+        fc->speed = speed;
+        cKF_SkeletonInfo_R_play(&v->item_keyframe); /* Player_actor_Item_CulcAnimation_Base */
+        v->toy_last_wpos = actor->world.position;
+    }
+}
+
+/* Player_actor_Item_draw_balloon_Before / _After (m_player_item_balloon.c_inc:190-231): tex edge alpha 80 for joints 1..3, back to 144. */
+static int pc_remote_player_balloon_before(GAME* game, cKF_SkeletonInfo_R_c* kf, int joint_no, Gfx** gfx_pp, u8* work_flag, void* arg,
+                                           s_xyz* rot, xyz_t* pos) {
+    if (joint_no >= 1 && joint_no <= 3) {
+        OPEN_POLY_OPA_DISP(game->graph);
+        gDPPipeSync(POLY_OPA_DISP++);
+        gDPSetTexEdgeAlpha(POLY_OPA_DISP++, 80);
+        CLOSE_POLY_OPA_DISP(game->graph);
+    }
+    return TRUE;
+}
+
+static int pc_remote_player_balloon_after(GAME* game, cKF_SkeletonInfo_R_c* kf, int joint_no, Gfx** gfx_pp, u8* work_flag, void* arg,
+                                          s_xyz* rot, xyz_t* pos) {
+    if (joint_no >= 1 && joint_no <= 3) {
+        OPEN_POLY_OPA_DISP(game->graph);
+        gDPPipeSync(POLY_OPA_DISP++);
+        gDPSetTexEdgeAlpha(POLY_OPA_DISP++, 144);
+        CLOSE_POLY_OPA_DISP(game->graph);
+    }
+    return TRUE;
+}
+
+/* Player_actor_Item_draw_windmill_After_kaza1_fan (m_player_item_windmill.c_inc:111-126), joint 2, into this puppet only. */
+static int pc_remote_player_windmill_after(GAME* game, cKF_SkeletonInfo_R_c* kf, int joint_no, Gfx** gfx_pp, u8* work_flag, void* arg,
+                                           s_xyz* rot, xyz_t* pos) {
+    PCRemotePlayerActor* self = (PCRemotePlayerActor*)arg;
+
+    if (joint_no == 2 && self != NULL) {
+        PCRemotePlayerVisual* v = &self->visual;
+
+        v->wm_start_pos = v->wm_end_pos;
+        Matrix_Position_Zero(&v->wm_end_pos);
+        Matrix_to_rotate_new(get_Matrix_now(), &v->wm_angle, MTX_LOAD);
+        v->wm_angle.x *= -1;
+        v->wm_angle.y += 0x8000;
+    }
+    return TRUE;
+}
+
+/* Draws a balloon (Player_actor_Item_draw_balloon :232-285) or a pinwheel (Player_actor_Item_draw_windmill :149-181). The caller has
+ * pushed and put the hand matrix (scaled by item_scale like Player_actor_Item_draw) and loaded it into the display list. */
+static void pc_remote_player_draw_toy(PCRemotePlayerActor* self, GAME* game, int cls, f32 scale) {
+    GRAPH* graph = game->graph;
+    PCRemotePlayerVisual* v = &self->visual;
+    Mtx* item_mtx;
+
+    if (!v->item_ready || v->item_keyframe.skeleton == NULL) {
+        return;
+    }
+    item_mtx = (Mtx*)GRAPH_ALLOC_TYPE(graph, Mtx, v->item_keyframe.skeleton->num_shown_joints);
+    if (item_mtx == NULL) {
+        return;
+    }
+    if (cls == PC_HELD_BALLOON) {
+        ACTOR* actor = &self->actor_class;
+        s16 angle = (s16)(DEG2SHORT_ANGLE2(-90.0f) + v->bal_angle.x + v->bal_add_rot_x); /* + balloon_lean_angle (0) */
+        Mtx* m;
+
+        Matrix_push();
+        Matrix_translate(v->toy_hand_pos.x, v->toy_hand_pos.y, v->toy_hand_pos.z, MTX_LOAD);
+        Matrix_RotateY(actor->shape_info.rotation.y, MTX_MULT);
+        Matrix_RotateX(angle, MTX_MULT);
+        Matrix_RotateZ(0x4000, MTX_MULT);
+        Matrix_RotateX(v->bal_angle.z, MTX_MULT);
+        Matrix_scale(actor->scale.x * scale, actor->scale.y * scale, actor->scale.z * scale, MTX_MULT);
+        m = _Matrix_to_Mtx_new(graph);
+        if (m != NULL) {
+            OPEN_POLY_OPA_DISP(graph);
+            gSPMatrix(POLY_OPA_DISP++, m, G_MTX_NOPUSH | G_MTX_LOAD | G_MTX_MODELVIEW);
+            CLOSE_POLY_OPA_DISP(graph);
+            Setpos_HiliteReflect_init(&v->toy_hand_pos, (GAME_PLAY*)game);
+            cKF_Si3_draw_R_SV(game, &v->item_keyframe, item_mtx, pc_remote_player_balloon_before, pc_remote_player_balloon_after, self);
+        }
+        Matrix_pull();
+    } else {
+        Mtx* m;
+
+        Matrix_push();
+        Matrix_RotateY(0, MTX_MULT); /* -0.5 * shape_info.rotation.x: the puppet has no lean */
+        m = _Matrix_to_Mtx_new(graph);
+        if (m != NULL) {
+            OPEN_POLY_OPA_DISP(graph);
+            gSPMatrix(POLY_OPA_DISP++, m, G_MTX_NOPUSH | G_MTX_LOAD | G_MTX_MODELVIEW);
+            CLOSE_POLY_OPA_DISP(graph);
+            cKF_Si3_draw_R_SV(game, &v->item_keyframe, item_mtx, NULL, pc_remote_player_windmill_after, self);
+            if (!v->wm_pos_valid) {
+                v->wm_start_pos = v->wm_end_pos; /* balloon_start_pos_set_flag: the first draw has no travel */
+                v->wm_pos_valid = 1;
+            }
+        }
+        Matrix_pull();
+    }
+}
+
+/* Draws the carried item at the captured hand matrix. Structure follows Player_actor_Item_draw()
+ * (m_player_item.c_inc): Matrix_push / Matrix_put(hand) / _Matrix_to_Mtx_new / _texture_z_light_fog_prim /
+ * gSPMatrix, then the per-kind draw (item_scale is 1.0 outside take-out/put-away, so no scale is applied). */
+static void pc_remote_player_draw_item(PCRemotePlayerActor* self, GAME* game) {
+    GRAPH* graph = game->graph;
+    PCRemotePlayerVisual* v = &self->visual;
+    int kind = v->held_kind;
+    int cls = v->held_class;
+    Mtx* mtx;
+
+    if (cls == PC_HELD_NONE || cls == PC_HELD_DEFERRED || !self->hand_mtx_valid || v->item_hidden) {
+        return;
+    }
+
+    if (cls != PC_HELD_UMBRELLA && v->item_scale_on && v->item_scale <= 0.0f) {
+        return; /* P1: take-out before timer 36 / put-in after 18 frames: vanilla draws the item at scale 0 (invisible) */
+    }
+    Matrix_push();
+    Matrix_put(&self->hand_mtx);
+    if (cls == PC_HELD_BALLOON || cls == PC_HELD_WINDMILL) {
+        /* P1: right_hand_pos / right_hand_move (m_player_draw.c_inc:131-136), this puppet's own hand */
+        xyz_t hp;
+
+        Matrix_Position_Zero(&hp);
+        if (v->toy_hand_valid) {
+            v->toy_hand_move.x = hp.x - v->toy_hand_pos.x;
+            v->toy_hand_move.y = hp.y - v->toy_hand_pos.y;
+            v->toy_hand_move.z = hp.z - v->toy_hand_pos.z;
+        } else {
+            v->toy_hand_move.x = v->toy_hand_move.y = v->toy_hand_move.z = 0.0f;
+        }
+        v->toy_hand_pos = hp;
+        v->toy_hand_valid = 1;
+    }
+    if (cls != PC_HELD_UMBRELLA && v->item_scale_on && v->item_scale != 1.0f) {
+        /* P1: Player_actor_Item_draw (m_player_item.c_inc:122-130): the hand matrix scaled by item_scale when it is not 1 */
+        Matrix_scale(v->item_scale, v->item_scale, v->item_scale, MTX_MULT);
+    }
+
+    if (cls == PC_HELD_UMBRELLA) {
+        /* Vanilla: the T_UMBRELLA child actor (ac_t_umbrella.c, aTUMB_actor_draw) receives this same hand matrix and
+         * draws handle then canopy; in the steady carried state (OPENING clip at its last frame 26) the handle scale
+         * is (1,1,1) and the canopy scale (0.9,1,1). Reproduced statically; no actor, no animation. */
+        int idx = kind - mPlayer_ITEM_KIND_UMBRELLA00;
+        if (idx >= 0 && idx < 32) {
+            Mtx* e_mtx;
+            Mtx* k_mtx;
+
+            _texture_z_light_fog_prim_npc(graph);
+            Matrix_rotateXYZ(0, -0x4000, 0, MTX_MULT);
+            e_mtx = _Matrix_to_Mtx_new(graph);
+            Matrix_translate(4500.0f, 0.0f, 0.0f, MTX_MULT);
+            Matrix_scale(0.9f, 1.0f, 1.0f, MTX_MULT);
+            k_mtx = _Matrix_to_Mtx_new(graph);
+            if (e_mtx != NULL && k_mtx != NULL) {
+                OPEN_POLY_OPA_DISP(graph);
+                gSPMatrix(POLY_OPA_DISP++, e_mtx, G_MTX_NOPUSH | G_MTX_LOAD | G_MTX_MODELVIEW);
+                gSPDisplayList(POLY_OPA_DISP++, s_remote_umbrella_models[idx].model_e);
+                gSPMatrix(POLY_OPA_DISP++, k_mtx, G_MTX_NOPUSH | G_MTX_LOAD | G_MTX_MODELVIEW);
+                gSPDisplayList(POLY_OPA_DISP++, s_remote_umbrella_models[idx].model_kasa);
+                CLOSE_POLY_OPA_DISP(graph);
+            }
+        }
+        Matrix_pull();
+        return;
+    }
+
+    mtx = _Matrix_to_Mtx_new(graph);
+    if (mtx != NULL) {
+        _texture_z_light_fog_prim(graph);
+
+        OPEN_POLY_OPA_DISP(graph);
+        gSPMatrix(POLY_OPA_DISP++, mtx, G_MTX_NOPUSH | G_MTX_LOAD | G_MTX_MODELVIEW);
+        CLOSE_POLY_OPA_DISP(graph);
+
+        switch (cls) {
+            case PC_HELD_AXE:
+            case PC_HELD_SHOVEL:
+            case PC_HELD_FAN: {
+                /* Pure display lists (Player_actor_Item_draw_axe/_scoop/_fan): the vanilla position-only side
+                 * effects (axe_pos / scoop_pos) feed collision and are not needed. */
+                Gfx* dl = (Gfx*)mPlib_Get_Item_DataPointer(mPlib_Get_BasicItemShapeIndex_fromItemKind(kind));
+                if (dl != NULL) {
+                    OPEN_POLY_OPA_DISP(graph);
+                    gSPDisplayList(POLY_OPA_DISP++, dl);
+                    CLOSE_POLY_OPA_DISP(graph);
+                }
+                break;
+            }
+            case PC_HELD_NET:
+            case PC_HELD_ROD:
+                if (v->item_ready && v->item_keyframe.skeleton != NULL) {
+                    Mtx* item_mtx = (Mtx*)GRAPH_ALLOC_TYPE(graph, Mtx, v->item_keyframe.skeleton->num_shown_joints);
+                    if (item_mtx != NULL) {
+                        if (cls == PC_HELD_NET) {
+                            /* M9-C Phase 6a: PLAYER_ACTOR::net_pos exactly as Player_actor_Item_draw_net (m_player_item_net.c_inc:
+                             * 243-249) derives it from the hand matrix; stored in THIS puppet only (net sounds). */
+                            Matrix_push();
+                            Matrix_rotateXYZ(0, 3000, 0, MTX_MULT);
+                            Matrix_Position_VecZ(4000.0f, &self->cos.net_pos);
+                            Matrix_pull();
+                            self->cos.net_frame = game->frame_counter + 1u;
+                        }
+                        /* Net: Player_actor_Item_draw_net; rod: Player_actor_Item_draw_rod with item_rod_angle_z == 0
+                         * (its only writer is the ready-rod state), so no extra rotation/matrix is needed. The
+                         * rod's top-position callback only feeds the bobber and is not needed. */
+                        cKF_Si3_draw_R_SV(game, &v->item_keyframe, item_mtx, NULL,
+                                          (cls == PC_HELD_NET) ? pc_remote_player_item_net_after : NULL, self);
+                    }
+                }
+                break;
+            case PC_HELD_BALLOON:
+            case PC_HELD_WINDMILL: /* P1 */
+                pc_remote_player_draw_toy(self, game, cls, v->item_scale_on ? v->item_scale : 1.0f);
+                break;
+            default:
+                break;
+        }
+    }
+    Matrix_pull();
+}
+
+
+/* ------------------------------------------------------------------------------------------------------------
+ * M9-C Phase 2a: puppet state machine over the (main_index, entry counter) pair of the interpolated snapshot.
+ *
+ *  - An ENTRY EDGE is any change of the pair (or of its validity). Compared by equality only (the 4-bit counter wraps).
+ *    Same pair = the state continues (nothing restarts); a different counter on the same index = a re-entry (repeated
+ *    swing/dig) and restarts the clip.
+ *  - An edge into a state that has a row starts that row at once (interrupting any latched one-shot).
+ *  - ONE-SHOT LATCH: a STOP-mode row keeps playing until its clip FINISHED even if a later edge already reports a state
+ *    without a row (idle/walk/run/dash/other = fallback): the fallback only takes over after the clip finished, or after
+ *    PC_REMOTE_PLAYER_LATCH_TIMEOUT_FRAMES past that edge (a lost/stuck state can never freeze the pose). A snapshot gap,
+ *    a teleport snap, a scene-presence change and a recreated actor (zeroed visual) all clear it.
+ *  - First sight of a pair on a fresh actor adopts it silently, except REPEAT rows (steady states) which start.
+ * Everything is per-actor (PCRemotePlayerVisual), nothing is shared between puppets.
+ * ------------------------------------------------------------------------------------------------------------ */
+
+#define PC_REMOTE_PLAYER_LATCH_TIMEOUT_FRAMES 120.0 /* fallback may cut a one-shot this long after its edge */
+#define PC_REMOTE_PLAYER_ACTION_GAP_FRAMES 90.0     /* no MOVE for this long clears a one-shot latch */
+#define PC_REMOTE_PLAYER_HIDDEN_DOOR_TIMEOUT_FRAMES 600.0 /* a walked-in (DOOR) puppet whose scene event never arrives re-appears after this */
+#define PC_REMOTE_PLAYER_SCENE_FRESH_TIMEOUT_FRAMES 60.0  /* a scene event waits at most this long for a MOVE received after it */
+
+static void pc_puppet_sweat_kill(PCRemotePlayerActor* self, const char* reason); /* review H1 (defined with the Phase 3 block) */
+static int pc_puppet_scoop_target(const PCRemotePlayerActor* self, xyz_t* out, mActor_name_t* fg_out); /* P1: dig_scoop stump clip (Phase 6b block) */
+
+static void pc_remote_player_row_diag_release(PCRemotePlayerActor* self, const char* why) {
+    if (pc_remote_player_puppet_diag()) {
+        printf("[NET][PUPPET][DIAG] player %d latch released (%s)\n", (int)self->peer, why);
+    }
+}
+
+/* Ends the active row: the next frame's fallback block rebinds clips (current_* invalidated). A one-shot (STOP) row that
+ * ends logs its latch release with `why`. */
+static void pc_remote_player_row_release(PCRemotePlayerActor* self, const char* why) {
+    PCRemotePlayerVisual* v = &self->visual;
+    const PCStateRow* row;
+
+    if (!v->row_active) {
+        return;
+    }
+    row = pc_remote_player_row_for(v->row_idx);
+    if (row != NULL && row->mode == cKF_FRAMECONTROL_STOP) {
+        pc_remote_player_row_diag_release(self, why);
+    }
+    pc_puppet_sweat_kill(self, why); /* review H1: the pitfall run ends here (no-op unless this puppet's sweat is up) */
+    v->rebind_from_row = 1; /* review R1-L3: the rebind of the next frame is a row release, not a state entry edge */
+    v->row_active = 0;
+    v->row_pending = 0;
+    v->row_finished = 0;
+    v->row_chained = 0;
+    v->item_hidden = 0;
+    v->item_restart = 0;
+    v->keyframe0.animation_enabled = 0; /* ROOT_PIN rows: the root pin ends with the row */
+    v->current_anim_idx = -1; /* force the fallback block to rebind both layers + part table */
+    v->current_anim1_idx = -1;
+    v->current_part_table = -1;
+    v->item_scale_on = 0; /* P1: the take-out / put-in scale curve ends with its row (vanilla SetupItemScale: 1.0 in any other state) */
+    v->takeout_switched = 0;
+}
+
+/* Binds both body layers. P1: `morph` is the vanilla morph_counter (0 = snap); `reverse` plays the clip backwards from its last
+ * frame (vanilla InitAnimation_Base3: cKF_SkeletonInfo_R_init_reverse_setspeedandmorphandmode; the frame argument is unused). */
+static void pc_remote_player_bind_body(PCRemotePlayerVisual* v, int a0, int a1, f32 frame, f32 speed, int mode, f32 morph,
+                                       int reverse) {
+    if (reverse) {
+        cKF_SkeletonInfo_R_init_reverse_setspeedandmorphandmode(&v->keyframe0, mPlib_Get_Pointer_Animation(a0), NULL, speed, morph,
+                                                                mode);
+        cKF_SkeletonInfo_R_init_reverse_setspeedandmorphandmode(&v->keyframe1, mPlib_Get_Pointer_Animation(a1), NULL, speed, morph,
+                                                                mode);
+    } else {
+        cKF_SkeletonInfo_R_init_standard_setframeandspeedandmorphandmode(&v->keyframe0, mPlib_Get_Pointer_Animation(a0), NULL,
+                                                                         frame, speed, morph, mode);
+        cKF_SkeletonInfo_R_init_standard_setframeandspeedandmorphandmode(&v->keyframe1, mPlib_Get_Pointer_Animation(a1), NULL,
+                                                                         frame, speed, morph, mode);
+    }
+    v->current_anim_idx = a0;
+    v->current_anim1_idx = a1;
+    v->keyframe0.animation_enabled = 0; /* a (re)bind drops a previous ROOT_PIN (row_start re-applies it) */
+}
+
+#ifdef TARGET_PC
+#define PC_REMOTE_PLAYER_DOOR_COSM_RADIUS 60.0f /* a puppet's door position must be this close to a building's door point */
+/* door class of a building / of the interior a player just left (PC_DOOR_UNKNOWN: keep the table clip) */
+#define PC_DOOR_UNKNOWN 0
+#define PC_DOOR_HINGED 1 /* vanilla door type 0: OPEN1 in, exit GO_OUT_O1 from frame 25 (houses, my house, post office, needlework, cottages) */
+#define PC_DOOR_SHOP 2   /* vanilla door type 1 (mPlib_request_main_door_type1(..., TRUE)): INTO_S1 in, exit GO_OUT_S1 from frame 1 */
+static int pc_remote_player_scene_is_local_field(const PCRemotePlayerSlot* slot, const GAME_PLAY* play);
+
+/* Door class of an interior scene id (the scene a player was announced in before it came back out into the town). Mapped by scene id, not by
+ * pc_net_game_scene_kind (SCENE_NEEDLEWORK is KIND_SHOP there but uses the hinged door). */
+static int pc_remote_player_door_class_of_scene(int scene_id) {
+    switch (scene_id) {
+        case SCENE_SHOP0:
+        case SCENE_CONVENI:
+        case SCENE_SUPER:
+        case SCENE_DEPART:
+        case SCENE_DEPART_2:
+        case SCENE_BROKER_SHOP:
+        case SCENE_MUSEUM_ENTRANCE:
+        case SCENE_MUSEUM_ROOM_PAINTING:
+        case SCENE_MUSEUM_ROOM_FOSSIL:
+        case SCENE_MUSEUM_ROOM_INSECT:
+        case SCENE_MUSEUM_ROOM_FISH:
+        case SCENE_POLICE_BOX:
+        case SCENE_KAMAKURA:
+        case SCENE_BUGGY:
+        case SCENE_LIGHTHOUSE:
+        case SCENE_TENT:
+            return PC_DOOR_SHOP;
+        case SCENE_MY_ROOM_S:
+        case SCENE_MY_ROOM_M:
+        case SCENE_MY_ROOM_L:
+        case SCENE_MY_ROOM_LL1:
+        case SCENE_MY_ROOM_LL2:
+        case SCENE_MY_ROOM_BASEMENT_S:
+        case SCENE_MY_ROOM_BASEMENT_M:
+        case SCENE_MY_ROOM_BASEMENT_L:
+        case SCENE_MY_ROOM_BASEMENT_LL1:
+        case SCENE_NPC_HOUSE:
+        case SCENE_POST_OFFICE:
+        case SCENE_NEEDLEWORK:
+        case SCENE_COTTAGE_MY:
+        case SCENE_COTTAGE_NPC:
+            return PC_DOOR_HINGED;
+        default:
+            return PC_DOOR_UNKNOWN;
+    }
+}
+
+/* World position of the door point of building `a` for an entry (exit_row 0: where the player stands when the door request is made) or an
+ * exit (exit_row 1: the exit_position the building writes into structure_exit_door_data). Returns the building's door class, or
+ * PC_DOOR_UNKNOWN for an actor that is not a door building. The hinged points are the ones the aHUS/aMHS/aPOFF/aNW wrappers measure from;
+ * the type-1 points are the pos of the building's mPlib_request_main_door_type1 call / its *_rewrite_out_data (ac_shop_move.c_inc:248 and :64,
+ * ac_conveni_move.c_inc:258 and :21, ac_super/ac_depart_move.c_inc:280 and :21, ac_museum.c:239 and :151, ac_police_box_move.c_inc:127 and :42,
+ * ac_br_shop_move.c_inc:~194 and :83, ac_buggy_move.c_inc:~246 and :98, ac_kamakura_move.c_inc:~168 and :95, ac_tent.c:~176 and :122,
+ * ac_toudai_move.c_inc:193 and :13). */
+static int pc_remote_player_door_point(const ACTOR* a, int exit_row, float* out_x, float* out_z) {
+    float wx = a->world.position.x;
+    float wz = a->world.position.z;
+    float hx = a->home.position.x;
+    float hz = a->home.position.z;
+
+    switch (a->id) {
+        case mAc_PROFILE_MYHOUSE: {
+            const STRUCTURE_ACTOR* sa = (const STRUCTURE_ACTOR*)a;
+            if (exit_row) {
+                *out_x = wx + (((sa->action & 1) != 0) ? -48.29f : 48.29f); /* aMHS_rewrite_pl_out_data */
+                *out_z = wz + 48.29f;
+            } else {
+                *out_x = sa->arg0_f; /* the point aMHS_check_player_sub measures from */
+                *out_z = sa->arg1_f;
+            }
+            return PC_DOOR_HINGED;
+        }
+        case mAc_PROFILE_HOUSE:
+            if (exit_row) {
+                *out_x = hx; /* aHUS_rewrite_out_data */
+                *out_z = hz + 60.0f;
+            } else {
+                *out_x = wx; /* house size 40, direction south: (size / 2 + 20) * direct_vector */
+                *out_z = wz + 40.0f;
+            }
+            return PC_DOOR_HINGED;
+        case mAc_PROFILE_POST_OFFICE:
+        case mAc_PROFILE_NEEDLEWORK_SHOP:
+            *out_x = wx - 40.0f * 0.70710678f; /* size 40, direction 5 (south west) */
+            *out_z = wz + 40.0f * 0.70710678f;
+            return PC_DOOR_HINGED;
+        case mAc_PROFILE_SHOP:
+            *out_x = wx + (exit_row ? -68.29f : -50.0f);
+            *out_z = wz + (exit_row ? 68.29f : 50.0f);
+            return PC_DOOR_SHOP;
+        case mAc_PROFILE_CONVENI:
+            *out_x = wx + (exit_row ? -42.0f : -25.0f);
+            *out_z = wz + (exit_row ? 98.57f : 82.5f);
+            return PC_DOOR_SHOP;
+        case mAc_PROFILE_SUPER:
+        case mAc_PROFILE_DEPART:
+            *out_x = wx + (exit_row ? -62.0f : -45.0f);
+            *out_z = wz + (exit_row ? 118.57f : 102.5f);
+            return PC_DOOR_SHOP;
+        case mAc_PROFILE_MUSEUM:
+            *out_x = exit_row ? hx : wx;
+            *out_z = exit_row ? hz + 120.0f : wz + 100.0f;
+            return PC_DOOR_SHOP;
+        case mAc_PROFILE_POLICE_BOX:
+            *out_x = exit_row ? hx + 60.0f : wx + 50.0f;
+            *out_z = exit_row ? hz + 60.0f : wz + 50.0f;
+            return PC_DOOR_SHOP;
+        case mAc_PROFILE_BRSHOP:
+        case mAc_PROFILE_BUGGY:
+            *out_x = wx;
+            *out_z = wz + (exit_row ? 100.0f : 64.0f);
+            return PC_DOOR_SHOP;
+        case mAc_PROFILE_KAMAKURA:
+        case mAc_PROFILE_TENT:
+            *out_x = wx;
+            *out_z = wz + (exit_row ? 86.0f : 68.0f);
+            return PC_DOOR_SHOP;
+        case mAc_PROFILE_TOUDAI:
+            *out_x = wx;
+            *out_z = wz + (exit_row ? -70.0f : -60.0f);
+            return PC_DOOR_SHOP;
+        default:
+            return PC_DOOR_UNKNOWN;
+    }
+}
+
+/* Which kind of building door a remote puppet's DOOR (entry) / OUTDOOR (exit) row belongs to: the nearest door point of the right kind
+ * (entry or exit) of a building of the local town within PC_REMOTE_PLAYER_DOOR_COSM_RADIUS of the puppet. For an exit the interior the owner
+ * just left (slot->prev_scene_id) fixes the class when it is known (the geometry then only picks the building); an unknown previous scene
+ * falls back to the nearest door point of either class. Returns PC_DOOR_UNKNOWN (keep the table clip) when the puppet is not in the shown
+ * town or nothing is near. *out_best is the nearest building of that class within the radius, or NULL. Reads only. */
+static int pc_remote_player_door_pick(PCRemotePlayerActor* self, int exit_row, ACTOR** out_best) {
+    GAME_PLAY* play = (GAME_PLAY*)gamePT;
+    PCRemotePlayerSlot* slot = pc_remote_player_find_slot(self->peer);
+    ACTOR* a;
+    ACTOR* best = NULL;
+    int best_cls = PC_DOOR_UNKNOWN;
+    int want = PC_DOOR_UNKNOWN;
+    float best_d2 = PC_REMOTE_PLAYER_DOOR_COSM_RADIUS * PC_REMOTE_PLAYER_DOOR_COSM_RADIUS;
+    float px = ((ACTOR*)self)->world.position.x;
+    float pz = ((ACTOR*)self)->world.position.z;
+
+    *out_best = NULL;
+    if (slot == NULL || play == NULL || !pc_remote_player_scene_is_local_field(slot, play)) {
+        return PC_DOOR_UNKNOWN;
+    }
+    if (exit_row) {
+        want = pc_remote_player_door_class_of_scene((int)slot->prev_scene_id);
+    }
+    for (a = play->actor_info.list[ACTOR_PART_ITEM].actor; a != NULL; a = a->next_actor) {
+        float x, z, dx, dz, d2;
+        int cls = pc_remote_player_door_point(a, exit_row, &x, &z);
+
+        if (cls == PC_DOOR_UNKNOWN || (want != PC_DOOR_UNKNOWN && cls != want)) {
+            continue;
+        }
+        dx = px - x;
+        dz = pz - z;
+        d2 = dx * dx + dz * dz;
+        if (d2 < best_d2) {
+            best_d2 = d2;
+            best = a;
+            best_cls = cls;
+        }
+    }
+    *out_best = best;
+    return (best != NULL) ? best_cls : want; /* a known previous scene decides the clip even if the building is not found */
+}
+
+/* Building doors: a remote puppet that enters (main index DOOR) / leaves (OUTDOOR) a HINGED-door building in the local town makes that
+ * building play its door clip (door_pick found it). Vanilla only animates for the local player (PLAYER_ACTOR door label), an NPC request or
+ * the structure control's exit request, so a puppet would walk through a closed door. The building wrappers (aHUS/aMHS/aPOFF/aNW_pc_cosmetic_door)
+ * only set that building's own request/animation fields and refuse a busy door (several puppets at one door: the first wins). Shop-style
+ * (type-1) buildings have no cosmetic door clip. Local scene only, never while a scene event waits for its first fresh MOVE, never while a
+ * local exit is in progress. Called once per row instance. */
+static void pc_remote_player_cosmetic_door(PCRemotePlayerActor* self, int exit_row, int cls, ACTOR* best) {
+    GAME_PLAY* play = (GAME_PLAY*)gamePT;
+    PCRemotePlayerSlot* slot = pc_remote_player_find_slot(self->peer);
+    STRUCTURE_CONTROL_ACTOR* ctrl;
+
+    if (cls != PC_DOOR_HINGED || best == NULL) {
+        return;
+    }
+    if (slot == NULL || play == NULL || slot->snap_req || !pc_remote_player_scene_is_local_field(slot, play)) {
+        return;
+    }
+    if (mPlib_get_player_actor_main_index((GAME*)play) == (int)mPlayer_INDEX_OUTDOOR) {
+        return; /* the local player is leaving a building: the structure control hands that exit to the right door */
+    }
+    ctrl = (STRUCTURE_CONTROL_ACTOR*)Actor_info_name_search(&play->actor_info, mAc_PROFILE_STRUCTURE, ACTOR_PART_CONTROL);
+    if (ctrl != NULL && ctrl->str_door_name != EMPTY_NO) {
+        return; /* a local exit request is still pending */
+    }
+    if (best->id == mAc_PROFILE_MYHOUSE) {
+        aMHS_pc_cosmetic_door(best, exit_row);
+    } else if (best->id == mAc_PROFILE_HOUSE) {
+        aHUS_pc_cosmetic_door(best, exit_row);
+    } else if (best->id == mAc_PROFILE_POST_OFFICE) {
+        aPOFF_pc_cosmetic_door(best, exit_row);
+    } else {
+        aNW_pc_cosmetic_door(best, exit_row);
+    }
+}
+#endif
+
+/* Starts `row` (restart if it is already active). Returns 0 and leaves the puppet on its fallback if a clip pointer is
+ * missing. Writes only into the puppet's own PCRemotePlayerVisual. */
+static int pc_remote_player_row_start(PCRemotePlayerActor* self, int idx, const PCStateRow* row, int raw_kind, int held_kind,
+                                      double now, int* out_a0, int* out_a1, int* out_pt) {
+    PCRemotePlayerVisual* v = &self->visual;
+    int prev_active = v->row_active;
+    int prev_idx = v->row_idx;
+    int a0;
+    int a1;
+    int pt = row->part_table;
+    int cont;
+    int pin_mask;
+    f32 f0;
+    f32 start_frame = row->start_frame;
+
+    if (row->anim0 == PC_ROW_ANIM_PUTIN && raw_kind < 0) {
+        raw_kind = v->last_held_kind; /* P1: the sender already cleared the kind being put away: the puppet remembers it */
+    }
+    a0 = pc_remote_player_row_anim0(row, raw_kind);
+    if (mPlib_Get_Pointer_Animation(a0) == NULL) {
+        return 0;
+    }
+    if (row->anim1 == PC_ROW_A1_SAME) {
+        a1 = a0;
+    } else if (row->anim1 == PC_ROW_A1_ITEM) {
+        a1 = a0;
+        if (held_kind >= 0) {
+            int pose = mPlib_Get_BasicPlayerAnimeIndex_fromItemKind(held_kind);
+            if (pose >= 0 && mPlib_Get_Pointer_Animation(pose) != NULL) {
+                a1 = pose;
+            }
+        }
+    } else {
+        a1 = row->anim1;
+        if (mPlib_Get_Pointer_Animation(a1) == NULL) {
+            a1 = a0;
+        }
+    }
+#ifdef TARGET_PC
+    if (idx == (int)mPlayer_INDEX_DOOR || idx == (int)mPlayer_INDEX_OUTDOOR) {
+        /* building doors: once per row instance (door_cosm_time latch) pick the door class, make a hinged building play its door clip, then
+         * swap the table clip for the shop-style one (type-1 door: INTO_S1 in, GO_OUT_S1 from frame 1 out) or the hinged exit start (GO_OUT_O1
+         * from frame 25). PC_DOOR_UNKNOWN keeps the table clip. */
+        int exit_row = (idx == (int)mPlayer_INDEX_OUTDOOR);
+
+        if (v->door_cosm_time != now) {
+            ACTOR* door_best = NULL;
+
+            v->door_cosm_time = now;
+            v->door_cls = pc_remote_player_door_pick(self, exit_row, &door_best);
+            pc_remote_player_cosmetic_door(self, exit_row, v->door_cls, door_best);
+        }
+        if (v->door_cls == PC_DOOR_SHOP) {
+            int alt = exit_row ? (int)mPlayer_ANIM_GO_OUT_S1 : (int)mPlayer_ANIM_INTO_S1;
+
+            if (mPlib_Get_Pointer_Animation(alt) != NULL) {
+                a0 = alt;
+                a1 = alt;
+                start_frame = 1.0f;
+            }
+        } else if (v->door_cls == PC_DOOR_HINGED && exit_row) {
+            start_frame = 25.0f; /* vanilla type 0 outdoor (m_player_main_outdoor.c_inc:35-37) */
+        }
+    }
+    if (idx == (int)mPlayer_INDEX_DIG_SCOOP) {
+        /* P1: vanilla digs a tree stump with DIG_KABU1 (dig_scoop.c_inc:24-32). The request's item is not on the wire: the shovel target tile
+         * is reconstructed read-only from the puppet's position / facing (pc_puppet_scoop_target, the same tile the PC_TCOND_STUMP tool events
+         * test), only while the puppet is in the town this process shows. */
+        PCRemotePlayerSlot* dslot = pc_remote_player_find_slot(self->peer);
+        xyz_t dtgt;
+        mActor_name_t dfg = (mActor_name_t)EMPTY_NO;
+
+        if (dslot != NULL && gamePT != NULL && pc_remote_player_scene_is_local_field(dslot, (GAME_PLAY*)gamePT) &&
+            pc_puppet_scoop_target(self, &dtgt, &dfg) && IS_ITEM_TREE_STUMP(dfg) &&
+            mPlib_Get_Pointer_Animation(mPlayer_ANIM_DIG_KABU1) != NULL) {
+            a0 = mPlayer_ANIM_DIG_KABU1;
+            a1 = mPlayer_ANIM_DIG_KABU1;
+        }
+    }
+#endif
+    if (row->flags & PC_ROWF_PT_FROM_ANIM1) {
+        pt = mPlib_Get_BasicPartTableIndex_fromAnimeIndex(a1);
+    }
+    if ((row->flags & PC_ROWF_PT_NET_IF_ITEM) && held_kind >= 0 && a1 != a0) {
+        pt = mPlayer_PART_TABLE_NET;
+    }
+    if (pt < 0 || pt >= mPlayer_PART_TABLE_NUM) {
+        pt = mPlayer_PART_TABLE_NORMAL;
+    }
+
+    if (row->flags & PC_ROWF_FREEZE) {
+        /* P1 stop_net (m_player_main_stop_net.c_inc:15-19): no InitAnimation at all, only keyframe0/1 speed = 0: the clips the puppet is
+         * drawing (the net swing that hit something, or the idle of a fallback) stop where they are; the part table stays. */
+        a0 = v->current_anim_idx;
+        a1 = v->current_anim1_idx;
+        if (a0 < 0 || a1 < 0 || mPlib_Get_Pointer_Animation(a0) == NULL || mPlib_Get_Pointer_Animation(a1) == NULL) {
+            a0 = a1 = mPlayer_ANIM_WAIT1; /* nothing bound (just released): the idle pose, frozen */
+            pc_remote_player_bind_body(v, a0, a1, 1.0f, 0.0f, cKF_FRAMECONTROL_REPEAT, 0.0f, 0);
+        }
+        v->keyframe0.frame_control.speed = 0.0f;
+        v->keyframe1.frame_control.speed = 0.0f;
+        pt = (v->current_part_table >= 0 && v->current_part_table < mPlayer_PART_TABLE_NUM) ? v->current_part_table
+                                                                                            : mPlayer_PART_TABLE_NORMAL;
+    } else {
+        /* vanilla keeps the running body clips for cast_rod (it never calls InitAnimation) */
+        cont = (row->flags & PC_ROWF_BODY_CONTINUE) && prev_active && v->current_anim_idx == a0 &&
+               v->current_anim1_idx == a1;
+        if (!cont) {
+            f0 = ((row->flags & PC_ROWF_BODY_CARRY) && prev_active) ? v->keyframe0.frame_control.current_frame : start_frame;
+            pc_remote_player_bind_body(v, a0, a1, f0, row->speed, row->mode, pc_remote_player_row_morph(idx, row, raw_kind),
+                                       pc_remote_player_row_reverse(row, raw_kind));
+        }
+    }
+    if (pt != v->current_part_table) {
+        mPlib_DMA_player_Part_Table(v->part_table, pt);
+        v->current_part_table = pt;
+    }
+    /* P1: the vanilla ct_base mask of this state (s_row_pin; 1 TRANS_XZ, 2 TRANS_Y, 4 ROT_Y), with its Set_base_shape_trs(0, 1000, z, 0, 0,
+     * 0x4000): the joint-0 draw (c_keyframe.c cKF_Si3_draw_SV_R_child) then uses base_model_translation x/z (TRANS_XZ), y (TRANS_Y) and the
+     * base rotation (ROT_Y) instead of the clip's root values, so the clip never adds its own travel / turn to the synced position / facing.
+     * (DOOR / KNOCK_DOOR: cKF_ANIMATION_TRANS_XZ | cKF_ANIMATION_ROT_Y as before.) AnimationMove_base is deliberately NOT run (the position
+     * is synced, never integrated here). */
+    pin_mask = (idx > 0 && idx < mPlayer_INDEX_NUM && (row->flags & PC_ROWF_ROOT_PIN)) ? (int)s_row_pin[idx].mask : 0;
+    if (pin_mask != 0) {
+        cKF_SkeletonInfo_R_Animation_Set_base_shape_trs(&v->keyframe0, 0.0f, 1000.0f, (f32)s_row_pin[idx].base_z, 0, 0, 0x4000);
+        v->keyframe0.animation_enabled = pin_mask;
+        if (pc_remote_player_puppet_diag()) {
+            printf("[NET][PUPPET][DIAG] player %d root pin row=%s mask=%d base_z=%d pos=(%.1f,%.1f,%.1f) facing=%d\n", (int)self->peer,
+                   row->name, pin_mask, (int)s_row_pin[idx].base_z, (double)self->actor_class.world.position.x,
+                   (double)self->actor_class.world.position.y, (double)self->actor_class.world.position.z,
+                   (int)self->actor_class.shape_info.rotation.y);
+        }
+    } else {
+        v->keyframe0.animation_enabled = 0;
+    }
+    if (row->flags & PC_ROWF_SCENE_ENTRY) {
+        v->hidden_door = 0; /* the owner is out again */
+    }
+    if (prev_active && prev_idx != idx) {
+        pc_puppet_sweat_kill(self, "row"); /* P1: vanilla ready/struggle_pitfall settle kills the ASE2 sweat when the state is left */
+    }
+    v->item_scale_on = 0;
+    v->takeout_switched = 0;
+    if (row->flags & PC_ROWF_ITEM_SCALE) {
+        /* P1: vanilla item_scale (takeout_item.c_inc:38,42; putin_item.c_inc:75-89): umbrellas stay 1.0 (the umbrella actor animates
+         * itself); anything else starts at 0 (take-out) / 1 (put-in) and follows the curve in pc_remote_player_row_tick. */
+        v->scale_kind = raw_kind;
+        if (!mPlayer_ITEM_IS_UMBRELLA(raw_kind)) {
+            v->item_scale_on = 1;
+            v->item_scale = (row->anim0 == PC_ROW_ANIM_TAKEOUT) ? 0.0f : 1.0f;
+        }
+    }
+
+    v->row_active = 1;
+    v->row_idx = idx;
+    v->row_finished = 0;
+    v->row_chained = 0;
+    v->row_pending = 0;
+    v->row_start_time = now;
+    v->row_adopted = 0;
+    v->item_hidden = 0; /* no row hides the carried item (the HIDE row hides the whole body via PC_ROWF_HIDE_BODY) */
+    v->item_restart = 1;
+    v->item_carry_ok = prev_active;
+    v->row_held_kind = held_kind;
+    *out_a0 = a0;
+    *out_a1 = a1;
+    *out_pt = pt;
+    return 1;
+}
+
+#ifdef TARGET_PC
+static int pc_remote_player_scene_is_local_field(const PCRemotePlayerSlot* slot, const GAME_PLAY* play);
+
+/* T4: the puppet is in the 'standing in the train' state (mPlayer_INDEX_DEMO_STANDING_TRAIN: the ride-off demo of an arriving player).
+ * Once per contiguous standing period (per-puppet latch in PCRemotePlayerVisual, cleared when the state ends and by actor re-creation) and
+ * only while the puppet's announced scene is the town this process shows, ask the train code to start the local arrival train through its
+ * guard (mTRC_pc_remote_arrival: no own train, no title demo, no local arrival, no pending request). Reads the wire state only, sends nothing. */
+static void pc_remote_player_arrival_train_poll(PCRemotePlayerActor* self, PCRemotePlayerSlot* slot, int standing) {
+    GAME_PLAY* play = (GAME_PLAY*)gamePT;
+    int in_town = (gamePT != NULL && slot != NULL) ? pc_remote_player_scene_is_local_field(slot, play) : 0;
+
+    if (pcarr_remote_standing_should_evaluate(&self->visual.train_standing_latched, standing, in_town)) {
+        /* transient refusals (local intro demo, pending request, own train) release the latch: re-polled each frame while standing */
+        pcarr_remote_standing_settle(&self->visual.train_standing_latched, mTRC_pc_remote_arrival((GAME*)play, (int)self->peer, in_town));
+    }
+}
+#endif
+
+/* Entry-edge detection + row start/latch bookkeeping; runs once per puppet move BEFORE the fallback animation block.
+ * fb_* are the fallback (move_state / carried pose) values, logged for rows without an override. */
+static void pc_remote_player_row_pre(PCRemotePlayerActor* self, PCRemotePlayerSlot* slot, double now, int raw_kind,
+                                     int held_kind, int fb_a0, int fb_a1, int fb_pt, int snapped) {
+    PCRemotePlayerVisual* v = &self->visual;
+    int valid = self->cosmetic_action_valid ? 1 : 0;
+    int idx = valid ? (int)self->cosmetic_action_index : -1;
+    int ctr = valid ? (int)self->cosmetic_action_counter : -1;
+    const PCStateRow* row;
+    const PCStateRow* active;
+    int oneshot_held;
+    int edge;
+    int a0, a1, pt;
+    int diag = pc_remote_player_puppet_diag();
+
+    if (slot->snapshot_count == 0) {
+        return; /* review R1-L1: no MOVE seen yet (fresh actor / reconnect): nothing to adopt, so the first real pair is adopted
+                 * silently (steady rows start) instead of being treated as an entry edge of an action in progress */
+    }
+    if (slot->snap_req) {
+        return; /* a scene event is waiting for its first fresh MOVE (mv): the stale pre-scene state must not start or release anything */
+    }
+    if (v->hidden_door && (now - v->hidden_door_since) > PC_REMOTE_PLAYER_HIDDEN_DOOR_TIMEOUT_FRAMES) {
+        v->hidden_door = 0; /* the scene event never came: never stay invisible */
+    }
+#ifdef TARGET_PC
+    pc_remote_player_arrival_train_poll(self, slot, valid && idx == (int)mPlayer_INDEX_DEMO_STANDING_TRAIN);
+#endif
+    active = v->row_active ? pc_remote_player_row_for(v->row_idx) : NULL;
+    oneshot_held = (active != NULL && active->mode == cKF_FRAMECONTROL_STOP && !v->row_chained);
+    if (active != NULL && (active->flags & PC_ROWF_HIDE_BODY)) {
+        /* a hidden (HIDE) puppet must never stay invisible after a teleport snap or a silent peer: same clears as a latch */
+        if (snapped || (now - slot->last_move_recv_local_frame) > PC_REMOTE_PLAYER_ACTION_GAP_FRAMES) {
+            pc_remote_player_row_release(self, snapped ? "snap" : "gap");
+            active = NULL;
+        }
+    }
+
+    /* clears first: scene presence change / teleport snap / snapshot gap */
+    if (slot->latch_clear_req) {
+        slot->latch_clear_req = 0;
+        v->hidden_door = 0; /* scene presence changed: the scene gate / the new snapshots decide visibility from here */
+        if (active != NULL && (active->flags & PC_ROWF_SCENE_ENTRY)) {
+            /* an arrival (OUTDOOR) row survives the scene change that brought the owner back into this town */
+            v->pair_known = 1;
+            v->pair_valid = valid;
+            v->pair_idx = (uint8_t)(idx < 0 ? 0 : idx);
+            v->pair_ctr = (uint8_t)(ctr < 0 ? 0 : ctr);
+            return;
+        }
+        pc_remote_player_row_release(self, "scene");
+        if (valid && idx == (int)mPlayer_INDEX_OUTDOOR) {
+            /* the owner arrives out of a building: play the exit from its start (the clear would otherwise adopt it silently) */
+            row = pc_remote_player_row_for(idx);
+            if (row != NULL && (row->flags & PC_ROWF_SCENE_ENTRY) && row->mode == cKF_FRAMECONTROL_STOP) {
+                v->pair_known = 1;
+                v->pair_valid = valid;
+                v->pair_idx = (uint8_t)idx;
+                v->pair_ctr = (uint8_t)(ctr < 0 ? 0 : ctr);
+                if (pc_remote_player_row_start(self, idx, row, raw_kind, held_kind, now, &a0, &a1, &pt) && diag) {
+                    printf("[NET][PUPPET][DIAG] player %d state main_index=%d counter=%d row=%s anim0=%d anim1=%d part_table=%d "
+                           "mode=stop latch=on (scene entry)\n",
+                           (int)self->peer, idx, ctr, row->name, a0, a1, pt);
+                }
+                return;
+            }
+        }
+        if (v->pair_known) {
+            v->pair_valid = valid; /* adopt the current pair silently: no restart without a NEW edge */
+            v->pair_idx = (uint8_t)(idx < 0 ? 0 : idx);
+            v->pair_ctr = (uint8_t)(ctr < 0 ? 0 : ctr);
+            return;
+        }
+        /* review R1-L2: a fresh (recreated) actor has no pair yet: fall through to the first-sight adoption below so a
+         * steady REPEAT row (hide, sitdown_wait, wait_bed, relax_rod, tired) starts instead of being skipped */
+        active = NULL;
+        oneshot_held = 0;
+    }
+    if (oneshot_held && snapped) {
+        pc_remote_player_row_release(self, "snap");
+        active = NULL;
+        oneshot_held = 0;
+    } else if (oneshot_held && (now - slot->last_move_recv_local_frame) > PC_REMOTE_PLAYER_ACTION_GAP_FRAMES) {
+        pc_remote_player_row_release(self, "gap");
+        active = NULL;
+        oneshot_held = 0;
+    }
+
+    if (!v->pair_known) { /* fresh actor: adopt; only steady (REPEAT) rows start */
+        v->pair_known = 1;
+        v->pair_valid = valid;
+        v->pair_idx = (uint8_t)(idx < 0 ? 0 : idx);
+        v->pair_ctr = (uint8_t)(ctr < 0 ? 0 : ctr);
+        row = valid ? pc_remote_player_row_for(idx) : NULL;
+        if (row != NULL && (row->mode == cKF_FRAMECONTROL_REPEAT || (row->flags & PC_ROWF_SCENE_ENTRY)) &&
+            pc_remote_player_row_start(self, idx, row, raw_kind, held_kind, now, &a0, &a1, &pt) && diag) {
+            printf("[NET][PUPPET][DIAG] player %d state main_index=%d counter=%d row=%s anim0=%d anim1=%d part_table=%d "
+                   "mode=repeat latch=off\n",
+                   (int)self->peer, idx, ctr, row->name, a0, a1, pt);
+        }
+        if (row != NULL && v->row_active && v->row_idx == idx && v->row_start_time == now) {
+            v->row_adopted = 1; /* M9-C Phase 6a: a steady row adopted without an entry edge: no entry cosmetics */
+        }
+        return;
+    }
+
+    edge = (valid != v->pair_valid) || (valid && ((uint8_t)idx != v->pair_idx || (uint8_t)ctr != v->pair_ctr));
+    if (!edge) {
+        return;
+    }
+    v->pair_valid = valid;
+    v->pair_idx = (uint8_t)(idx < 0 ? 0 : idx);
+    v->pair_ctr = (uint8_t)(ctr < 0 ? 0 : ctr);
+    row = valid ? pc_remote_player_row_for(idx) : NULL;
+
+    if (row != NULL) {
+        /* a latched, unfinished one-shot is interrupted at once by an edge into another action state. Only logged here:
+         * the row start below keeps the running clips (cast_rod continues ready_rod's clip) and overwrites the latch. */
+        if (oneshot_held && !v->row_finished && diag) {
+            pc_remote_player_row_diag_release(self, "interrupted");
+        }
+        if (pc_remote_player_row_start(self, idx, row, raw_kind, held_kind, now, &a0, &a1, &pt)) {
+            if (diag) {
+                printf("[NET][PUPPET][DIAG] player %d state main_index=%d counter=%d row=%s anim0=%d anim1=%d part_table=%d "
+                       "mode=%s latch=%s\n",
+                       (int)self->peer, idx, ctr, row->name, a0, a1, pt,
+                       (row->mode == cKF_FRAMECONTROL_STOP) ? "stop" : "repeat",
+                       (row->mode == cKF_FRAMECONTROL_STOP) ? "on" : "off");
+            }
+            return;
+        }
+        row = NULL; /* clip missing: behave as a fallback state */
+    }
+
+    /* fallback state: a latched, unfinished one-shot is allowed to finish first */
+    {
+        int latched = (v->row_active && oneshot_held && !v->row_finished);
+        if (diag) {
+            printf("[NET][PUPPET][DIAG] player %d state main_index=%d counter=%d row=fallback anim0=%d anim1=%d part_table=%d "
+                   "mode=repeat latch=%s\n",
+                   (int)self->peer, idx, ctr, fb_a0, fb_a1, fb_pt, latched ? "on" : "off");
+        }
+        if (latched) {
+            if (!v->row_pending) {
+                v->row_pending = 1;
+                v->row_pending_since = now;
+            }
+        } else if (v->row_active) {
+            pc_remote_player_row_release(self, "finished");
+        }
+    }
+}
+
+/* After the animation play of this frame: detect clip end, chain clips, and release a pending latch. */
+static void pc_remote_player_row_post(PCRemotePlayerActor* self, int play_state, double now) {
+    PCRemotePlayerVisual* v = &self->visual;
+    const PCStateRow* row;
+
+    if (!v->row_active) {
+        return;
+    }
+    row = pc_remote_player_row_for(v->row_idx);
+    if (row == NULL) {
+        pc_remote_player_row_release(self, "interrupted");
+        return;
+    }
+    if (row->mode == cKF_FRAMECONTROL_STOP && !v->row_chained && !v->row_finished && play_state == cKF_STATE_STOPPED) {
+        if (!v->row_pending && row->chain_anim >= 0 && mPlib_Get_Pointer_Animation(row->chain_anim) != NULL) {
+            int c1 = row->chain_anim;
+            if (row->anim1 == PC_ROW_A1_ITEM && v->row_held_kind >= 0) { /* SetupItem_Base1 again: item pose on layer 1 */
+                int pose = mPlib_Get_BasicPlayerAnimeIndex_fromItemKind(v->row_held_kind);
+                if (pose >= 0 && mPlib_Get_Pointer_Animation(pose) != NULL) {
+                    c1 = pose;
+                }
+            }
+            pc_remote_player_bind_body(v, row->chain_anim, c1, 1.0f, 0.5f,
+                                       (row->flags & PC_ROWF_CHAIN_STOP) ? cKF_FRAMECONTROL_STOP : cKF_FRAMECONTROL_REPEAT,
+                                       PC_ROW_CHAIN_MORPH, 0);
+            v->row_chained = 1; /* steady pose now (vanilla: InitAnimation_Base1/2 in the state): no latch */
+        } else {
+            v->row_finished = 1;
+            if ((row->flags & PC_ROWF_HIDE_AT_END) && !v->hidden_door) {
+                /* the body is inside the building: never left standing outside the door. Not once the owner's announced scene is already
+                 * an interior (shared-interior presence): the scene gate in dw decides there, and the flag would keep a puppet that
+                 * legitimately shares the local player's interior invisible until the (already consumed) scene clear. */
+                const PCRemotePlayerSlot* hs = pc_remote_player_find_slot(self->peer);
+
+                if (hs == NULL || !hs->scene.valid || hs->scene.kind == (uint8_t)PC_NETSCENE_KIND_FIELD) {
+                    v->hidden_door = 1;
+                    v->hidden_door_since = now;
+                }
+            }
+        }
+    }
+    if (v->row_pending) {
+        if (v->row_finished || v->row_chained) {
+            pc_remote_player_row_release(self, "finished");
+        } else if ((now - v->row_pending_since) > PC_REMOTE_PLAYER_LATCH_TIMEOUT_FRAMES) {
+            pc_remote_player_row_release(self, "timeout");
+        }
+    }
+}
+
+/* P1: per-frame part of the take-out / put-in rows, BEFORE the clips advance (vanilla runs SearchTimer / SetItemScale in the state's
+ * main, on the state timer = frames since setup; here the time since the row started on the same graph_dt_frame_time() clock).
+ *  - take-out of anything but an umbrella (takeout_item.c_inc:75-102): from timer 36 the item grows 0 -> 1 until 54
+ *    (get_percent_forAccelBrake(t, 36, 54, 0, 0)) and the body switches ONCE to the carried pose clip (Base1 REPEAT 0.5, morph +9):
+ *    the row is then a steady pose (row_chained: no latch).
+ *  - put-in of anything but an umbrella (putin_item.c_inc:75-89): the item shrinks 1 -> 0 over the first 18 frames. */
+static void pc_remote_player_row_tick(PCRemotePlayerActor* self, double now) {
+    PCRemotePlayerVisual* v = &self->visual;
+    const PCStateRow* row = v->row_active ? pc_remote_player_row_for(v->row_idx) : NULL;
+    f32 t;
+
+    if (row == NULL || !(row->flags & PC_ROWF_ITEM_SCALE) || !v->item_scale_on) {
+        return;
+    }
+    t = (f32)(now - v->row_start_time);
+    if (row->anim0 == PC_ROW_ANIM_TAKEOUT) {
+        if (t < 36.0f) {
+            v->item_scale = 0.0f;
+            return;
+        }
+        v->item_scale = (t >= 54.0f) ? 1.0f : get_percent_forAccelBrake(t, 36.0f, 54.0f, 0.0f, 0.0f);
+        if (!v->takeout_switched) {
+            int pose = (v->scale_kind >= 0) ? mPlib_Get_BasicPlayerAnimeIndex_fromItemKind(v->scale_kind) : -1;
+
+            v->takeout_switched = 1;
+            if (pose >= 0 && mPlib_Get_Pointer_Animation(pose) != NULL && pose != v->current_anim_idx) {
+                pc_remote_player_bind_body(v, pose, pose, 1.0f, 0.5f, cKF_FRAMECONTROL_REPEAT, 9.0f, 0);
+                if (v->current_part_table != mPlayer_PART_TABLE_NORMAL) {
+                    mPlib_DMA_player_Part_Table(v->part_table, mPlayer_PART_TABLE_NORMAL);
+                    v->current_part_table = mPlayer_PART_TABLE_NORMAL;
+                }
+            }
+            v->row_chained = 1;
+        }
+    } else if (row->anim0 == PC_ROW_ANIM_PUTIN) {
+        v->item_scale = (t >= 18.0f) ? 0.0f : 1.0f - get_percent_forAccelBrake(t, 0.0f, 18.0f, 0.0f, 0.0f);
+    }
+    if (v->item_scale < 0.0f) {
+        v->item_scale = 0.0f;
+    } else if (v->item_scale > 1.0f) {
+        v->item_scale = 1.0f;
+    }
+}
+
+/* Desired item-skeleton clip of a NET/ROD puppet this frame (see the row's item_* fields); rebinding keeps the puppet's own
+ * item_keyframe (ct'd once by pc_remote_player_item_skeleton_setup). */
+static void pc_remote_player_item_clip_bind(PCRemotePlayerVisual* v, int anim_idx, int mode, f32 frame) {
+    cKF_Animation_R_c* anim = (cKF_Animation_R_c*)mPlib_Get_Item_DataPointer(anim_idx);
+    if (anim == NULL) {
+        return;
+    }
+    cKF_SkeletonInfo_R_init_standard_setframeandspeedandmorphandmode(&v->item_keyframe, anim, NULL, frame, 0.5f, 0.0f, mode);
+    v->item_anim_idx = anim_idx;
+}
+
+static void pc_remote_player_item_tick(PCRemotePlayerActor* self, int held_moving) {
+    PCRemotePlayerVisual* v = &self->visual;
+    const PCStateRow* row = v->row_active ? pc_remote_player_row_for(v->row_idx) : NULL;
+    int cls = v->held_class;
+    int want, mode, force;
+    f32 frame;
+
+    if (!v->item_ready || (cls != PC_HELD_NET && cls != PC_HELD_ROD)) {
+        return;
+    }
+    /* carried default: nets KAMAE_MAIN_M (SetupItem_Base1), rods ROD_WAIT (idle) / ROD_MOVE (walk/run/dash, Base3) */
+    want = (cls == PC_HELD_NET) ? mPlayer_ITEM_DATA_KAMAE_MAIN_M
+                                : ((row == NULL && held_moving) ? mPlayer_ITEM_DATA_ROD_MOVE : mPlayer_ITEM_DATA_ROD_WAIT);
+    mode = cKF_FRAMECONTROL_REPEAT;
+    frame = 1.0f;
+    force = 0;
+    if (row != NULL && row->item_clip >= 0) {
+        /* vanilla only applies a clip whose data type fits the carried item (Check_ItemAnimationToItemKind) */
+        u8 type = mPlib_Get_Item_DataPointerType(row->item_clip);
+        if ((cls == PC_HELD_NET && type == mPlayer_ITEM_DATA_TYPE_NET_ANIMATION) ||
+            (cls == PC_HELD_ROD && type == mPlayer_ITEM_DATA_TYPE_ROD_ANIMATION)) {
+            want = row->item_clip;
+            mode = row->item_mode;
+            frame = row->item_start;
+            if ((row->flags & PC_ROWF_ITEM_CARRY) && v->item_carry_ok) {
+                frame = v->item_keyframe.frame_control.current_frame;
+                if (v->item_anim_idx == want && v->item_keyframe.frame_control.mode == mode) {
+                    v->item_restart = 0; /* same clip continues (cast_rod keeps ROD_SWING running) */
+                }
+            }
+            force = v->item_restart;
+        }
+    }
+    v->item_restart = 0;
+    if (force || want != v->item_anim_idx) {
+        pc_remote_player_item_clip_bind(v, want, mode, frame);
+    }
+}
+
+/* M9-C Phase 3: the puppet's scene is the local scene and that scene is the town FIELD. Factored out of the M9-B arming
+ * test (identical conditions) so presentation and collision cannot drift apart. */
+static int pc_remote_player_scene_is_local_field(const PCRemotePlayerSlot* slot, const GAME_PLAY* play) {
+    return slot->scene.valid && slot->scene.kind == (uint8_t)PC_NETSCENE_KIND_FIELD &&
+           (slot->scene.flags & PC_NETGAME_SCENE_FLAG_IN_TOWN) && slot->scene.scene_id == (uint8_t)play->scene_id &&
+           pc_net_game_scene_kind((int)play->scene_id) == PC_NETSCENE_KIND_FIELD;
+}
+
+/* Interiors: the puppet may be DRAWN (dw only) when the field rule holds, or when it and the local player are in the very same shared
+ * interior: both announced scenes are the same non-cottage interior scene id with the same owner (player room / NPC house owner id; 0 for the
+ * one-instance-per-town shops, post office, police box, museum, depart floors, needlework, kamakura, buggy, lighthouse, tent) and that scene is the
+ * one the local GAME_PLAY runs. Cottages (island, not shared: COTTAGE_MY/NPC owner is forced to 0) never match. Collision, effects, sounds, the
+ * arrival-train poll and the cosmetic building doors keep the field-only rule (pc_remote_player_scene_is_local_field). */
+static int pc_remote_player_scene_is_local_shown(const PCRemotePlayerSlot* slot, const GAME_PLAY* play) {
+    PCNetPlayerScene ls;
+    int sid;
+
+    if (pc_remote_player_scene_is_local_field(slot, play)) {
+        return 1;
+    }
+    if (!slot->scene.valid) {
+        return 0;
+    }
+    switch ((PCNetSceneKind)slot->scene.kind) {
+        case PC_NETSCENE_KIND_SHOP:
+        case PC_NETSCENE_KIND_POST_OFFICE:
+        case PC_NETSCENE_KIND_POLICE:
+        case PC_NETSCENE_KIND_MUSEUM:
+        case PC_NETSCENE_KIND_PLAYER_HOUSE:
+        case PC_NETSCENE_KIND_VILLAGER_HOUSE:
+        case PC_NETSCENE_KIND_OTHER_INTERIOR:
+            break;
+        default:
+            return 0;
+    }
+    sid = (int)slot->scene.scene_id;
+    if (sid == SCENE_COTTAGE_MY || sid == SCENE_COTTAGE_NPC) {
+        return 0;
+    }
+    if (!pc_net_game_get_local_scene(&ls)) {
+        return 0;
+    }
+    return (int)ls.scene_id == sid && (int)play->scene_id == sid && ls.owner == slot->scene.owner;
+}
+
+/* M9-B: decides whether this puppet's collision pipe is registered this frame. Returns NULL = arm; "hold" = a
+ * transient, deliberately silent skip (pause / net-or-axe swing / post-teleport-snap hold: no log state change);
+ * otherwise a DISARMED reason string for the log. Pure read-only evaluation. *out_local is set only when a real local
+ * player actor was found. Interiors: armed only for a shared non-player-house interior (scene_is_local_shown), never in door/outdoor/demo local states. */
+static const char* pc_remote_player_collide_eval(PCRemotePlayerActor* self, PCRemotePlayerSlot* slot, GAME* game,
+                                                 PLAYER_ACTOR** out_local, float* out_dist) {
+    GAME_PLAY* play = (GAME_PLAY*)game;
+    PLAYER_ACTOR* local;
+    float dx, dz, dist;
+    int main_index;
+    int in_interior;
+
+    *out_local = NULL;
+    *out_dist = 0.0f;
+
+    if (pc_host_observer_active()) {
+        return "observer"; /* --host-observer: the hidden server observer is never shoved by a puppet (it also registers no collider of its own) */
+    }
+    in_interior = 0;
+    if (!pc_remote_player_scene_is_local_field(slot, play)) {
+        /* Shared interior (same scene id + owner as the local scene, see scene_is_local_shown): arm the same pipe. Player rooms are armed
+         * only while furniture sync is in effect for the session (pc_net_game_house_sync_active): without it each process builds the room
+         * from its own save, so a puppet may stand inside a piece that only exists on the owner's side. */
+        if (!pc_remote_player_scene_is_local_shown(slot, play) ||
+            (slot->scene.kind == (uint8_t)PC_NETSCENE_KIND_PLAYER_HOUSE && !pc_net_game_house_sync_active())) {
+            return "scene";
+        }
+        in_interior = 1;
+    }
+    if (slot->snapshot_count == 0) {
+        return "no-snapshot";
+    }
+    if (!self->visual.initialized) {
+        return "no-visual";
+    }
+    /* building interactions: a puppet that is hidden, waiting for its first post-scene MOVE, or playing a door/knock/exit state
+     * (positions are scripted around a door) never shoves the local player */
+    if (slot->snap_req || pc_remote_player_body_hidden(self) ||
+        (self->visual.row_active && (self->visual.row_idx == (int)mPlayer_INDEX_KNOCK_DOOR ||
+                                     self->visual.row_idx == (int)mPlayer_INDEX_DOOR ||
+                                     self->visual.row_idx == (int)mPlayer_INDEX_OUTDOOR))) {
+        return "hold";
+    }
+    local = NULL;
+    if (Common_Get(player_actor_exists)) {
+        local = GET_PLAYER_ACTOR(play);
+    }
+    if (local == NULL || (uint64_t)(uintptr_t)local >= PC_LOWADDR_LIMIT) {
+        return "no-local";
+    }
+    *out_local = local;
+    dx = self->actor_class.world.position.x - local->actor_class.world.position.x;
+    dz = self->actor_class.world.position.z - local->actor_class.world.position.z;
+    dist = sqrtf(dx * dx + dz * dz);
+    *out_dist = dist;
+    slot->collide_target_ok = 1; /* eligible for the test hooks regardless of range/hold */
+    if (!(dist < PC_REMOTE_PLAYER_COLLIDE_RANGE)) { /* also rejects NaN */
+        return "range";
+    }
+
+    /* Transient holds. Pause: CollisionCheck_setOC() itself refuses while paused. Net/axe swing: the player's
+     * item-triangle check (OCC) ignores group flags, so a registered pipe would stop/reflect the swing. */
+    main_index = local->now_main_index;
+    /* guest arrival: while the LOCAL guest's ride-off demo actor exists (the train ride, the get-off, the welcome, and above all the scripted final walk to (2220, 840)) no puppet shoves it:
+     * the walk only ends at z >= 840 and cannot be interrupted, so a player already standing at that target (the guest that arrived first, or the one it shares the train with) would lock it
+     * in DEMO_WALK for good. Ordinary collision resumes the moment the demo actor is gone (control restored). */
+    if (Actor_info_name_search(&play->actor_info, mAc_PROFILE_RIDE_OFF_DEMO, ACTOR_PART_CONTROL) != NULL) {
+        return "hold";
+    }
+    if (in_interior) {
+        /* a stale puppet (owner stopped sending MOVE, e.g. an unannounced scene) is hidden by dw: it must not shove either */
+        if (gamePT != NULL && (graph_dt_frame_time(gamePT) - slot->last_move_recv_local_frame) > PC_REMOTE_PLAYER_ACTION_GAP_FRAMES) {
+            return "hold";
+        }
+        /* never while the local player is in a door / outdoor / intro / demo state (a puppet on the door mat must not shove a
+         * player who is entering or leaving) */
+        switch (main_index) {
+            case mPlayer_INDEX_INTRO:
+            case mPlayer_INDEX_RETURN_DEMO:
+            case mPlayer_INDEX_RETURN_OUTDOOR:
+            case mPlayer_INDEX_RETURN_OUTDOOR2:
+            case mPlayer_INDEX_DOOR:
+            case mPlayer_INDEX_OUTDOOR:
+            case mPlayer_INDEX_KNOCK_DOOR:
+            case mPlayer_INDEX_DEMO_WAIT:
+            case mPlayer_INDEX_DEMO_WALK:
+            case mPlayer_INDEX_DEMO_GETON_TRAIN:
+            case mPlayer_INDEX_DEMO_GETON_TRAIN_WAIT:
+            case mPlayer_INDEX_DEMO_GETOFF_TRAIN:
+            case mPlayer_INDEX_DEMO_STANDING_TRAIN:
+            case mPlayer_INDEX_DEMO_WADE:
+            case mPlayer_INDEX_DEMO_GETON_BOAT:
+            case mPlayer_INDEX_DEMO_GETON_BOAT_SITDOWN:
+            case mPlayer_INDEX_DEMO_GETON_BOAT_WAIT:
+            case mPlayer_INDEX_DEMO_GETON_BOAT_WADE:
+            case mPlayer_INDEX_DEMO_GETOFF_BOAT_STANDUP:
+            case mPlayer_INDEX_DEMO_GETOFF_BOAT:
+            case mPlayer_INDEX_DEMO_GET_GOLDEN_ITEM:
+            case mPlayer_INDEX_DEMO_GET_GOLDEN_ITEM2:
+            case mPlayer_INDEX_DEMO_GET_GOLDEN_AXE_WAIT:
+                return "hold";
+            default:
+                break;
+        }
+    }
+    if (_Game_play_isPause(play) == 1 || main_index == mPlayer_INDEX_SWING_AXE || main_index == mPlayer_INDEX_SWING_NET) {
+        return "hold";
+    }
+    {
+        extern int g_pc_submenu_world_tick; /* m_actor.c: set while m_play.c ticks this puppet with a submenu open (no OC pass runs) */
+        if (g_pc_submenu_world_tick) {
+            return "hold";
+        }
+    }
+    if (self->collide_hold > 0) {
+        self->collide_hold--;
+        return "hold";
+    }
+    return NULL;
+}
+
+/* M9-B: opt-in for the periodic/per-contact "[NET][COLLIDE][DIAG] player N frame=..." lines. Off by default (normal
+ * gameplay stays quiet); enabled by PC_COLLIDE_DIAG=1 in the environment (read once and cached, like
+ * PC_NPC_TALKHOLD_DIAG) or by the --collide-test-* hook flags. The ARMED/DISARMED transition lines and the rare
+ * peak / failed-setOC lines are not gated. */
+static int pc_remote_player_collide_diag(void) {
+    static int s_diag = -1;
+    if (s_diag < 0) {
+        const char* e = getenv("PC_COLLIDE_DIAG");
+        s_diag = (e != NULL && e[0] == '1') ? 1 : 0;
+    }
+    return s_diag;
+}
+
+/* M9-B: called at the end of pc_remote_player_mv(). Registers the puppet's pipe with the vanilla OC pass (stateless:
+ * the collider table is cleared every frame, so disarming is just "don't call setOC"). The vanilla solver
+ * (CollisionCheck_OC at the top of the NEXT frame's play update, m_play.c) writes status_data.collision_vec only on
+ * the local player (the puppet is MASSTYPE_HEAVY so a normal-weight player takes the whole push, an idle/HEAVY
+ * player half), and Actor_position_move() inside the player's own movement applies it; the player's own BG check
+ * corrects walls the same frame. The puppet's own collision_vec is cleared right after its mv (Actor_info_call_actor)
+ * and is never applied: puppet position stays purely interpolated. */
+static void pc_remote_player_collide_update(PCRemotePlayerActor* self, PCRemotePlayerSlot* slot, GAME* game) {
+    GAME_PLAY* play = (GAME_PLAY*)game;
+    PLAYER_ACTOR* local = NULL;
+    float dist = 0.0f;
+    const char* reason;
+    ACTOR* actor = &self->actor_class;
+
+    slot->collide_target_ok = 0;
+    reason = pc_remote_player_collide_eval(self, slot, game, &local, &dist);
+
+    if (reason != NULL) {
+        if (strcmp(reason, "observer") == 0) {
+            static int s_observer_disarm_logged = 0;
+            slot->collide_armed = 0;
+            if (!s_observer_disarm_logged) {
+                s_observer_disarm_logged = 1;
+                printf("[NET][COLLIDE] player %d: collider DISARMED reason=observer\n", (int)self->peer);
+            }
+            return;
+        }
+        if (strcmp(reason, "hold") != 0 && slot->collide_armed) {
+            slot->collide_armed = 0;
+            printf("[NET][COLLIDE] player %d: collider DISARMED reason=%s\n", (int)self->peer, reason);
+        }
+        return;
+    }
+
+    {
+        /* Read-only diagnostics BEFORE setOC (which clears the pipe's COLLIDED flag): the UNUSED part runs before
+         * PLAYER in Actor_info_call_actor and only the player's own clear (after its mv) zeroes its collision_vec,
+         * so collision_vec still holds the push this frame's OC pass produced. */
+        const xyz_t* push = &local->actor_class.status_data.collision_vec;
+        int hit = (self->col_pipe.collision_obj.collision_flags0 & ClObj_FLAG_COLLIDED) != 0;
+        int test_active = (g_pc_collide_test_overlap || g_pc_collide_test_approach > 0);
+        int pushed = (push->x != 0.0f || push->z != 0.0f);
+        u32 fc = game->frame_counter;
+
+        if (!slot->collide_armed) {
+            slot->collide_armed = 1;
+            printf("[NET][COLLIDE] player %d: collider ARMED\n", (int)self->peer);
+        }
+        if ((pc_remote_player_collide_diag() || test_active) &&
+            ((test_active && (pushed || hit || dist < 60.0f)) || (pushed && (fc % 15) == 0) || (fc % 120) == 0)) {
+            printf("[NET][COLLIDE][DIAG] player %d frame=%u xz_dist=%.2f push=(%.2f,%.2f) local=(%.2f,%.2f) "
+                   "puppet=(%.2f,%.2f) hit=%d wt=%d main=%d peak_oc=%d failed_setoc=%d\n",
+                   (int)self->peer, (unsigned)fc, (double)dist, (double)push->x, (double)push->z,
+                   (double)local->actor_class.world.position.x, (double)local->actor_class.world.position.z,
+                   (double)actor->world.position.x, (double)actor->world.position.z, hit,
+                   (int)local->actor_class.status_data.weight, (int)local->now_main_index, s_collide_peak_colliders, s_collide_failed_setoc);
+        }
+    }
+
+    CollisionCheck_Uty_ActorWorldPosSetPipeC(actor, &self->col_pipe); /* interpolated render position, s16 centre */
+    if (CollisionCheck_setOC(game, &play->collision_check, &self->col_pipe.collision_obj) < 0) {
+        s_collide_failed_setoc++;
+        if (s_collide_failed_setoc == 1 || (s_collide_failed_setoc % 600) == 0) {
+            printf("[NET][COLLIDE][DIAG] setOC failed (collider table full / paused / skipped) count=%d\n",
+                   s_collide_failed_setoc);
+        }
+    }
+}
+
+/* ====================================================================================================================
+ * M9-C Phase 3: puppet-safe locomotion cosmetics (footsteps, foot/skid/tumble effects, idle ripple). No wire change.
+ *
+ * Everything here runs ONLY from pc_remote_player_mv() (never from a network handler), reads only puppet-owned state
+ * (its interpolated position/angle/speed/move_state/state row, keyframe0 frame control, the foot positions its OWN
+ * after-draw callback captured) plus read-only world data (ground attribute, season/weather), and spawns through the
+ * global effect clip / sAdo_* one-shots. It never calls a Player_actor_* function, a vanilla draw callback, the local
+ * player's sound-status path (sAdo_PlyWalkSe / sAdo_PlayerStatusLevel) or anything that mutates world state: the
+ * dash-flower trample (RANDOM + mFI_SetFG_common + island log) is deliberately NOT replayed.
+ * ================================================================================================================== */
+
+#define PC_PUPPET_FX_EFFECT_RANGE 500.0f /* box half-extent (|dx|,|dz|,|dy|) within which a puppet may spawn effects. Effect
+                                          * profiles die at 800 (eEC_DEFAULT_DEATH_DIST, eEC_DistDeath: same 3-axis box test
+                                          * against the LOCAL player), so 500 keeps every spawned effect alive for its life. */
+#define PC_PUPPET_FX_SOFT_RANGE 250.0f   /* range used instead while the pool is above PC_PUPPET_FX_POOL_SOFT (nearest first) */
+#define PC_PUPPET_FX_SOUND_RANGE 600.0f  /* footstep/tumble sounds are positional one-shots (distance attenuated by the mixer) */
+#define PC_PUPPET_FX_POOL_SOFT 50        /* of eEC_EFFECT_ACTIVE_MAX (100): above this, shrink the range */
+#define PC_PUPPET_FX_POOL_HARD 70        /* a spawn is refused (budget=pool) when pool_count + its fan-out would exceed this, so the
+                                          * local player keeps ~30 slots (review R3-L2: top-level spawns are weighted by the number of
+                                          * sub-effect slots their init/ct claims, see pc_puppet_fx_fanout) */
+#define PC_PUPPET_FX_FRAME_CAP 3         /* top-level effect spawns per game frame across ALL puppets */
+#define PC_PUPPET_SND_FRAME_CAP 4        /* puppet sounds per game frame across ALL puppets */
+#define PC_PUPPET_FX_BUCKET_MAX 4.0f     /* per-puppet effect burst */
+#define PC_PUPPET_FX_REFILL_PER_FRAME (10.0f / 60.0f) /* per-puppet sustained cap: 10 top-level effects per second */
+#define PC_PUPPET_FOOT_COOLDOWN_FRAMES 8.0  /* min spacing between two foot triggers of one puppet (WALK/IDLE flicker) */
+#define PC_PUPPET_EDGE_COOLDOWN_FRAMES 30.0 /* min spacing between two identical one-shot edges (skid in/out, tumble) */
+#define PC_PUPPET_FX_ITEM_NAME_BASE 0xFEE0u /* + wire id: per-puppet effect item_name (the local player uses RSV_NO 0xFFFF). 0xFEC3..0xFFDF is unused by m_name_table.h (its highest item name
+                                              * below RSV_WALL_NO is 0xFEC2); the old base 0xFFE0 left room for 17 ids only, so it could not outgrow the 9-slot table. */
+_Static_assert(PC_PUPPET_FX_ITEM_NAME_BASE + (PC_PUPPET_ID_LIMIT - 1) < 0xFFF1u, "PC_PUPPET_FX_ITEM_NAME_BASE + wire id must stay below the PC_TID_* ids (0xFFF1..)");
+_Static_assert(PC_PUPPET_FX_ITEM_NAME_BASE > 0xFEC2u, "the puppet effect item names must not overlap a real item name (m_name_table.h ends at 0xFEC2 below RSV_WALL_NO)");
+#define PC_PUPPET_FOOT_STALE_FRAMES 3       /* captured foot data older than this (game frames) is replaced by the fallback */
+#define PC_PUPPET_FOOT_FALLBACK_OFFSET 7.0f /* lateral offset (world units) of the fallback foot positions */
+#define PC_PUPPET_FX_DIAG_MAX_OK 40         /* diag lines per puppet actor and (cosmetic name) when it was spawned */
+#define PC_PUPPET_FX_DIAG_MAX_SUPPRESSED 4  /* ... per (cosmetic name, reason) when it was suppressed */
+#define PC_PUPPET_PENDING_FRAMES 12.0       /* a foot step denied only by the frame cap is retried for this many frames */
+#define PC_PUPPET_RIPPLE_PERIOD 8.0f        /* Player_actor_set_ripple period (60fps frames) */
+#define PC_PUPPET_MAX_DT_FRAMES 4.0f        /* a frame step above this suppresses frame-window triggers (hitch) */
+
+/* Foot clip frames (vanilla Player_actor_Check_{Left,Right}FootMark_AnimeFrame_fromAnimeIndex data tables,
+ * m_player_common.c_inc: left_data_{walk1,run1,dash1} = {1}, right_data_{walk1,run1,dash1} = {9}; RUN_SLIP1 = none;
+ * SetEffect_Walk/Dash(actor, game, 1.0f, 9.0f) use the same pair). */
+#define PC_PUPPET_FOOT_LEFT_FRAME 1.0f
+#define PC_PUPPET_FOOT_RIGHT_FRAME 9.0f
+
+enum { PC_PIECE_FOOTPRINT = 0, PC_PIECE_SOUND = 1, PC_PIECE_DUST = 2 }; /* pieces of one foot step */
+
+enum { /* PCRemotePlayerCosmetic::state */
+    PC_COS_NONE = 0,
+    PC_COS_IDLE,
+    PC_COS_MOVE,      /* WALK1 / RUN1 / DASH1 clip on the body layer */
+    PC_COS_TURN,      /* RUN_SLIP1 (the skid) */
+    PC_COS_TUMBLE,    /* state row TUMBLE (frame triggers available) */
+    PC_COS_TUMBLE_MV, /* move_state TUMBLE without a row (v6 sender): entry edge only */
+};
+
+static int s_puppet_fx_frame_valid = 0;
+static u32 s_puppet_fx_frame = 0;
+static int s_puppet_fx_frame_count = 0;
+static int s_puppet_snd_frame_count = 0;
+static int s_puppet_fx_peak_frame = 0; /* diag: highest per-frame spawn count observed */
+
+/* eEC_pc_count_active / eEC_pc_source_pos_override: declared in ef_effect_control.h (TARGET_PC) */
+
+
+/* M9-C Phase 3: puppet-owned foot position for foot index 0 = left / 1 = right. Uses the data this puppet's own
+ * after-draw callback captured during its last body draw (one frame of lag, like vanilla's own callbacks which also run
+ * during the draw after the move); falls back to the puppet's world position +- a lateral offset (facing based) when no
+ * recent capture exists (first frames, culled/hidden puppet, a frame without a draw). */
+static void pc_puppet_foot_get(const PCRemotePlayerActor* self, const GAME* game, int idx, xyz_t* out_pos, s16* out_angle) {
+    const PCRemotePlayerCosmetic* c = &self->cos;
+    u32 fc = game->frame_counter;
+
+    if (c->foot_frame[idx] != 0 && (fc + 1u) - c->foot_frame[idx] <= (u32)PC_PUPPET_FOOT_STALE_FRAMES) {
+        *out_pos = c->foot_pos[idx];
+        *out_angle = c->foot_angle_y[idx];
+    } else {
+        float a = (float)self->actor_class.world.angle.y * (3.14159265f / 32768.0f);
+        float side = (idx == 0) ? -PC_PUPPET_FOOT_FALLBACK_OFFSET : PC_PUPPET_FOOT_FALLBACK_OFFSET;
+
+        *out_pos = self->actor_class.world.position;
+        out_pos->x += side * cosf(a); /* local +x is (cos, -sin), see Player_actor_Check_FlatPlace's offset rotation */
+        out_pos->z -= side * sinf(a);
+        *out_angle = self->actor_class.world.angle.y;
+    }
+}
+
+/* Decides whether a puppet cosmetic may be produced right now. NULL = allowed (and the budget slot is consumed);
+ * otherwise the reason token used in the diagnostics: scene | pause | hidden | null | range | pool | capped. */
+static const char* pc_puppet_fx_reason_cost(PCRemotePlayerActor* self, PCRemotePlayerSlot* slot, GAME* game, int is_sound,
+                                            int fanout) {
+    GAME_PLAY* play = (GAME_PLAY*)game;
+    PCRemotePlayerCosmetic* c = &self->cos;
+    PLAYER_ACTOR* local = NULL;
+    float limit;
+    float dx, dz, dy;
+    u32 fc = game->frame_counter;
+    int pool = 0;
+
+    if (!pc_remote_player_scene_is_local_field(slot, play) || slot->snapshot_count == 0 || !self->visual.initialized) {
+        return "scene"; /* includes an unknown (never announced) puppet scene */
+    }
+    if (pc_remote_player_body_hidden(self)) {
+        return "hidden";
+    }
+    if (_Game_play_isPause(play) == 1) {
+        return "pause";
+    }
+    if (!is_sound) {
+        /* The clip is created by the effect-control actor's ct and cleared by its dt (ef_effect_control.c): it can be
+         * NULL right after a scene change, before the controller exists, and in scenes without one. */
+        if (eEC_CLIP == NULL || eEC_CLIP->effect_make_proc == NULL || eEC_CLIP->make_effect_proc == NULL) {
+            return "null";
+        }
+    }
+    if (!Common_Get(player_actor_exists)) {
+        return "scene";
+    }
+    local = GET_PLAYER_ACTOR(play);
+    if (local == NULL || (uint64_t)(uintptr_t)local >= PC_LOWADDR_LIMIT) {
+        return "scene";
+    }
+    limit = is_sound ? PC_PUPPET_FX_SOUND_RANGE : PC_PUPPET_FX_EFFECT_RANGE;
+    dx = self->actor_class.world.position.x - local->actor_class.world.position.x;
+    dz = self->actor_class.world.position.z - local->actor_class.world.position.z;
+    dy = self->actor_class.world.position.y - local->actor_class.world.position.y;
+    if (!(fabsf(dx) <= limit && fabsf(dz) <= limit && fabsf(dy) <= limit)) { /* also rejects NaN */
+        return "range";
+    }
+    if (!is_sound) {
+        pool = eEC_pc_count_active();
+        if (pool + fanout > PC_PUPPET_FX_POOL_HARD) {
+            return "pool";
+        }
+        if (pool > PC_PUPPET_FX_POOL_SOFT &&
+            !(fabsf(dx) <= PC_PUPPET_FX_SOFT_RANGE && fabsf(dz) <= PC_PUPPET_FX_SOFT_RANGE &&
+              fabsf(dy) <= PC_PUPPET_FX_SOFT_RANGE)) {
+            return "pool"; /* nearest puppets first while the pool is filling up */
+        }
+    }
+
+    /* budgets */
+    if (!s_puppet_fx_frame_valid || s_puppet_fx_frame != fc) {
+        s_puppet_fx_frame_valid = 1;
+        s_puppet_fx_frame = fc;
+        s_puppet_fx_frame_count = 0;
+        s_puppet_snd_frame_count = 0;
+    }
+    if (is_sound) {
+        if (s_puppet_snd_frame_count >= PC_PUPPET_SND_FRAME_CAP) {
+            return "capped";
+        }
+        s_puppet_snd_frame_count++;
+    } else {
+        double now = graph_dt_frame_time(game);
+
+        if (!c->bucket_init) {
+            c->bucket_init = 1;
+            c->tokens = PC_PUPPET_FX_BUCKET_MAX;
+            c->bucket_time = now;
+        } else if (now > c->bucket_time) {
+            c->tokens += (float)(now - c->bucket_time) * PC_PUPPET_FX_REFILL_PER_FRAME;
+            if (c->tokens > PC_PUPPET_FX_BUCKET_MAX) {
+                c->tokens = PC_PUPPET_FX_BUCKET_MAX;
+            }
+            c->bucket_time = now;
+        }
+        if (c->tokens < 1.0f || s_puppet_fx_frame_count >= PC_PUPPET_FX_FRAME_CAP) {
+            return "capped";
+        }
+        c->tokens -= 1.0f;
+        s_puppet_fx_frame_count++;
+        if (s_puppet_fx_frame_count > s_puppet_fx_peak_frame) {
+            s_puppet_fx_peak_frame = s_puppet_fx_frame_count;
+            if (pc_remote_player_puppet_diag()) {
+                printf("[NET][PUPPET][DIAG] cosmetic per-frame spawn peak=%d cap=%d\n", s_puppet_fx_peak_frame,
+                       PC_PUPPET_FX_FRAME_CAP);
+            }
+        }
+    }
+    return NULL;
+}
+
+/* Review R3-L2: extra pool slots one top-level spawn claims beyond what the old per-spawn check saw (estimated from the
+ * effect sources; a SLOT is one eEC_ctrl_work.effects entry):
+ *   DIG_SCOOP (ef_dig_scoop.c init, makes only children): arg1 0 = 6 DIG_MUD; arg1 1 on bush = 5 BUSH_HAPPA (+5 BUSH_YUKI in
+ *     winter, the reflect winter-bush path) = up to 10 (the worst case, used); the other variants make <= 6 (yukidama 4 /
+ *     sandsplash 3 / tumble dust 3 / mizutama 4 + ami_mizu).
+ *   DIG_HOLE (ef_dig_hole.c ct): itself + 1 DIG_MUD (fill) + 2 MIZUTAMA (water) = 4.
+ *   DASH_ASIMOTO (ef_dash_asimoto.c): itself + 2 HANABIRA + 3 BUSH_HAPPA + 3 BUSH_YUKI = 9 worst case; WALK_ASIMOTO
+ *     (ef_walk_asimoto.c) about 5. 10 is used for both (a safe upper bound: puppet foot dust simply stops a little earlier).
+ * Everything else keeps the old check (0 extra). */
+static int pc_puppet_fx_fanout(int fx_id) {
+    switch (fx_id) {
+        case eEC_EFFECT_DIG_SCOOP:
+            return 10;
+        case eEC_EFFECT_DIG_HOLE:
+            return 4;
+        case eEC_EFFECT_DASH_ASIMOTO:
+        case eEC_EFFECT_WALK_ASIMOTO:
+            return 10;
+        default:
+            return 0;
+    }
+}
+
+static const char* pc_puppet_fx_reason(PCRemotePlayerActor* self, PCRemotePlayerSlot* slot, GAME* game, int is_sound) {
+    return pc_puppet_fx_reason_cost(self, slot, game, is_sound, 0);
+}
+
+/* Review H1: kill this puppet's own continuous ASE2 pitfall sweat (vanilla: effect_kill_proc(ASE2, RSV_NO) in
+ * struggle_pitfall.c_inc:27 / ready_pitfall.c_inc:56). eEC_Name2EffectKill matches id AND item_name, so only the effect
+ * spawned with this puppet's item_name dies, never the local player's (RSV_NO). ASE2's profile is eEC_IMMEDIATE_DEATH: the
+ * slot is freed at once, so a following pitfall spawns a fresh one. Safe with a NULL clip (scene change / no controller:
+ * the pool is gone with it); only acts when this puppet spawned one (sweat_active). */
+static void pc_puppet_sweat_kill(PCRemotePlayerActor* self, const char* reason) {
+    if (!self->cos.sweat_active) {
+        return;
+    }
+    self->cos.sweat_active = 0;
+    if (eEC_CLIP != NULL && eEC_CLIP->effect_kill_proc != NULL) {
+        eEC_CLIP->effect_kill_proc(eEC_EFFECT_ASE2, (u16)(PC_PUPPET_FX_ITEM_NAME_BASE + (u32)self->peer));
+        if (pc_remote_player_puppet_diag()) {
+            printf("[NET][PUPPET][DIAG] player %d pitfall sweat kill reason=%s\n", (int)self->peer, reason);
+        }
+    }
+}
+
+/* Actor dt (scene teardown / reaped after Actor_delete): last chance to free the puppet's sweat. */
+static void pc_remote_player_dt(ACTOR* actor, GAME* game) {
+    (void)game;
+    pc_puppet_sweat_kill((PCRemotePlayerActor*)actor, "scene");
+}
+
+/* Rate limiter shared by every puppet cosmetic diag line: 1 = this (what, name, budget) key may still print. */
+static int pc_puppet_diag_allow(PCRemotePlayerActor* self, const char* what, const char* name, const char* budget) {
+    PCRemotePlayerCosmetic* c = &self->cos;
+    int ok = (strcmp(budget, "ok") == 0);
+    char key[40];
+    int i;
+
+    if (!pc_remote_player_puppet_diag()) {
+        return 0;
+    }
+    snprintf(key, sizeof(key), "%s/%s/%s", what, name, ok ? "ok" : budget);
+    for (i = 0; i < (int)(sizeof(c->diag) / sizeof(c->diag[0])); i++) {
+        if (c->diag[i].key[0] == '\0') {
+            strcpy(c->diag[i].key, key);
+            break;
+        }
+        if (strcmp(c->diag[i].key, key) == 0) {
+            break;
+        }
+    }
+    if (i >= (int)(sizeof(c->diag) / sizeof(c->diag[0])) ||
+        c->diag[i].n >= (ok ? PC_PUPPET_FX_DIAG_MAX_OK : PC_PUPPET_FX_DIAG_MAX_SUPPRESSED)) {
+        return 0;
+    }
+    c->diag[i].n++;
+    return 1;
+}
+
+static void pc_puppet_fx_diag(PCRemotePlayerActor* self, const char* what, const char* name, float frame, int attr,
+                              const char* budget) {
+    if (!pc_puppet_diag_allow(self, what, name, budget)) {
+        return;
+    }
+    if (strcmp(what, "effect") == 0) {
+        printf("[NET][PUPPET][DIAG] player %d cosmetic effect=%s frame=%.1f pos=(%.0f,%.0f) attr=%d budget=%s\n",
+               (int)self->peer, name, (double)frame, (double)self->actor_class.world.position.x,
+               (double)self->actor_class.world.position.z, attr, budget);
+    } else {
+        printf("[NET][PUPPET][DIAG] player %d %s sound label=%d frame=%.1f budget=%s\n", (int)self->peer, name, attr,
+               (double)frame, budget);
+    }
+}
+
+/* One effect through the global clip: gated, budgeted, null-checked. `weather_sensitive`: the effect's init/ct indexes a
+ * per-weather table (ef_walk_asimoto.c:92-110, ef_dash_asimoto.c:165-181) that is NULL/short for "leaves" when BUGFIXES is
+ * off (a NULL call / one-past-the-end read): the caller-side guard skips exactly that condition (and any out-of-range
+ * weather value) instead of editing the effect files. BUGFIXES is defined for this target, which makes the table
+ * complete; the guard stays as defence in depth. */
+static void pc_puppet_fx_refund(PCRemotePlayerActor* self);
+static int pc_puppet_tool_fx_noop(PCRemotePlayerActor* self, PCRemotePlayerSlot* slot, GAME* game, int fx_id, int arg1);
+
+/* M9-C Phase 6b: optional per-spawn extras (NULL = the Phase 3-6a behaviour). */
+typedef struct PCFxOpts {
+    const xyz_t* attr_pos; /* ground attribute is read here instead of at the puppet (vanilla: mCoBG_Wpos2Attribute(*pos)) */
+    int attr_force;        /* >= 0: this attribute value is passed as arg0 (vanilla passes a literal 0) */
+    int angle_zero;        /* vanilla passes angle 0 */
+    int dig_src;           /* ef_dig_hole / ef_dig_scoop: puppet position replaces the local player's (eEC_pc_source_pos_override) */
+} PCFxOpts;
+
+static int pc_puppet_fx_emit_core(PCRemotePlayerActor* self, PCRemotePlayerSlot* slot, GAME* game, int fx_id,
+                                  const char* name, const xyz_t* pos, s16 angle, float frame, s16 arg1,
+                                  int weather_sensitive, int retry, const PCFxOpts* opts) {
+    const char* reason = NULL;
+    int attr = -1;
+    PCRemotePlayerCosStats* st = &slot->cos_stats;
+
+    if (weather_sensitive) {
+        int w = mEnv_NowWeather();
+
+        if (w < 0 || w >= mEnv_WEATHER_NUM) {
+            reason = "weather";
+        }
+#ifndef BUGFIXES
+        else if (w == mEnv_WEATHER_LEAVES) {
+            reason = "weather";
+        }
+#endif
+    }
+    if (reason == NULL) {
+        reason = pc_puppet_fx_reason_cost(self, slot, game, 0, pc_puppet_fx_fanout(fx_id));
+    }
+    if (reason != NULL && retry && strcmp(reason, "capped") == 0) {
+        return 0; /* deferred: the caller retries next frame (counted only if it finally expires) */
+    }
+    if (reason == NULL && pc_puppet_tool_fx_noop(self, slot, game, fx_id, (int)arg1)) {
+        /* M9-C Phase 6a: vanilla's init would spawn nothing visible here (swing rod / swing axe start on non-bush ground):
+         * all gates passed, the budget slot is returned and no pool slot is burned. Other effects never match. */
+        pc_puppet_fx_refund(self);
+        slot->cos_stats.tool_noop++;
+        pc_puppet_fx_diag(self, "effect", name, frame, -1, "noop");
+        return 1;
+    }
+    if (reason == NULL) {
+        /* Scene == local scene was verified by pc_puppet_fx_reason(): mCoBG_Wpos2Attribute reads the CURRENT scene's
+         * collision data, which is what the puppet's position refers to. Pure read (no cant_dig out-param). */
+        if (opts != NULL && opts->attr_force >= 0) {
+            attr = opts->attr_force;
+        } else {
+            xyz_t apos = (opts != NULL && opts->attr_pos != NULL) ? *opts->attr_pos : self->actor_class.world.position;
+
+            attr = (int)mCoBG_Wpos2Attribute(apos, NULL);
+        }
+        if (opts != NULL && opts->angle_zero) {
+            angle = 0;
+        }
+        if (opts != NULL && opts->dig_src) {
+            eEC_pc_source_pos_override = &self->actor_class.world.position; /* cleared right after the one call */
+        }
+        eEC_CLIP->effect_make_proc(fx_id, *pos, 2, angle, game, (u16)(PC_PUPPET_FX_ITEM_NAME_BASE + (u32)self->peer),
+                                   (s16)attr, arg1);
+        eEC_pc_source_pos_override = NULL;
+        st->spawned++;
+        pc_puppet_fx_diag(self, "effect", name, frame, attr, "ok");
+    } else {
+        if (strcmp(reason, "capped") == 0) {
+            st->capped++;
+        } else {
+            st->suppressed++;
+        }
+        pc_puppet_fx_diag(self, "effect", name, frame, -1, reason);
+    }
+    return 1;
+}
+
+static int pc_puppet_fx_emit_ex(PCRemotePlayerActor* self, PCRemotePlayerSlot* slot, GAME* game, int fx_id,
+                                const char* name, const xyz_t* pos, s16 angle, float frame, s16 arg1, int weather_sensitive,
+                                int retry) {
+    return pc_puppet_fx_emit_core(self, slot, game, fx_id, name, pos, angle, frame, arg1, weather_sensitive, retry, NULL);
+}
+
+static void pc_puppet_fx_emit(PCRemotePlayerActor* self, PCRemotePlayerSlot* slot, GAME* game, int fx_id, const char* name,
+                              const xyz_t* pos, s16 angle, float frame, s16 arg1, int weather_sensitive) {
+    (void)pc_puppet_fx_emit_ex(self, slot, game, fx_id, name, pos, angle, frame, arg1, weather_sensitive, 0);
+}
+
+/* Footstep (NPC-style path: sAdo_NpcWalkSe + sAdo_Get_WalkLabel, exactly aNPC_WalkSe in ac_npc_sound.c_inc, never the
+ * local-player sAdo_PlyWalkSe/sou_walk_flag) or tumble sound (sAdo_OngenTrgStart with sAdo_Get_KokeruLabel, exactly the
+ * body of Player_actor_sound_Tumble / aNPC_TumbleSe). Outdoor (field) only: interior floor sounds are not played. */
+static int pc_puppet_snd_emit_ex(PCRemotePlayerActor* self, PCRemotePlayerSlot* slot, GAME* game, int tumble, float frame,
+                                 int retry) {
+    const char* reason = pc_puppet_fx_reason(self, slot, game, 1);
+    PCRemotePlayerCosStats* st = &slot->cos_stats;
+    const char* what = tumble ? "tumble" : "footstep";
+
+    if (reason != NULL && retry && strcmp(reason, "capped") == 0) {
+        return 0;
+    }
+    if (reason == NULL) {
+        xyz_t pos = self->actor_class.world.position;
+        u32 attr = mCoBG_Wpos2Attribute(pos, NULL);
+        u16 label;
+
+        if (tumble) {
+            label = sAdo_Get_KokeruLabel((int)attr);
+            sAdo_OngenTrgStart(label, &pos);
+        } else {
+            label = sAdo_Get_WalkLabel((int)attr);
+            if (sAdo_CheckOnPlussBridge(&pos, attr)) {
+                label = NA_SE_FOOTSTEP_PLUSSBRIDGE;
+            }
+            sAdo_NpcWalkSe(label, &pos);
+        }
+        st->sounds++;
+        pc_puppet_fx_diag(self, what, what, frame, (int)label, "ok");
+    } else {
+        st->sounds_suppressed++;
+        pc_puppet_fx_diag(self, what, what, frame, -1, reason);
+    }
+    return 1;
+}
+
+static void pc_puppet_snd_emit(PCRemotePlayerActor* self, PCRemotePlayerSlot* slot, GAME* game, int tumble, float frame) {
+    (void)pc_puppet_snd_emit_ex(self, slot, game, tumble, frame, 0);
+}
+
+/* Window test of Player_actor_Check_AnimationFrame_Common for a positive-speed clip, over the REAL previous/current
+ * frames this puppet observed (so it is independent of dt scaling): last < target <= cur, with the repeat-clip wrap
+ * (frames run 1..max_frames; vanilla's `1.0f <= target <= cur` branch after the wrap). */
+static int pc_puppet_frame_crossed(float last, float cur, float max_frames, float target) {
+    if (cur >= last) {
+        return last < target && target <= cur;
+    }
+    return (last < target && target <= max_frames) || (1.0f <= target && target <= cur);
+}
+
+/* ====================================================================================================================
+ * M9-C Phase 4: remote tree-shake presentation (cosmetic only).
+ *
+ * Vanilla chain (all local to the shaking process): CheckAndRequest_main_shake_tree_all finds the tree with
+ * Get_shake_tree_position_and_itemNo (read-only 8-neighbour search over the LOCAL fg grid), then the SHAKE_TREE state (index
+ * 89, SHAKE1 anim, STOP, speed 0.5) fires at keyframe0 frame 10 (SetEffect_Shake_tree, m_player_main_shake_tree.c_inc:52-99):
+ * Set_shake_tree_table -> Set_EffectBgTree -> Make_EffectBG(EffectBG_EFFECT_SHAKE_LARGE, variant, tile centre) + the
+ * NA_SE_TREE_YURASU one-shot at the tree. Everything after that (item_tree_fruit_drop_proc / request_tree_shake / bees /
+ * insect reactions) is gameplay and is NOT reproduced: the host stays the only authority for the tile (FIELD_UPDATE).
+ * The puppet re-derives the tree from its own interpolated position/facing at frame 10; it reads only mFI_/mCoBG_ pure
+ * accessors of the current scene and spawns through the public clip (CLIP(make_effect_bg_proc)).
+ * ================================================================================================================== */
+
+#define PC_PUPPET_TREE_FRAME 10.0f          /* SHAKE1 keyframe0 frame of SetEffect_Shake_tree (Check_AnimationFrame 10.0f) */
+#define PC_PUPPET_TREE_COOLDOWN_FRAMES 84.0 /* vanilla shake_tree_timer (Set_shake_tree_table 84.0f): per-puppet min spacing */
+#define PC_PUPPET_TREE_GLOBAL_SPACING 30.0  /* at most one puppet-driven tree effect per this many frames across all puppets */
+#define PC_PUPPET_TREE_RETRY_FRAMES 60.0    /* an effect denied only by a cap is retried this long */
+#define PC_PUPPET_TREE_EFBG_MAX_ACTIVE 1    /* EffectBG pool = 3 slots: a puppet spawns only while <= 1 is busy (>= 1 stays free) */
+#define PC_PUPPET_TREE_DUP_RADIUS 20.0f     /* an active EffectBG whose base is within this XZ distance is "the same tile" */
+#define PC_PUPPET_TREE_RING 4
+
+/* Effectbg_pc_count_active / Effectbg_pc_count_near: declared in ac_effectbg.h (TARGET_PC) */
+
+static struct {
+    int ux, uz;
+    double t;
+    int used;
+} s_tree_ring[PC_PUPPET_TREE_RING]; /* recently presented tiles (any puppet): a second puppet on the same tree = "cooldown" */
+static int s_tree_ring_next = 0;
+static int s_tree_global_valid = 0;
+static int s_tree_diag_efbg = -1; /* EffectBG slots busy when the last attempt started (-1 = no EffectBG actor); diag only */
+static double s_tree_global_last = 0.0;
+
+/* Puppet-owned mirror of Player_actor_Get_shake_tree_position_and_itemNo (m_player_common.c_inc:6243-6330) followed by the
+ * mFI_Wpos2UtNum of Player_actor_CheckAndRequest_main_shake_tree_all: same neighbour order (row-major, centre skipped), same
+ * tile filters (IS_ITEM_COLLIDEABLE_TREE, |dy| <= 10, dist^2 < unit base size^2, facing within 45 degrees, first strictly
+ * smaller angle wins). Pure reads of the current scene's field/collision data. Returns the tree item (EMPTY_NO = none) and
+ * fills the tile and its centre position. */
+static mActor_name_t pc_puppet_find_shake_tree(const xyz_t* ppos, s16 facing, int* out_ux, int* out_uz, xyz_t* out_pos) {
+    xyz_t center_pos;
+
+    *out_ux = -1;
+    *out_uz = -1;
+    *out_pos = *ppos;
+    if (mFI_Wpos2UtCenterWpos(&center_pos, *ppos)) {
+        static const f32 add_X[] = { -mFI_UT_WORLDSIZE_X_F, 0.0f, mFI_UT_WORLDSIZE_X_F, -mFI_UT_WORLDSIZE_X_F,
+                                     mFI_UT_WORLDSIZE_X_F, -mFI_UT_WORLDSIZE_X_F, 0.0f, mFI_UT_WORLDSIZE_X_F };
+        static const f32 add_Z[] = { -mFI_UT_WORLDSIZE_Z_F, -mFI_UT_WORLDSIZE_Z_F, -mFI_UT_WORLDSIZE_Z_F, 0.0f,
+                                     0.0f, mFI_UT_WORLDSIZE_Z_F, mFI_UT_WORLDSIZE_Z_F, mFI_UT_WORLDSIZE_Z_F };
+        mActor_name_t unit_item[8];
+        xyz_t unit_pos[8];
+        int select_index = -1;
+        int i;
+
+        for (i = 0; i < 8; i++) {
+            unit_pos[i].x = center_pos.x + add_X[i];
+            unit_pos[i].z = center_pos.z + add_Z[i];
+        }
+        for (i = 0; i < 8; i++) {
+            mActor_name_t* fg_p = mFI_GetUnitFG(unit_pos[i]);
+
+            unit_item[i] = (fg_p != NULL && IS_ITEM_COLLIDEABLE_TREE(*fg_p)) ? *fg_p : EMPTY_NO;
+        }
+        for (i = 0; i < 8; i++) {
+            if (unit_item[i] != EMPTY_NO) {
+                unit_pos[i].y = mCoBG_GetBgY_OnlyCenter_FromWpos2(unit_pos[i], 0.0f);
+                if (ABS(unit_pos[i].y - ppos->y) > 10.0f) {
+                    unit_item[i] = EMPTY_NO;
+                }
+            }
+        }
+        for (i = 0; i < 8; i++) {
+            if (unit_item[i] != EMPTY_NO) {
+                f32 dist_sq = Math3DLengthSquare2D(unit_pos[i].x, unit_pos[i].z, ppos->x, ppos->z);
+
+                if (dist_sq >= SQ(mFI_UNIT_BASE_SIZE_F)) {
+                    unit_item[i] = EMPTY_NO;
+                }
+            }
+        }
+        {
+            int min_angle = DEG2SHORT_ANGLE2(45.0f);
+
+            for (i = 0; i < 8; i++) {
+                if (unit_item[i] != EMPTY_NO) {
+                    f32 dx = unit_pos[i].x - ppos->x;
+                    f32 dz = unit_pos[i].z - ppos->z;
+                    int angle = (s16)(atans_table(dz, dx) - (int)facing);
+                    int abs_angle = ABS(angle);
+
+                    if (abs_angle < min_angle) {
+                        select_index = i;
+                        min_angle = abs_angle;
+                    }
+                }
+            }
+        }
+        if (select_index >= 0 && select_index < 8) {
+            int ux, uz;
+
+            if (mFI_Wpos2UtNum(&ux, &uz, unit_pos[select_index])) {
+                *out_ux = ux;
+                *out_uz = uz;
+                *out_pos = unit_pos[select_index];
+                return unit_item[select_index];
+            }
+        }
+    }
+    return EMPTY_NO;
+}
+
+/* Mirror of Player_actor_Set_EffectBgTree's item -> variant mapping (m_player_common.c_inc:6182-6241). The variant comes
+ * from the CURRENT tile item: a fruit tree the host already converted to NOFRUIT is the plain full-size TREE id, i.e. the
+ * same *_FULL variant the fruit-bearing id maps to (the else branch), so a FIELD_UPDATE landing first changes nothing. */
+static s16 pc_puppet_tree_variant(mActor_name_t item, const char** species, int* small) {
+    int type = FGTreeType_check(item);
+    s16 v;
+
+    *species = (type == mNT_TREE_TYPE_PALM)    ? "palm"
+               : (type == mNT_TREE_TYPE_CEDAR) ? "cedar"
+               : (type == mNT_TREE_TYPE_GOLD)  ? "gold"
+                                               : "normal";
+    *small = 0;
+    if (IS_ITEM_XMAS_TREE(item)) {
+        v = (type == mNT_TREE_TYPE_CEDAR) ? EffectBG_VARIANT_CEDAR_XMAS : EffectBG_VARIANT_TREE_XMAS;
+    } else if (IS_ITEM_SMALL_TREE(item)) {
+        *small = 1; /* Make_EffectBG routes small variants to eEC_EFFECT_YOUNG_TREE (effect pool), not an EffectBG slot */
+        v = (type == mNT_TREE_TYPE_PALM)    ? EffectBG_VARIANT_PALM_SMALL
+            : (type == mNT_TREE_TYPE_CEDAR) ? EffectBG_VARIANT_CEDAR_SMALL
+            : (type == mNT_TREE_TYPE_GOLD)  ? EffectBG_VARIANT_GOLD_SMALL
+                                            : EffectBG_VARIANT_TREE_SMALL;
+    } else if (IS_ITEM_MED_TREE(item)) {
+        v = (type == mNT_TREE_TYPE_PALM)    ? EffectBG_VARIANT_PALM_MED
+            : (type == mNT_TREE_TYPE_CEDAR) ? EffectBG_VARIANT_CEDAR_MED
+            : (type == mNT_TREE_TYPE_GOLD)  ? EffectBG_VARIANT_GOLD_MED
+                                            : EffectBG_VARIANT_TREE_MED;
+    } else if (IS_ITEM_LARGE_TREE(item)) {
+        v = (type == mNT_TREE_TYPE_PALM)    ? EffectBG_VARIANT_PALM_LARGE
+            : (type == mNT_TREE_TYPE_CEDAR) ? EffectBG_VARIANT_CEDAR_LARGE
+            : (type == mNT_TREE_TYPE_GOLD)  ? EffectBG_VARIANT_GOLD_LARGE
+                                            : EffectBG_VARIANT_TREE_LARGE;
+    } else {
+        v = (type == mNT_TREE_TYPE_PALM)    ? EffectBG_VARIANT_PALM_FULL
+            : (type == mNT_TREE_TYPE_CEDAR) ? EffectBG_VARIANT_CEDAR_FULL
+            : (type == mNT_TREE_TYPE_GOLD)  ? EffectBG_VARIANT_GOLD_FULL
+                                            : EffectBG_VARIANT_TREE_FULL;
+    }
+    return v;
+}
+
+static void pc_puppet_tree_diag(PCRemotePlayerActor* self, const char* what, const char* detail, int ux, int uz,
+                                mActor_name_t item, const char* species, const char* budget) {
+    if (!pc_puppet_diag_allow(self, "tree", what, budget)) {
+        return;
+    }
+    if (strcmp(what, "effect") == 0) {
+        printf("[NET][PUPPET][DIAG] player %d tree shake effect=large variant=%s tile=(%d,%d) item=0x%04x species=%s "
+               "budget=%s efbg_active=%d\n",
+               (int)self->peer, detail, ux, uz, (unsigned)item, species, budget, s_tree_diag_efbg);
+    } else {
+        printf("[NET][PUPPET][DIAG] player %d tree shake sound label=%s tile=(%d,%d) item=0x%04x species=%s budget=%s\n",
+               (int)self->peer, detail, ux, uz, (unsigned)item, species, budget);
+    }
+}
+
+/* Undo the token / per-frame slot pc_puppet_fx_reason(.., 0) consumed when a later tree-specific gate denies. */
+static void pc_puppet_fx_refund(PCRemotePlayerActor* self) {
+    self->cos.tokens += 1.0f;
+    if (self->cos.tokens > PC_PUPPET_FX_BUCKET_MAX) {
+        self->cos.tokens = PC_PUPPET_FX_BUCKET_MAX;
+    }
+    if (s_puppet_fx_frame_count > 0) {
+        s_puppet_fx_frame_count--;
+    }
+}
+
+/* One frame-10 attempt. Returns 1 = final (presented or definitively skipped), 0 = denied only by a cap: retry later. */
+static int pc_puppet_tree_shake_fire(PCRemotePlayerActor* self, PCRemotePlayerSlot* slot, GAME* game, double now,
+                                     int expired) {
+    PCRemotePlayerCosmetic* c = &self->cos;
+    PCRemotePlayerCosStats* st = &slot->cos_stats;
+    const char* reason;
+    const char* species = "normal";
+    xyz_t tpos;
+    int ux = -1, uz = -1, small = 0, i;
+    mActor_name_t item;
+    s16 variant;
+
+    /* scene -> hidden -> pause -> null (eEC clip) -> local player -> range -> pool (effect pool) -> capped */
+    s_tree_diag_efbg = Effectbg_pc_count_active();
+    reason = pc_puppet_fx_reason(self, slot, game, 0);
+    if (reason != NULL) {
+        if (strcmp(reason, "capped") == 0 && !expired) {
+            return 0;
+        }
+        st->tree_skipped++;
+        pc_puppet_tree_diag(self, "effect", "-", -1, -1, EMPTY_NO, species, reason);
+        return 1;
+    }
+    /* From here the scene is the local field (checked above), so the pure field readers below see the right grid. */
+    item = pc_puppet_find_shake_tree(&self->actor_class.world.position, self->actor_class.shape_info.rotation.y, &ux, &uz,
+                                     &tpos);
+    if (item == EMPTY_NO) {
+        pc_puppet_fx_refund(self);
+        st->tree_skipped++;
+        pc_puppet_tree_diag(self, "effect", "-", -1, -1, EMPTY_NO, species, "notree");
+        return 1;
+    }
+    variant = pc_puppet_tree_variant(item, &species, &small);
+
+    if (!c->tree_committed) {
+        int cool = c->tree_have_last && (now - c->tree_last) < PC_PUPPET_TREE_COOLDOWN_FRAMES;
+
+        for (i = 0; i < PC_PUPPET_TREE_RING && !cool; i++) {
+            if (s_tree_ring[i].used && s_tree_ring[i].ux == ux && s_tree_ring[i].uz == uz &&
+                (now - s_tree_ring[i].t) < PC_PUPPET_TREE_COOLDOWN_FRAMES) {
+                cool = 1;
+            }
+        }
+        if (cool) {
+            pc_puppet_fx_refund(self);
+            st->tree_skipped++;
+            pc_puppet_tree_diag(self, "effect", "-", ux, uz, item, species, "cooldown");
+            return 1;
+        }
+        if (!small && Effectbg_pc_count_near(&tpos, PC_PUPPET_TREE_DUP_RADIUS) > 0) {
+            /* the local player's own shake (or another effect) is already playing on this tile */
+            pc_puppet_fx_refund(self);
+            st->tree_skipped++;
+            pc_puppet_tree_diag(self, "effect", "-", ux, uz, item, species, "dup");
+            return 1;
+        }
+        /* The shake is accepted (vanilla: Set_shake_tree_table succeeded): stamp the cooldowns, then play the sound. */
+        c->tree_committed = 1;
+        c->tree_have_last = 1;
+        c->tree_last = now;
+        s_tree_ring[s_tree_ring_next].used = 1;
+        s_tree_ring[s_tree_ring_next].ux = ux;
+        s_tree_ring[s_tree_ring_next].uz = uz;
+        s_tree_ring[s_tree_ring_next].t = now;
+        s_tree_ring_next = (s_tree_ring_next + 1) % PC_PUPPET_TREE_RING;
+        {
+            const char* sreason = pc_puppet_fx_reason(self, slot, game, 1);
+
+            if (sreason == NULL) {
+                xyz_t spos = tpos;
+
+                sAdo_OngenTrgStart(NA_SE_TREE_YURASU, &spos); /* Player_actor_sound_tree_yurasu(target_pos) */
+                st->tree_sounds++;
+                pc_puppet_tree_diag(self, "sound", "0x135", ux, uz, item, species, "ok");
+            } else {
+                st->sounds_suppressed++;
+                pc_puppet_tree_diag(self, "sound", "0x135", ux, uz, item, species, sreason);
+            }
+        }
+    }
+
+    /* effect: never evict (Make_EffectBG overwrites the OLDEST slot when all 3 are busy) and keep >= 1 slot free */
+    if (Common_Get(clip).make_effect_bg_proc == NULL) {
+        pc_puppet_fx_refund(self);
+        st->tree_skipped++;
+        pc_puppet_tree_diag(self, "effect", "-", ux, uz, item, species, "null");
+        return 1;
+    }
+    if (!small) {
+        int active = Effectbg_pc_count_active();
+
+        if (active < 0) {
+            pc_puppet_fx_refund(self);
+            st->tree_skipped++;
+            pc_puppet_tree_diag(self, "effect", "-", ux, uz, item, species, "null");
+            return 1;
+        }
+        if (active > PC_PUPPET_TREE_EFBG_MAX_ACTIVE) {
+            pc_puppet_fx_refund(self);
+            st->tree_skipped++;
+            pc_puppet_tree_diag(self, "effect", "-", ux, uz, item, species, "pool");
+            return 1;
+        }
+    }
+    if (s_tree_global_valid && (now - s_tree_global_last) < PC_PUPPET_TREE_GLOBAL_SPACING) {
+        pc_puppet_fx_refund(self);
+        if (!expired) {
+            return 0;
+        }
+        st->tree_skipped++;
+        pc_puppet_tree_diag(self, "effect", "-", ux, uz, item, species, "capped");
+        return 1;
+    }
+    {
+        xyz_t epos;
+
+        if (mFI_UtNum2CenterWpos(&epos, ux, uz)) { /* Player_actor_Set_EffectBgTree: tile centre, y = tile centre height */
+            epos.y = mCoBG_UtNum2UtCenterY_Keep(ux, uz);
+            Common_Get(clip).make_effect_bg_proc(game, EffectBG_EFFECT_SHAKE_LARGE, variant, &epos);
+            s_tree_global_valid = 1;
+            s_tree_global_last = now;
+            st->tree_effects++;
+            pc_puppet_tree_diag(self, "effect", small ? "young-tree" : "canopy", ux, uz, item, species, "ok");
+        } else {
+            pc_puppet_fx_refund(self);
+            st->tree_skipped++;
+            pc_puppet_tree_diag(self, "effect", "-", ux, uz, item, species, "notree");
+        }
+    }
+    return 1;
+}
+
+/* Per puppet move (called from pc_remote_player_cosmetics): arms on each SHAKE_TREE run (entry edge = a new
+ * row_start_time), fires once when kf0 reaches frame 10, retries a cap-denied effect for a while, and disarms when the run
+ * ends/changes. A latched shake whose state was already replaced by walking/idle still plays its clip to the end, so it
+ * still presents (the visual matches the clip); a different row state or a scene clear disarms it before frame 10. */
+static void pc_puppet_tree_shake_tick(PCRemotePlayerActor* self, PCRemotePlayerSlot* slot, GAME* game, double now,
+                                      float cur, float last, int have_last, float max_frames, double row_start_now) {
+    PCRemotePlayerCosmetic* c = &self->cos;
+    PCRemotePlayerVisual* v = &self->visual;
+
+    if (!(v->row_active && v->row_idx == mPlayer_INDEX_SHAKE_TREE)) {
+        if (c->tree_armed && c->tree_deadline != 0.0) {
+            slot->cos_stats.tree_skipped++; /* still retrying a capped effect when the run ended: final "capped" */
+            pc_puppet_tree_diag(self, "effect", "-", -1, -1, EMPTY_NO, "normal", "capped");
+        }
+        c->tree_armed = 0;
+        c->tree_row_start = 0.0;
+        return;
+    }
+    if (c->tree_row_start != row_start_now) { /* new entry edge (incl. a repeated shake with a new entry counter) */
+        c->tree_row_start = row_start_now;
+        c->tree_armed = 1;
+        c->tree_committed = 0;
+        c->tree_deadline = 0.0;
+        return; /* never fires on the entry frame itself */
+    }
+    if (!c->tree_armed) {
+        return;
+    }
+    if (c->tree_deadline == 0.0) {
+        int hit = (have_last && pc_puppet_frame_crossed(last, cur, max_frames, PC_PUPPET_TREE_FRAME)) ||
+                  cur >= PC_PUPPET_TREE_FRAME; /* a hitch step may skip the window: armed-once makes `>=` equivalent */
+
+        if (!hit) {
+            return;
+        }
+        c->tree_deadline = now + PC_PUPPET_TREE_RETRY_FRAMES;
+    }
+    if (pc_puppet_tree_shake_fire(self, slot, game, now, now >= c->tree_deadline)) {
+        c->tree_armed = 0;
+        c->tree_deadline = 0.0;
+    }
+}
+
+/* ====================================================================================================================
+ * M9-C Phase 5: remote PICKUP presentation (flying item + sounds), cosmetic only.
+ *
+ * Vanilla (m_player_main_pickup.c_inc): PICKUP state (index 30), anim PICKUP1 (29 frames), morph -6, speed 0.5. The state's
+ * item timer runs in game frames from state entry: < 20 the item stays on the ground (scale 0.01) and item_offset =
+ * ground - left hand is refreshed; 20..40 pos = hand + p * offset, scale = p * 0.01, p = 1 - (timer-20)/20; >= 40 gone.
+ * Sounds at clip frame 10 (NA_SE_ITEM_GET) and 20 (NA_SE_GASAGOSO). The draw (m_player_draw.c_inc:311-353) is
+ * bg_item_clip->single_draw_proc(item, pos, scale), FG scenes only.
+ * The puppet has no morph phase (its clip starts at once, 12 game frames = 6/0.5 ahead of vanilla's clip), so the vanilla
+ * timer is reconstructed from the puppet's own clip frame: timer = 12 + 2 * (frame - 1) (speed 0.5). The item therefore
+ * stays in step with the hand pose exactly like the vanilla one. The item id and tile come from the host's PLAYER_ACTION
+ * (pc_remote_player_on_action): the ground tile may already be cleared by the FIELD_UPDATE (the item is removed from the
+ * ground slightly before the puppet reaches for it) so it cannot be reconstructed from the field. Bells (money bags)
+ * get no flying item (wallet path). A rejected/aborted pickup has no event: the pose plays with no item. The sounds are
+ * keyed on the pickup clip itself (the sender plays them for any pickup attempt).
+ * Nothing here writes the field, the inventory or any gameplay state.
+ * ================================================================================================================== */
+
+#define PC_PUPPET_PK_HOLD_FRAMES 90.0f      /* a queued event waits this long (game frames) for the puppet's pickup state */
+#define PC_PUPPET_PK_TIMER_BASE 12.0f       /* vanilla morph -6 at 0.5/frame: clip frame 1 is at timer 12 */
+#define PC_PUPPET_PK_TIMER_PER_FRAME 2.0f   /* 1 / row speed 0.5 */
+#define PC_PUPPET_PK_FLY_START 20.0f        /* timer at which the item starts flying to the hand */
+#define PC_PUPPET_PK_TIMER_END 40.0f        /* ... and is gone */
+#define PC_PUPPET_PK_END_CF (1.0f + (PC_PUPPET_PK_TIMER_END - PC_PUPPET_PK_TIMER_BASE) / PC_PUPPET_PK_TIMER_PER_FRAME)
+#define PC_PUPPET_PK_LATE_CF 2.0f           /* bound later than this many clip frames after the start = "late" */
+#define PC_PUPPET_PK_SOUND_GET_FRAME 10.0f
+#define PC_PUPPET_PK_SOUND_RUSTLE_FRAME 20.0f
+
+static void pc_pk_diag_event(int peer, uint16_t seq, int ux, int uz, uint16_t item, const char* state, const char* budget) {
+    static int s_n = 0;
+
+    if (!pc_remote_player_puppet_diag() || s_n >= 400) {
+        return;
+    }
+    s_n++;
+    printf("[NET][PUPPET][DIAG] player %d pickup event seq=%u tile=(%d,%d) item=0x%04X state=%s%s%s\n", peer,
+           (unsigned)seq, ux, uz, (unsigned)item, state, budget != NULL ? " budget=" : "", budget != NULL ? budget : "");
+}
+
+/* Bell/money-bag items are credited to the wallet by the vanilla pickup state (PC_ENHANCEMENTS): no flying item. */
+static int pc_pk_item_is_bell(uint16_t item) {
+#ifdef PC_ENHANCEMENTS
+    if (mNT_check_unknown((mActor_name_t)item)) {
+        return 0; /* the lookup indexes its tables unchecked: never look up an unknown id */
+    }
+    return mPr_GetAmountForMoneyItem((mActor_name_t)item) > 0;
+#else
+    (void)item;
+    return 0;
+#endif
+}
+
+/* Same checks as pc_puppet_fx_reason() minus the budgets (the flying item is one draw, no effect/sound slot). NULL = ok. */
+static const char* pc_pk_gate(PCRemotePlayerActor* self, PCRemotePlayerSlot* slot, GAME* game) {
+    GAME_PLAY* play = (GAME_PLAY*)game;
+    PLAYER_ACTOR* local;
+    float dx, dz, dy;
+
+    if (!pc_remote_player_scene_is_local_field(slot, play) || slot->snapshot_count == 0 || !self->visual.initialized) {
+        return "scene";
+    }
+    if (pc_remote_player_body_hidden(self)) {
+        return "hidden";
+    }
+    if (_Game_play_isPause(play) == 1) {
+        return "pause";
+    }
+    if (Common_Get(clip).bg_item_clip == NULL || Common_Get(clip).bg_item_clip->single_draw_proc == NULL) {
+        return "null";
+    }
+    if (!Common_Get(player_actor_exists)) {
+        return "scene";
+    }
+    local = GET_PLAYER_ACTOR(play);
+    if (local == NULL || (uint64_t)(uintptr_t)local >= PC_LOWADDR_LIMIT) {
+        return "scene";
+    }
+    dx = self->actor_class.world.position.x - local->actor_class.world.position.x;
+    dz = self->actor_class.world.position.z - local->actor_class.world.position.z;
+    dy = self->actor_class.world.position.y - local->actor_class.world.position.y;
+    if (!(fabsf(dx) <= PC_PUPPET_FX_EFFECT_RANGE && fabsf(dz) <= PC_PUPPET_FX_EFFECT_RANGE &&
+          fabsf(dy) <= PC_PUPPET_FX_EFFECT_RANGE)) {
+        return "range";
+    }
+    return NULL;
+}
+
+/* Ground position of the picked item: Player_actor_CheckItemPosition_forPickup's target (tile centre, y = bg height with a -1
+ * offset in FG) + bIT_actor_rand_pos_get_plus (weeds and shells are displaced by a fixed per-tile table). */
+static int pc_pk_ground_pos(int ux, int uz, uint16_t item, xyz_t* out) {
+    static const f32 rnd_x[4][4] = { { 7.5f, 0.0f, -5.0f, 5.0f }, { -5.0f, -7.5f, 2.5f, -2.5f },
+                                     { 7.5f, 10.0f, -2.5f, 5.0f }, { -2.5f, 5.0f, 7.5f, -2.5f } };
+    static const f32 rnd_z[4][4] = { { -5.0f, 0.0f, 5.0f, 0.0f }, { -5.0f, 2.5f, 0.0f, 5.0f },
+                                     { -2.5f, 0.0f, 7.5f, 5.0f }, { 7.5f, -7.5f, -2.5f, -5.0f } };
+    xyz_t c;
+
+    if (!mFI_UtNum2CenterWpos(&c, ux, uz)) {
+        return 0;
+    }
+    c.y = mCoBG_GetBgY_OnlyCenter_FromWpos2(c, -1.0f);
+    if (IS_ITEM_GRASS(item) || (item >= ITM_SHELL_START && item <= ITM_SHELL7)) {
+        c.x += rnd_x[ux & 3][uz & 3];
+        c.z += rnd_z[ux & 3][uz & 3];
+    }
+    *out = c;
+    return 1;
+}
+
+/* One positional one-shot (the vanilla Player_actor_sound_ITEM_GET / _GASAGOSO body: sAdo_OngenTrgStart at the actor). */
+static void pc_pk_snd(PCRemotePlayerActor* self, PCRemotePlayerSlot* slot, GAME* game, u16 id, const char* name, float frame) {
+    const char* reason = pc_puppet_fx_reason(self, slot, game, 1);
+    PCRemotePlayerCosStats* st = &slot->cos_stats;
+
+    if (reason == NULL) {
+        xyz_t pos = self->actor_class.world.position;
+
+        sAdo_OngenTrgStart(id, &pos);
+        st->sounds++;
+        st->pk_sounds++;
+        pc_puppet_fx_diag(self, name, name, frame, (int)id, "ok");
+    } else {
+        st->sounds_suppressed++;
+        pc_puppet_fx_diag(self, name, name, frame, -1, reason);
+    }
+}
+
+/* Per puppet move (from pc_remote_player_cosmetics, after the clip advanced). */
+static void pc_puppet_pickup_tick(PCRemotePlayerActor* self, PCRemotePlayerSlot* slot, GAME* game, double now, float cur,
+                                  float last, int have_last, float max_frames, double row_start_now) {
+    PCRemotePlayerCosmetic* c = &self->cos;
+    PCRemotePlayerVisual* v = &self->visual;
+    PCRemotePlayerCosStats* st = &slot->cos_stats;
+    int peer = (int)self->peer;
+    int in_row = v->row_active && v->row_idx == mPlayer_INDEX_PICKUP;
+    int i;
+
+    /* queued events that never met a pickup state expire */
+    for (i = 0; i < PC_PUPPET_PK_RING; i++) {
+        PCRemotePickupEvent* ev = &slot->pk_ev[i];
+
+        if (ev->valid && (now - ev->arrival) > (double)PC_PUPPET_PK_HOLD_FRAMES) {
+            ev->valid = 0;
+            st->pk_dropped++;
+            pc_pk_diag_event(peer, ev->seq, ev->ux, ev->uz, ev->item, "dropped", "expired");
+        }
+    }
+
+    if (!in_row) {
+        c->pk_row_start = 0.0;
+        c->pk_active = 0;
+        c->pk_bound = 0;
+        return;
+    }
+    if (c->pk_row_start != row_start_now) { /* a new PICKUP run (incl. a repeated pickup with a new entry counter) */
+        c->pk_row_start = row_start_now;
+        c->pk_active = 0;
+        c->pk_bound = 0;
+        c->pk_ofs_valid = 0;
+    }
+
+    /* sounds: clip frames 10 / 20 (Player_actor_SetSound_Pickup); never on the entry frame */
+    if (have_last) {
+        if (pc_puppet_frame_crossed(last, cur, max_frames, PC_PUPPET_PK_SOUND_GET_FRAME)) {
+            pc_pk_snd(self, slot, game, (u16)NA_SE_ITEM_GET, "pickup_item_get", cur);
+        }
+        if (pc_puppet_frame_crossed(last, cur, max_frames, PC_PUPPET_PK_SOUND_RUSTLE_FRAME)) {
+            pc_pk_snd(self, slot, game, (u16)NA_SE_GASAGOSO, "pickup_gasagoso", cur);
+        }
+    }
+
+    /* pairing: the oldest queued event binds to this run (one per run); an event that is only seen after the flight is over
+     * (clip still playing) is dropped; once the clip FINISHED, events wait for the next run (they most likely belong to
+     * the next pickup, whose MOVE has not shown up yet) */
+    if (!c->pk_bound && !v->row_finished) {
+        int idx = -1;
+        PCRemotePickupEvent ev;
+
+        for (i = 0; i < PC_PUPPET_PK_RING; i++) {
+            if (slot->pk_ev[i].valid && (idx < 0 || slot->pk_ev[i].arrival < slot->pk_ev[idx].arrival)) {
+                idx = i;
+            }
+        }
+        if (idx < 0) {
+            return;
+        }
+        ev = slot->pk_ev[idx];
+        slot->pk_ev[idx].valid = 0;
+        c->pk_bound = 1;
+        if (pc_pk_item_is_bell(ev.item)) {
+            st->pk_bell++;
+            pc_pk_diag_event(peer, ev.seq, ev.ux, ev.uz, ev.item, "bell", NULL);
+        } else if (cur >= PC_PUPPET_PK_END_CF) {
+            st->pk_dropped++;
+            pc_pk_diag_event(peer, ev.seq, ev.ux, ev.uz, ev.item, "dropped", "late");
+        } else {
+            const char* reason = pc_pk_gate(self, slot, game);
+
+            if (reason == NULL && !pc_pk_ground_pos(ev.ux, ev.uz, ev.item, &c->pk_ground)) {
+                reason = "tile";
+            }
+            if (reason != NULL) {
+                st->pk_ignored++;
+                pc_pk_diag_event(peer, ev.seq, ev.ux, ev.uz, ev.item, "ignored", reason);
+            } else {
+                int late = (cur - 1.0f) >= PC_PUPPET_PK_LATE_CF;
+
+                c->pk_active = 1;
+                c->pk_item = ev.item;
+                c->pk_ofs_valid = 0;
+                if (late) {
+                    st->pk_late++;
+                } else {
+                    st->pk_started++;
+                }
+                pc_pk_diag_event(peer, ev.seq, ev.ux, ev.uz, ev.item, late ? "late" : "started", NULL);
+                if (pc_remote_player_puppet_diag()) {
+                    printf("[NET][PUPPET][DIAG] player %d pickup flying item start frame=%.1f\n", peer, (double)cur);
+                }
+            }
+        }
+    }
+}
+
+/* Draw (puppet dw, after the body and the carried item): mirrors Player_actor_Set_Item_Pickup's timeline and the draw at
+ * m_player_draw.c_inc:348-353, with the puppet's own item position/scale and the hand captured by its own callback. */
+static void pc_remote_player_draw_pickup_item(PCRemotePlayerActor* self, GAME* game) {
+    PCRemotePlayerCosmetic* c = &self->cos;
+    PCRemotePlayerVisual* v = &self->visual;
+    PCRemotePlayerSlot* slot;
+    float timer, p, scale;
+    xyz_t pos;
+
+    if (!c->pk_active || !v->row_active || v->row_idx != mPlayer_INDEX_PICKUP) {
+        return;
+    }
+    if (c->hand_frame != game->frame_counter + 1u) {
+        return; /* no fresh hand this frame (hidden body etc.) */
+    }
+    slot = pc_remote_player_find_slot(self->peer);
+    if (slot == NULL || pc_pk_gate(self, slot, game) != NULL ||
+        mFI_GET_TYPE(mFI_GetFieldId()) != mFI_FIELD_FG) { /* vanilla: single_draw_proc only in FG scenes */
+        return;
+    }
+    timer = PC_PUPPET_PK_TIMER_BASE + (v->keyframe0.frame_control.current_frame - 1.0f) * PC_PUPPET_PK_TIMER_PER_FRAME;
+    if (!(timer < PC_PUPPET_PK_TIMER_END)) {
+        return; /* flight over (vanilla: scale 0, nothing drawn) */
+    }
+    if (timer < PC_PUPPET_PK_FLY_START || !c->pk_ofs_valid) {
+        /* timer < 20: item_offset = item_pos - left_hand_pos every frame (vanilla); a late-bound run captures it once */
+        c->pk_ofs.x = c->pk_ground.x - c->hand_pos.x;
+        c->pk_ofs.y = c->pk_ground.y - c->hand_pos.y;
+        c->pk_ofs.z = c->pk_ground.z - c->hand_pos.z;
+        c->pk_ofs_valid = 1;
+    }
+    if (timer < PC_PUPPET_PK_FLY_START) {
+        pos = c->pk_ground;
+        scale = 0.01f;
+    } else {
+        p = 1.0f - (timer - PC_PUPPET_PK_FLY_START) / 20.0f;
+        if (p < 0.0f) {
+            p = 0.0f;
+        } else if (p > 1.0f) {
+            p = 1.0f;
+        }
+        scale = p * 0.01f;
+        pos.x = c->hand_pos.x + p * c->pk_ofs.x;
+        pos.y = c->hand_pos.y + p * c->pk_ofs.y;
+        pos.z = c->hand_pos.z + p * c->pk_ofs.z;
+    }
+    if (scale > 0.0f && c->pk_item != (u16)EMPTY_NO) {
+        Common_Get(clip).bg_item_clip->single_draw_proc(game, (mActor_name_t)c->pk_item, &pos, scale, NULL, NULL, NULL);
+    }
+}
+
+/* Foot step on foot `idx` (0 left, 1 right): Set_FootMark_Base1 (footprint decal + footstep sound) followed by
+ * SetEffect_Walk/Dash (m_player_main_walk.c_inc:106, m_player_main_dash.c_inc:73). The 1-in-4 flower trample of
+ * SetEffectRemoveFlower_Dash is NOT replayed (world mutation): plain dash dust only. The three pieces are pending bits:
+ * a piece denied ONLY by a frame cap (per-frame cap across all puppets, or the sound cap) stays pending and is retried on
+ * the next moves for PC_PUPPET_PENDING_FRAMES, so identical-phase puppets take turns instead of the same ones always
+ * winning; pieces denied by any other reason (scene/range/pool/...) are final. Expiry counts the leftovers as capped. */
+/* ====================================================================================================================
+ * M9-C Phase 6a: remote held-tool presentation (axe / net / fishing rod / fan / umbrella), cosmetic only.
+ *
+ * Table-driven, keyed on the puppet's state row (visual.row_idx) and keyframe0 frame exactly like the tree-shake/pickup
+ * ticks: a run is armed on a new visual.row_start_time (entry edge); `frame == 0` events fire on that entry tick (vanilla
+ * fires them inside setup_main_X), `frame > 0` events fire on a frame crossing of the puppet's own clip
+ * (pc_puppet_frame_crossed), never on the entry tick; a run interrupted by another row before the frame never fires.
+ * Every effect goes through pc_puppet_fx_emit_ex and every sound through pc_puppet_tool_snd (scene/hidden/pause/null/
+ * local-player/range/pool/per-puppet bucket/global per-frame caps, diag limiter); a cap-denied event stays "due" and is
+ * retried for PC_PUPPET_TOOL_RETRY_FRAMES. The sounds are plain sAdo_OngenTrgStart(id, pos) with the id the vanilla
+ * Player_actor_sound_* wrapper uses (m_player_sound.c_inc:84-217): never Player_actor_sound_*. The effects read no local
+ * player state: ef_swing_axe/ef_swing_rod/ef_kasamizu/ef_turn_asimoto/ef_break_axe/ef_kikuzu/ef_impact_star (audited:
+ * only the effect clip, season/weather, the tile at the effect position and the global gameplay fqrand()/RANDOM_F stream
+ * inside the effect internals (ACCEPTED RESIDUE, see impl_notes 'Review round 2 fixes'; mostly the global fqrand() stream, several effects also draw RANDOM2, impact_star only RANDOM; streams are not synchronized across processes, so no desync)). The ONE effect with
+ * a local-player read in this family (ef_swing_net.c:68, only in the water-hit branch arg1 != 0) is never spawned; the
+ * arg1 == 0 swoosh is spawned by vanilla only from settle_main_Swing_net when the state is LEFT inside (8.5, 9.0], and
+ * produces only bush leaves / flower petals: it is deferred (the puppet cannot observe the vanilla exit instant).
+ * ================================================================================================================== */
+
+#define PC_PUPPET_TOOL_RETRY_FRAMES 30.0   /* a cap-denied tool event is retried this long */
+#define PC_PUPPET_TOOL_REPEAT_GUARD 8.0    /* min spacing of a repeating tool sound (clip wrap alias guard) */
+#define PC_PUPPET_TOOL_MAX_EVENTS 10
+
+enum { PC_TOOL_FX = 0, PC_TOOL_SND = 1 };
+enum { PC_TPOS_WORLD = 0, PC_TPOS_AXE_HIT, PC_TPOS_AXE_TARGET, PC_TPOS_NET,
+       PC_TPOS_SCOOP_TGT,  /* Phase 6b: the shovel's target tile (read-only mirror of mPlib_Check_scoop_after's tile choice) */
+       PC_TPOS_REFLECT,    /* Phase 6b: reflect_scoop effect point 37 ahead / 2 aside of the puppet */
+       PC_TPOS_FEEL,       /* Phase 6b: FEEL joint captured by the puppet's own draw */
+       PC_TPOS_GRASS };    /* Phase 6b: remove_grass item position (tile found at 20/10 ahead, vanilla weed offset) */
+enum { PC_TCOND_ANY = 0, PC_TCOND_NOT_STUMP, PC_TCOND_STUMP };
+enum { PC_TFL_DIGSRC = 1, PC_TFL_ATTR_TGT = 2, PC_TFL_ATTR0 = 4, PC_TFL_ANGLE0 = 8 };
+/* dynamic ids resolved at fire time (never valid NA_SE / eEC ids) */
+#define PC_TID_ARAIIKI 0xFFF1u    /* tired: gender-dependent breath (Player_actor_sound_araiiki) */
+#define PC_TID_REFLECT_SND 0xFFF2u /* reflect_scoop: target-dependent hit sound (Player_actor_SetSound_Reflect_scoop) */
+#define PC_TID_REFLECT_FX 0xFFF3u  /* reflect_scoop: DIG_SCOOP arg1 1, attribute chosen from the target tile */
+#define PC_TOOL_NA_SLIP 0x4129 /* Player_actor_sound_slip (m_player_sound.c_inc:156) */
+
+typedef struct PCToolEvent {
+    uint8_t kind;       /* PC_TOOL_FX / PC_TOOL_SND */
+    uint8_t pos;        /* PC_TPOS_* */
+    uint8_t repeat;     /* fires on every crossing of a REPEAT clip (fan) instead of once per run */
+    s16     arg1;       /* effect arg1 */
+    u16     id;         /* eEC_EFFECT_* or NA_SE_* */
+    float   frame;      /* 0 = entry tick, else keyframe0 frame (Check_AnimationFrame target) */
+    const char* name;   /* diag name */
+    uint8_t cond;       /* Phase 6b: PC_TCOND_* (evaluated on the reconstructed shovel target tile) */
+    uint8_t fl;         /* Phase 6b: PC_TFL_* effect options */
+} PCToolEvent;
+
+typedef struct PCToolRow {
+    int row;            /* mPlayer_INDEX_* */
+    int n;
+    PCToolEvent ev[PC_PUPPET_TOOL_MAX_EVENTS];
+} PCToolRow;
+
+/* Sources (m_player_main_*.c_inc / m_player_common.c_inc):
+ * SWING_AXE 37: swing_axe:230-237 FURI frame 10 (SetSound_AXE_FURI_axe_common), :72-76 SetEffectStart_axe_common (common
+ *   .c_inc:3601) SWING_AXE arg1 1 at frame 12, :53 SetEffectHit_axe_common SWING_AXE arg1 0 at frame 15 (offset -7,20,24),
+ *   :240-246 AXE_CUT at frame 15 at the target tile (puppet: forward approximation). AIR_AXE 38: air_axe:32-37 FURI 10 + start 12.
+ * REFLECT_AXE 39: reflect_axe:73-76 hit effect arg1 2 (impact stars) at 15 + start 12, :153-173 FURI 10, AXE_HIT at 15 (rock/
+ *   ground; a snowman/ball target would be NA_SE_AXE_BALL_HIT / silent: unknown to the puppet -> AXE_HIT).
+ * BROKEN_AXE 40: broken_axe:104-110 SWING_AXE arg1 3 (BREAK_AXE x2) at frame 15 + the swing/reflect search (FURI 10, start 12)
+ *   + ChangeItemNo_axe_common (swing_axe:253-278) NA_SE_TOOL_BROKEN3 at 15 (axe_damage_no 0 -> EMPTY_NO). The type-specific hit
+ *   effect/sound (swing vs reflect target) is not transmitted and is left out.
+ * SLIP_NET 41: slip_net:30-36 slip sound + TURN_ASIMOTO arg1 1 on entry (the per-frame SLIP effect :85 and the exit
+ *   SLIP_FOOTPRINT :44 are deferred). SWING_NET 44: swing_net:37 AMI_FURI at net_pos on entry. PULL_NET 45: the catch
+ *   sound AMI_GET (swing_net:215, `CatchSomethingCheck`) plays in the SWING state when the insect enters the net; PULL_NET is
+ *   only entered after a catch, so its entry is the closest observable edge (up to one swing late). AMI_HIT (BG/actor hit,
+ *   swing_net:310-320) is a hit/miss branch the puppet cannot tell: not played. PUTAWAY_NET 48: putaway_net:28 GASAGOSO.
+ * CAST_ROD 50: cast_rod:25-27 SWING_ROD arg1 0 on entry + :39-45 ROD_STROKE frame 20. AIR_ROD 51: air_rod:27-29 SWING_ROD
+ *   entry + :38-41 ROD_STROKE_SMALL frame 20. COLLECT_ROD 53: collect_rod:20-24 ROD_BACK + SWING_ROD on entry. FLY_ROD 55:
+ *   fly_rod:17 ROD_BACK on entry (no effect). PUTAWAY_ROD 57: putaway_rod:32 GASAGOSO on entry. READY/RELAX/VIB/NOTICE_ROD
+ *   have no player-side sound/effect except notice_rod's YAJIRUSHI (killifish type of the LOCAL bobber: deferred).
+ * ROTATE_UMBRELLA 103: rotate_umbrella:17-20 KASAMIZU (arg0 0, arg1 0) + UMBRELLA_ROTATE on entry. SWING_FAN 109:
+ *   swing_fan:51-55 UCHIWA at frame 1.5 of every pass of the REPEAT clip. */
+static const PCToolRow s_tool_rows[] = {
+    { mPlayer_INDEX_SWING_AXE, 4, {
+        { PC_TOOL_SND, PC_TPOS_WORLD, 0, 0, NA_SE_TOOL_FURI, 10.0f, "axe_furi", 0, 0 },
+        { PC_TOOL_FX, PC_TPOS_WORLD, 0, 1, eEC_EFFECT_SWING_AXE, 12.0f, "swing_axe_start", 0, 0 },
+        { PC_TOOL_FX, PC_TPOS_AXE_HIT, 0, 0, eEC_EFFECT_SWING_AXE, 15.0f, "swing_axe_hit", 0, 0 },
+        { PC_TOOL_SND, PC_TPOS_AXE_TARGET, 0, 0, NA_SE_AXE_CUT, 15.0f, "axe_cut", 0, 0 } } },
+    { mPlayer_INDEX_AIR_AXE, 2, {
+        { PC_TOOL_SND, PC_TPOS_WORLD, 0, 0, NA_SE_TOOL_FURI, 10.0f, "axe_furi", 0, 0 },
+        { PC_TOOL_FX, PC_TPOS_WORLD, 0, 1, eEC_EFFECT_SWING_AXE, 12.0f, "swing_axe_start", 0, 0 } } },
+    { mPlayer_INDEX_REFLECT_AXE, 4, {
+        { PC_TOOL_SND, PC_TPOS_WORLD, 0, 0, NA_SE_TOOL_FURI, 10.0f, "axe_furi", 0, 0 },
+        { PC_TOOL_FX, PC_TPOS_WORLD, 0, 1, eEC_EFFECT_SWING_AXE, 12.0f, "swing_axe_start", 0, 0 },
+        { PC_TOOL_FX, PC_TPOS_AXE_HIT, 0, 2, eEC_EFFECT_SWING_AXE, 15.0f, "reflect_axe_hit", 0, 0 },
+        { PC_TOOL_SND, PC_TPOS_AXE_TARGET, 0, 0, NA_SE_AXE_HIT, 15.0f, "axe_hit", 0, 0 } } },
+    { mPlayer_INDEX_BROKEN_AXE, 4, {
+        { PC_TOOL_SND, PC_TPOS_WORLD, 0, 0, NA_SE_TOOL_FURI, 10.0f, "axe_furi", 0, 0 },
+        { PC_TOOL_FX, PC_TPOS_WORLD, 0, 1, eEC_EFFECT_SWING_AXE, 12.0f, "swing_axe_start", 0, 0 },
+        { PC_TOOL_FX, PC_TPOS_WORLD, 0, 3, eEC_EFFECT_SWING_AXE, 15.0f, "break_axe", 0, 0 },
+        { PC_TOOL_SND, PC_TPOS_WORLD, 0, 0, NA_SE_TOOL_BROKEN3, 15.0f, "axe_broken", 0, 0 } } },
+    { mPlayer_INDEX_SLIP_NET, 2, {
+        { PC_TOOL_SND, PC_TPOS_WORLD, 0, 0, PC_TOOL_NA_SLIP, 0.0f, "net_slip", 0, 0 },
+        { PC_TOOL_FX, PC_TPOS_WORLD, 0, 1, eEC_EFFECT_TURN_ASIMOTO, 0.0f, "net_slip_asimoto", 0, 0 } } },
+    { mPlayer_INDEX_SWING_NET, 1, {
+        { PC_TOOL_SND, PC_TPOS_NET, 0, 0, NA_SE_TOOL_FURI, 0.0f, "ami_furi", 0, 0 } } },
+    { mPlayer_INDEX_PULL_NET, 1, {
+        { PC_TOOL_SND, PC_TPOS_NET, 0, 0, NA_SE_TOOL_GET, 0.0f, "ami_get", 0, 0 } } },
+    { mPlayer_INDEX_PUTAWAY_NET, 1, {
+        { PC_TOOL_SND, PC_TPOS_WORLD, 0, 0, NA_SE_GASAGOSO, 0.0f, "net_putaway_gasagoso", 0, 0 } } },
+    { mPlayer_INDEX_CAST_ROD, 2, {
+        { PC_TOOL_FX, PC_TPOS_WORLD, 0, 0, eEC_EFFECT_SWING_ROD, 0.0f, "swing_rod", 0, 0 },
+        { PC_TOOL_SND, PC_TPOS_WORLD, 0, 0, NA_SE_ROD_STROKE, 20.0f, "rod_stroke", 0, 0 } } },
+    { mPlayer_INDEX_AIR_ROD, 2, {
+        { PC_TOOL_FX, PC_TPOS_WORLD, 0, 0, eEC_EFFECT_SWING_ROD, 0.0f, "swing_rod", 0, 0 },
+        { PC_TOOL_SND, PC_TPOS_WORLD, 0, 0, NA_SE_ROD_STROKE_SMALL, 20.0f, "rod_stroke_small", 0, 0 } } },
+    { mPlayer_INDEX_COLLECT_ROD, 2, {
+        { PC_TOOL_SND, PC_TPOS_WORLD, 0, 0, NA_SE_ROD_BACK, 0.0f, "rod_back", 0, 0 },
+        { PC_TOOL_FX, PC_TPOS_WORLD, 0, 0, eEC_EFFECT_SWING_ROD, 0.0f, "swing_rod", 0, 0 } } },
+    { mPlayer_INDEX_FLY_ROD, 1, {
+        { PC_TOOL_SND, PC_TPOS_WORLD, 0, 0, NA_SE_ROD_BACK, 0.0f, "rod_back", 0, 0 } } },
+    { mPlayer_INDEX_PUTAWAY_ROD, 1, {
+        { PC_TOOL_SND, PC_TPOS_WORLD, 0, 0, NA_SE_GASAGOSO, 0.0f, "rod_putaway_gasagoso", 0, 0 } } },
+    { mPlayer_INDEX_ROTATE_UMBRELLA, 2, {
+        { PC_TOOL_FX, PC_TPOS_WORLD, 0, 0, eEC_EFFECT_KASAMIZU, 0.0f, "kasamizu", 0, 0 },
+        { PC_TOOL_SND, PC_TPOS_WORLD, 0, 0, NA_SE_UMBRELLA_ROTATE, 0.0f, "umbrella_rotate", 0, 0 } } },
+    { mPlayer_INDEX_SWING_FAN, 1, {
+        { PC_TOOL_SND, PC_TPOS_WORLD, 1, 0, NA_SE_UCHIWA, 1.5f, "uchiwa", 0, 0 } } },
+    /* ---- M9-C Phase 6b: shovel states (m_player_main_{dig,fill,reflect,air,get,putaway,putin}_scoop.c_inc) ---- */
+    /* DIG_SCOOP 58: SetEffectHit_Dig_scoop (dig_scoop.c_inc:30-68) DIG_HOLE arg 0/1/2 at 14/15/16, DIG_SCOOP arg 0 at 22 at the
+     *   target; stump target (DIG_KABU1 clip, not transmitted: the puppet always plays DIG1): DIG_SCOOP arg 0 at 42.
+     *   SetSound_Dig_scoop (:171-205): SCOOP1 at 15 (stump: KIRIBASU_SCOOP at 15, KIRIBASU_OUT at 35). Sounds at the digger. */
+    { mPlayer_INDEX_DIG_SCOOP, 8, {
+        { PC_TOOL_SND, PC_TPOS_WORLD, 0, 0, NA_SE_SCOOP1, 15.0f, "scoop1", PC_TCOND_NOT_STUMP, 0 },
+        { PC_TOOL_FX, PC_TPOS_SCOOP_TGT, 0, 0, eEC_EFFECT_DIG_HOLE, 14.0f, "dig_hole0", PC_TCOND_NOT_STUMP, PC_TFL_DIGSRC | PC_TFL_ATTR_TGT },
+        { PC_TOOL_FX, PC_TPOS_SCOOP_TGT, 0, 1, eEC_EFFECT_DIG_HOLE, 15.0f, "dig_hole1", PC_TCOND_NOT_STUMP, PC_TFL_DIGSRC | PC_TFL_ATTR_TGT },
+        { PC_TOOL_FX, PC_TPOS_SCOOP_TGT, 0, 2, eEC_EFFECT_DIG_HOLE, 16.0f, "dig_hole2", PC_TCOND_NOT_STUMP, PC_TFL_DIGSRC | PC_TFL_ATTR_TGT },
+        { PC_TOOL_FX, PC_TPOS_SCOOP_TGT, 0, 0, eEC_EFFECT_DIG_SCOOP, 22.0f, "dig_scoop", PC_TCOND_NOT_STUMP, PC_TFL_DIGSRC | PC_TFL_ATTR_TGT },
+        { PC_TOOL_SND, PC_TPOS_WORLD, 0, 0, NA_SE_KIRIBASU_SCOOP, 15.0f, "kirikabu_scoop", PC_TCOND_STUMP, 0 },
+        { PC_TOOL_SND, PC_TPOS_WORLD, 0, 0, NA_SE_KIRIBASU_OUT, 35.0f, "kirikabu_out", PC_TCOND_STUMP, 0 },
+        { PC_TOOL_FX, PC_TPOS_SCOOP_TGT, 0, 0, eEC_EFFECT_DIG_SCOOP, 42.0f, "dig_scoop_stump", PC_TCOND_STUMP, PC_TFL_DIGSRC | PC_TFL_ATTR_TGT } } },
+    /* FILL_SCOOP 59 (FILL_UP1, mod 0): fill_scoop.c_inc:73-111 DIG_HOLE arg 3/4/5 at 13/19/25 + DIG_SCOOP arg 2 at 40 at the
+     *   target; SetSound_Fill_scoop (:113-126) SCOOP_UMERU at 18-7 = 11. */
+    { mPlayer_INDEX_FILL_SCOOP, 5, {
+        { PC_TOOL_SND, PC_TPOS_WORLD, 0, 0, NA_SE_SCOOP_UMERU, 11.0f, "scoop_umeru", 0, 0 },
+        { PC_TOOL_FX, PC_TPOS_SCOOP_TGT, 0, 3, eEC_EFFECT_DIG_HOLE, 13.0f, "fill_hole3", 0, PC_TFL_DIGSRC | PC_TFL_ATTR_TGT },
+        { PC_TOOL_FX, PC_TPOS_SCOOP_TGT, 0, 4, eEC_EFFECT_DIG_HOLE, 19.0f, "fill_hole4", 0, PC_TFL_DIGSRC | PC_TFL_ATTR_TGT },
+        { PC_TOOL_FX, PC_TPOS_SCOOP_TGT, 0, 5, eEC_EFFECT_DIG_HOLE, 25.0f, "fill_hole5", 0, PC_TFL_DIGSRC | PC_TFL_ATTR_TGT },
+        { PC_TOOL_FX, PC_TPOS_SCOOP_TGT, 0, 2, eEC_EFFECT_DIG_SCOOP, 40.0f, "fill_scoop", 0, PC_TFL_DIGSRC | PC_TFL_ATTR_TGT } } },
+    /* PUTIN_SCOOP 64 (FILL_UP_I1: the shared fill helpers add mod 7): same helpers (putin_scoop.c_inc:62-77): frames 20/26/32/47,
+     *   UMERU at 18. */
+    { mPlayer_INDEX_PUTIN_SCOOP, 5, {
+        { PC_TOOL_SND, PC_TPOS_WORLD, 0, 0, NA_SE_SCOOP_UMERU, 18.0f, "scoop_umeru", 0, 0 },
+        { PC_TOOL_FX, PC_TPOS_SCOOP_TGT, 0, 3, eEC_EFFECT_DIG_HOLE, 20.0f, "fill_hole3", 0, PC_TFL_DIGSRC | PC_TFL_ATTR_TGT },
+        { PC_TOOL_FX, PC_TPOS_SCOOP_TGT, 0, 4, eEC_EFFECT_DIG_HOLE, 26.0f, "fill_hole4", 0, PC_TFL_DIGSRC | PC_TFL_ATTR_TGT },
+        { PC_TOOL_FX, PC_TPOS_SCOOP_TGT, 0, 5, eEC_EFFECT_DIG_HOLE, 32.0f, "fill_hole5", 0, PC_TFL_DIGSRC | PC_TFL_ATTR_TGT },
+        { PC_TOOL_FX, PC_TPOS_SCOOP_TGT, 0, 2, eEC_EFFECT_DIG_SCOOP, 47.0f, "fill_scoop", 0, PC_TFL_DIGSRC | PC_TFL_ATTR_TGT } } },
+    /* REFLECT_SCOOP 60 (NOT_DIG1): reflect_scoop.c_inc:50-137 DIG_SCOOP arg1 1 at frame 13 at 37 ahead + 2 aside (attribute 7 for a
+     *   tree/stone target, else the ground attribute there; none for furniture/item targets) and the target-dependent hit sound at 13
+     *   (:139-216: bush SHIGEMI, tree/reserve TREE_HIT, furniture/item ITEM_HIT, else wood TREE_HIT / SCOOP_HIT). */
+    { mPlayer_INDEX_REFLECT_SCOOP, 2, {
+        { PC_TOOL_SND, PC_TPOS_SCOOP_TGT, 0, 0, PC_TID_REFLECT_SND, 13.0f, "reflect_scoop_snd", 0, 0 },
+        { PC_TOOL_FX, PC_TPOS_REFLECT, 0, 1, PC_TID_REFLECT_FX, 13.0f, "reflect_scoop", 0, PC_TFL_DIGSRC } } },
+    /* AIR_SCOOP 61 (DIG_SUKA1): air_scoop.c_inc:25-32 KARABURI at 13. */
+    { mPlayer_INDEX_AIR_SCOOP, 1, {
+        { PC_TOOL_SND, PC_TPOS_WORLD, 0, 0, NA_SE_KARABURI, 13.0f, "karaburi", 0, 0 } } },
+    /* GET_SCOOP 62 (GET_D1): get_scoop.c_inc:99-102 -> SetEffectHit_Dig_scoop with main index GET_SCOOP: DIG_HOLE arg 0/1/2 at
+     *   14/15/16 + DIG_SCOOP arg 3 at 22; SetSound_Dig_scoop: SCOOP1 at 15 + ITEM_HORIDASHI at 21 (GET_D1). */
+    { mPlayer_INDEX_GET_SCOOP, 6, {
+        { PC_TOOL_SND, PC_TPOS_WORLD, 0, 0, NA_SE_SCOOP1, 15.0f, "scoop1", 0, 0 },
+        { PC_TOOL_SND, PC_TPOS_WORLD, 0, 0, NA_SE_ITEM_HORIDASHI, 21.0f, "horidashi", 0, 0 },
+        { PC_TOOL_FX, PC_TPOS_SCOOP_TGT, 0, 0, eEC_EFFECT_DIG_HOLE, 14.0f, "dig_hole0", 0, PC_TFL_DIGSRC | PC_TFL_ATTR_TGT },
+        { PC_TOOL_FX, PC_TPOS_SCOOP_TGT, 0, 1, eEC_EFFECT_DIG_HOLE, 15.0f, "dig_hole1", 0, PC_TFL_DIGSRC | PC_TFL_ATTR_TGT },
+        { PC_TOOL_FX, PC_TPOS_SCOOP_TGT, 0, 2, eEC_EFFECT_DIG_HOLE, 16.0f, "dig_hole2", 0, PC_TFL_DIGSRC | PC_TFL_ATTR_TGT },
+        { PC_TOOL_FX, PC_TPOS_SCOOP_TGT, 0, 3, eEC_EFFECT_DIG_SCOOP, 22.0f, "dig_scoop_get", 0, PC_TFL_DIGSRC | PC_TFL_ATTR_TGT } } },
+    /* PUTAWAY_SCOOP 63: putaway_scoop.c_inc:32 GASAGOSO on entry. */
+    { mPlayer_INDEX_PUTAWAY_SCOOP, 1, {
+        { PC_TOOL_SND, PC_TPOS_WORLD, 0, 0, NA_SE_GASAGOSO, 0.0f, "scoop_putaway_gasagoso", 0, 0 } } },
+    /* ---- M9-C Phase 6b: other filled common-action rows ---- */
+    /* TIRED 85: tired.c_inc:26-35 at frame 10 araiiki (gender) + DUST at feel_pos (arg0 0, arg1 0). */
+    { mPlayer_INDEX_TIRED, 2, {
+        { PC_TOOL_SND, PC_TPOS_WORLD, 0, 0, PC_TID_ARAIIKI, 10.0f, "araiiki", 0, 0 },
+        { PC_TOOL_FX, PC_TPOS_FEEL, 0, 0, eEC_EFFECT_DUST, 10.0f, "tired_dust", 0, PC_TFL_ATTR0 } } },
+    /* STRUGGLE_PITFALL 94: setup sets draw_effect_idx = ASE2 + 1 (struggle_pitfall.c_inc:22); the draw callback spawns ASE2 once at
+     *   feel_pos on the next draw (m_player_draw.c_inc:106-116, arg0 0, arg1 0). */
+    { mPlayer_INDEX_STRUGGLE_PITFALL, 1, {
+        { PC_TOOL_FX, PC_TPOS_FEEL, 0, 0, eEC_EFFECT_ASE2, 0.0f, "pitfall_sweat", 0, PC_TFL_ATTR0 } } },
+    /* SHOCK 99 (player-vs-player shovel, bee / axe bounces): shock.c_inc:64-75 Set_FeelEffect_Shock sets draw_effect_idx = SHOCK + 1 at GAAAN1
+     *   frame 5; the draw callback spawns it at feel_pos (m_player_draw.c_inc:112-116, arg0 0, arg1 0); ef_shock.c:88-92 plays its SE 0x2D
+     *   itself at the effect (so the puppet's dismay is HEARD by everybody near it, positioned at the puppet). The row starts on GAAAN1. */
+    { mPlayer_INDEX_SHOCK, 1, {
+        { PC_TOOL_FX, PC_TPOS_FEEL, 0, 0, eEC_EFFECT_SHOCK, 5.0f, "shock", 0, PC_TFL_ATTR0 } } },
+    /* STUNG_MOSQUITO 107 (player-vs-player net FLINCH, mosquito stings): the sting SE NA_SE_6A is played by the mosquito actor
+     *   (ac_ins_ka.c:238 aIKA_attack_init) of the stung player's own process, which nobody else has: the puppet plays it on entry. The PvP
+     *   flinch (no mosquito) plays the same SE locally (m_player.c Player_actor_pc_pvp_post). */
+    { mPlayer_INDEX_STUNG_MOSQUITO, 1, {
+        { PC_TOOL_SND, PC_TPOS_WORLD, 0, 0, NA_SE_6A, 0.0f, "flinch_6a", 0, 0 } } },
+    /* STUNG_BEE 96: stung_bee.c_inc:37 HACHI_SASARERU on entry. */
+    { mPlayer_INDEX_STUNG_BEE, 1, {
+        { PC_TOOL_SND, PC_TPOS_WORLD, 0, 0, NA_SE_HACHI_SASARERU, 0.0f, "hachi_sasareru", 0, 0 } } },
+    /* REMOVE_GRASS 98: remove_grass.c_inc:44-58 at frame 17, only if the target tile still holds grass: DIG_MUD arg1 8 at the
+     *   weed (angle 0) + ZASSOU_NUKU at the weed. The weed fly-off / tile change is a world mutation and is NOT replayed. */
+    { mPlayer_INDEX_REMOVE_GRASS, 2, {
+        { PC_TOOL_FX, PC_TPOS_GRASS, 0, 8, eEC_EFFECT_DIG_MUD, 17.0f, "grass_mud", 0, PC_TFL_ATTR_TGT | PC_TFL_ANGLE0 },
+        { PC_TOOL_SND, PC_TPOS_GRASS, 0, 0, NA_SE_ZASSOU_NUKU, 17.0f, "zassou_nuku", 0, 0 } } },
+    /* ---- P1 (puppet animation coverage): the new rows' player-side sounds / effects (same gating / budget as every tool event) ---- */
+    /* PICKUP_FURNITURE 32: pickup_furniture.c_inc:146-152 ITEM_GET at frame 10, GASAGOSO at 20. */
+    { mPlayer_INDEX_PICKUP_FURNITURE, 2, {
+        { PC_TOOL_SND, PC_TPOS_WORLD, 0, 0, NA_SE_ITEM_GET, 10.0f, "ftr_item_get", 0, 0 },
+        { PC_TOOL_SND, PC_TPOS_WORLD, 0, 0, NA_SE_GASAGOSO, 20.0f, "ftr_gasagoso", 0, 0 } } },
+    /* SITDOWN 34: sitdown.c_inc:64 JUMP on entry, :74-76 the chair's SIT SE at frame 18 (mRmTp_GetFtrActionSE of a furniture the puppet does
+     *   not know: the vanilla default HARD_CHAIR_SIT). STANDUP 36: standup.c_inc:37 the chair's STANDUP SE on entry (default
+     *   HARD_CHAIR_STANDUP), :59-61 LANDING at frame 17. */
+    { mPlayer_INDEX_SITDOWN, 2, {
+        { PC_TOOL_SND, PC_TPOS_WORLD, 0, 0, NA_SE_JUMP, 0.0f, "sit_jump", 0, 0 },
+        { PC_TOOL_SND, PC_TPOS_WORLD, 0, 0, NA_SE_HARD_CHAIR_SIT, 18.0f, "chair_sit", 0, 0 } } },
+    { mPlayer_INDEX_STANDUP, 2, {
+        { PC_TOOL_SND, PC_TPOS_WORLD, 0, 0, NA_SE_HARD_CHAIR_STANDUP, 0.0f, "chair_standup", 0, 0 },
+        { PC_TOOL_SND, PC_TPOS_WORLD, 0, 0, NA_SE_LANDING, 17.0f, "standup_landing", 0, 0 } } },
+    /* TAKEOUT_ITEM 72 / PUTIN_ITEM 73: GASAGOSO on entry (takeout_item.c_inc:46, putin_item.c_inc:56). */
+    { mPlayer_INDEX_TAKEOUT_ITEM, 1, {
+        { PC_TOOL_SND, PC_TPOS_WORLD, 0, 0, NA_SE_GASAGOSO, 0.0f, "takeout_gasagoso", 0, 0 } } },
+    { mPlayer_INDEX_PUTIN_ITEM, 1, {
+        { PC_TOOL_SND, PC_TPOS_WORLD, 0, 0, NA_SE_GASAGOSO, 0.0f, "putin_gasagoso", 0, 0 } } },
+    /* THROW_MONEY 87: throw_money.c_inc:68-84 COIN_GASAGOSO at frame 9, the COIN effect at frame 33 at the player (arg 0). */
+    { mPlayer_INDEX_THROW_MONEY, 2, {
+        { PC_TOOL_SND, PC_TPOS_WORLD, 0, 0, NA_SE_COIN_GASAGOSO, 9.0f, "coin_gasagoso", 0, 0 },
+        { PC_TOOL_FX, PC_TPOS_WORLD, 0, 0, eEC_EFFECT_COIN, 33.0f, "coin", 0, PC_TFL_ATTR0 } } },
+    /* READY_PITFALL 92: ready_pitfall.c_inc:70-79 draw_effect_idx = ASE2 + 1 at frame 5 (spawned at the FEEL joint by the draw callback),
+     *   killed by the state's settle (:56): sweat_active / pc_puppet_sweat_kill on the next row or the release. */
+    { mPlayer_INDEX_READY_PITFALL, 1, {
+        { PC_TOOL_FX, PC_TPOS_FEEL, 0, 0, eEC_EFFECT_ASE2, 5.0f, "pitfall_sweat_ready", 0, PC_TFL_ATTR0 } } },
+    /* KNOCK_DOOR 100: knock_door.c_inc:58-65 the knock SE at frames 13 and 20. */
+    { mPlayer_INDEX_KNOCK_DOOR, 2, {
+        { PC_TOOL_SND, PC_TPOS_WORLD, 0, 0, NA_SE_SOUND_KNOCK, 13.0f, "knock1", 0, 0 },
+        { PC_TOOL_SND, PC_TPOS_WORLD, 0, 0, NA_SE_SOUND_KNOCK, 20.0f, "knock2", 0, 0 } } },
+};
+
+static const PCToolRow* pc_puppet_tool_row_for(int row_idx) {
+    size_t i;
+
+    for (i = 0; i < sizeof(s_tool_rows) / sizeof(s_tool_rows[0]); i++) {
+        if (s_tool_rows[i].row == row_idx) {
+            return &s_tool_rows[i];
+        }
+    }
+    return NULL;
+}
+
+/* One tool sound: sAdo_OngenTrgStart(label, pos) (positional one-shot, reads only the camera mic position), gated and
+ * budgeted like every puppet sound. Returns 0 only when `retry` and the frame cap denied it (caller keeps it due). */
+static int pc_puppet_tool_snd(PCRemotePlayerActor* self, PCRemotePlayerSlot* slot, GAME* game, const char* name, u16 label,
+                              const xyz_t* pos, float frame, int retry) {
+    const char* reason = pc_puppet_fx_reason(self, slot, game, 1);
+    PCRemotePlayerCosStats* st = &slot->cos_stats;
+
+    if (reason != NULL && retry && strcmp(reason, "capped") == 0) {
+        return 0;
+    }
+    if (reason == NULL) {
+        xyz_t p = *pos;
+
+        sAdo_OngenTrgStart(label, &p);
+        st->sounds++;
+        st->tool_sounds++;
+        pc_puppet_fx_diag(self, name, name, frame, (int)label, "ok");
+    } else {
+        st->sounds_suppressed++;
+        pc_puppet_fx_diag(self, name, name, frame, -1, reason);
+    }
+    return 1;
+}
+
+/* 1 = vanilla's effect init would spawn nothing visible here, so the pool slot is not burned: ef_swing_rod_init and the
+ * arg1 == 1 branch of ef_swing_axe_init only act on BUSH ground (ef_swing_axe's ct also drops petals on a grown flower
+ * tile). Evaluated only for the local scene (collision data of the CURRENT scene); otherwise the normal gate reports it. */
+static int pc_puppet_tool_fx_noop(PCRemotePlayerActor* self, PCRemotePlayerSlot* slot, GAME* game, int fx_id, int arg1) {
+    GAME_PLAY* play = (GAME_PLAY*)game;
+    u32 attr;
+
+    if (!(fx_id == eEC_EFFECT_SWING_ROD || (fx_id == eEC_EFFECT_SWING_AXE && arg1 == 1))) {
+        return 0;
+    }
+    if (!pc_remote_player_scene_is_local_field(slot, play) || slot->snapshot_count == 0 || !self->visual.initialized) {
+        return 0;
+    }
+    attr = mCoBG_Wpos2Attribute(self->actor_class.world.position, NULL);
+    if (attr == mCoBG_ATTRIBUTE_BUSH) {
+        return 0;
+    }
+    if (fx_id == eEC_EFFECT_SWING_AXE) {
+        mActor_name_t* fg_p = mFI_GetUnitFG(self->actor_class.world.position);
+
+        if (fg_p != NULL && IS_ITEM_GROWN_FLOWER(*fg_p)) {
+            return 0;
+        }
+    }
+    return 1;
+}
+
+static void pc_puppet_tool_pos(const PCRemotePlayerActor* self, int mode, u32 game_frame, xyz_t* out) {
+    const ACTOR* a = &self->actor_class;
+    s16 rot = a->shape_info.rotation.y; /* swing/reflect/air axe: world.angle.y == shape_info.rotation.y while the state runs */
+    f32 s = sin_s(rot);
+    f32 c = cos_s(rot);
+
+    *out = a->world.position;
+    switch (mode) {
+        case PC_TPOS_AXE_HIT: /* Player_actor_SetEffectHit_axe_common offset {-7, 20, 24} */
+            out->y += 20.0f;
+            out->z += (24.0f * c) - (-7.0f * s);
+            out->x += (24.0f * s) + (-7.0f * c);
+            break;
+        case PC_TPOS_AXE_TARGET: /* the hit tile is not transmitted: one tile-ish ahead of the puppet at chest height */
+            out->y += 20.0f;
+            out->x += 40.0f * s;
+            out->z += 40.0f * c;
+            break;
+        case PC_TPOS_NET:
+            if (self->cos.net_frame != 0u && self->cos.net_frame + 3u >= game_frame + 1u) {
+                *out = self->cos.net_pos; /* captured by this puppet's own draw */
+            } else { /* vanilla net_pos is ~ 40 along the net handle: 50 ahead at hand height */
+                out->y += 20.0f;
+                out->x += 50.0f * s;
+                out->z += 50.0f * c;
+            }
+            break;
+        default:
+            break;
+    }
+}
+
+/* M9-C Phase 6b: READ-ONLY reconstruction of the shovel's target tile, the tile-choice part of mPlib_Check_scoop_after
+ * (m_player_lib.c:2971-3150) for the puppet's own position/facing: the 8 neighbours of the tile under the puppet, the one
+ * whose centre is closest to the facing angle (diagonals re-checked for walls / too far like vanilla), result tile centre with
+ * y = column height (or the plain ground height for stump/stone/tree/reserve targets). Only field reads (mFI_* / mCoBG_*
+ * getters of the CURRENT scene's tables, the caller has verified scene == local scene): no Now_Private, no local player, no
+ * world write. The state itself (dig/fill/get/reflect/air) comes from the MOVE main index; vanilla's later classification
+ * (wall line checks, NPC/snowman hits, dig status) is not repeated. Returns 1 = tile exists (out/fg_out filled), 0 = none
+ * (air). Facing = shape_info.rotation.y like the tree search. */
+static int pc_puppet_scoop_target(const PCRemotePlayerActor* self, xyz_t* out, mActor_name_t* fg_out) {
+    static const int add_num[8][2] = { { -1, -1 }, { 0, -1 }, { 1, -1 }, { -1, 0 }, { 1, 0 }, { -1, 1 }, { 0, 1 }, { 1, 1 } };
+    const xyz_t* pp = &self->actor_class.world.position;
+    xyz_t unit_pos[8];
+    int unit_num[8][2];
+    int unit_exist[8];
+    xyz_t unit_dist[8];
+    s16 unit_angle_y[8];
+    int unit_abs_diff[8];
+    xyz_t center;
+    int pux, puz, idx = 0, min_angle_y, player_angle_y, i;
+    mActor_name_t* fg_p;
+    mActor_name_t fg;
+    int special;
+
+    if (Common_Get(field_type) != mFI_FIELDTYPE2_FG || !mFI_Wpos2UtNum(&pux, &puz, *pp)) {
+        return 0;
+    }
+    mFI_UtNum2CenterWpos(&center, pux, puz);
+    for (i = 0; i < 8; i++) {
+        unit_num[i][0] = pux + add_num[i][0];
+        unit_num[i][1] = puz + add_num[i][1];
+        unit_exist[i] = mFI_UtNum2CenterWpos(&unit_pos[i], unit_num[i][0], unit_num[i][1]);
+        unit_pos[i].y = pp->y;
+        if (unit_exist[i] == FALSE) {
+            unit_pos[i].x = center.x + unit_num[i][0] * mFI_UT_WORLDSIZE_X_F;
+            unit_pos[i].z = center.z + unit_num[i][1] * mFI_UT_WORLDSIZE_Z_F;
+        }
+    }
+    for (i = 0; i < 8; i++) {
+        unit_dist[i].x = unit_pos[i].x - pp->x;
+        unit_dist[i].z = unit_pos[i].z - pp->z;
+        unit_angle_y[i] = atans_table(unit_dist[i].z, unit_dist[i].x);
+    }
+    player_angle_y = self->actor_class.shape_info.rotation.y;
+    min_angle_y = DEG2SHORT_ANGLE2(360.0f);
+    for (i = 0; i < 8; i++) {
+        int d = unit_angle_y[i] - player_angle_y;
+
+        unit_abs_diff[i] = ABS(d);
+        if (unit_abs_diff[i] > DEG2SHORT_ANGLE2(180.0f)) {
+            unit_abs_diff[i] = DEG2SHORT_ANGLE2(360.0f) - unit_abs_diff[i];
+        }
+        if (min_angle_y > unit_abs_diff[i]) {
+            min_angle_y = unit_abs_diff[i];
+            idx = i;
+        }
+    }
+    if (idx == 0 || idx == 2 || idx == 5 || idx == 7) { /* diagonal: wall / distance re-check (vanilla :3071-3140) */
+        int near_wall, too_far_away = FALSE, c0, c1, wall0 = FALSE, wall1 = FALSE;
+        f32 base_ut_y = mCoBG_GetBgY_OnlyCenter_FromWpos2(unit_pos[idx], 0.0f);
+
+        if (idx == 0) {
+            c0 = 1;
+            c1 = 3;
+        } else if (idx == 2) {
+            c0 = 1;
+            c1 = 4;
+        } else if (idx == 5) {
+            c0 = 3;
+            c1 = 6;
+        } else {
+            c0 = 4;
+            c1 = 6;
+        }
+        if (unit_exist[c0]) {
+            f32 g0 = mCoBG_GetBgY_OnlyCenter_FromWpos2(unit_pos[c0], 0.0f);
+            f32 g1 = mCoBG_Wpos2BgUtCenterHeight_AddColumn(unit_pos[c0]);
+
+            if (g0 != g1 && base_ut_y < g1) {
+                wall0 = TRUE;
+            }
+        }
+        if (unit_exist[c1]) {
+            f32 g0 = mCoBG_GetBgY_OnlyCenter_FromWpos2(unit_pos[c1], 0.0f);
+            f32 g1 = mCoBG_Wpos2BgUtCenterHeight_AddColumn(unit_pos[c1]);
+
+            if (g0 != g1 && base_ut_y < g1) {
+                wall1 = TRUE;
+            }
+        }
+        near_wall = (wall0 && wall1) ? TRUE : FALSE;
+        if (near_wall == FALSE) {
+            f32 dist = Math3DVecLengthSquare2D(unit_dist[idx].z, unit_dist[idx].x);
+
+            too_far_away = (SQ(63.245553f) > dist) ? FALSE : TRUE;
+        }
+        if (too_far_away || near_wall) {
+            static const int card[4] = { 1, 3, 4, 6 };
+
+            min_angle_y = DEG2SHORT_ANGLE2(360.0f);
+            for (i = 0; i < 4; i++) {
+                if (min_angle_y > unit_abs_diff[card[i]]) {
+                    min_angle_y = unit_abs_diff[card[i]];
+                    idx = card[i];
+                }
+            }
+        }
+    }
+    if (unit_exist[idx] == FALSE) {
+        return 0;
+    }
+    fg_p = mFI_UtNum2UtFG(unit_num[idx][0], unit_num[idx][1]);
+    fg = (fg_p == NULL) ? (mActor_name_t)EMPTY_NO : *fg_p;
+    special = IS_ITEM_TREE_STUMP(fg) || IS_ITEM_STONE_TC(fg) || IS_ITEM_HITTABLE_TREE(fg) || fg == DUMMY_RESERVE;
+    unit_pos[idx].y = mCoBG_Wpos2BgUtCenterHeight_AddColumn(unit_pos[idx]);
+    *out = unit_pos[idx];
+    if (special) {
+        out->y = mCoBG_GetBgY_OnlyCenter_FromWpos2(*out, 0.0f);
+    }
+    *fg_out = fg;
+    return 1;
+}
+
+/* M9-C Phase 6b: remove_grass target (Player_actor_Search_putin_item, m_player_common.c_inc:7401, GRASS items only): the tile
+ * 20 then 10 units in front of the puppet; vanilla item position = tile centre + weed offset (pc_pk_ground_pos mirrors
+ * bIT_actor_rand_pos_get_plus), within 15 units / 15 height of the probe. Read-only. 1 = a grass tile found. */
+static int pc_pk_ground_pos(int ux, int uz, uint16_t item, xyz_t* out);
+static int pc_puppet_find_grass(const PCRemotePlayerActor* self, xyz_t* item_pos) {
+    static const f32 dists[2] = { 20.0f, 10.0f };
+    s16 ang = self->actor_class.shape_info.rotation.y;
+    int k;
+
+    for (k = 0; k < 2; k++) {
+        xyz_t probe = self->actor_class.world.position;
+        mActor_name_t* fg_p;
+        int ux, uz;
+        xyz_t ground, c;
+
+        probe.x += dists[k] * sin_s(ang);
+        probe.z += dists[k] * cos_s(ang);
+        if (mFI_Wpos2DepositGet(probe) != FALSE) {
+            continue;
+        }
+        fg_p = mFI_GetUnitFG(probe);
+        if (fg_p == NULL || IS_ITEM_GRASS(*fg_p) == FALSE || !mFI_Wpos2UtNum(&ux, &uz, probe)) {
+            continue;
+        }
+        if (!pc_pk_ground_pos(ux, uz, (uint16_t)*fg_p, &ground)) {
+            continue;
+        }
+        mFI_Wpos2UtCenterWpos(&c, probe);
+        c.y = mCoBG_GetBgY_OnlyCenter_FromWpos2(c, 0.0f);
+        if (Math3DLengthSquare2D(ground.x, ground.z, probe.x, probe.z) <= SQ(15.0f) &&
+            ABS(c.y - probe.y) <= 15.0f) {
+            *item_pos = ground;
+            return 1;
+        }
+    }
+    return 0;
+}
+
+/* Target-dependent reflect_scoop hit sound (Player_actor_SetSound_Reflect_scoop, reflect_scoop.c_inc:139-216) for the
+ * "no reflected actor" case (the puppet cannot see the sender's NPC/snowman/ball): bush ground SHIGEMI; tree / reserve
+ * TREE_HIT; furniture/item1 ITEM_HIT; else wood ground TREE_HIT, otherwise SCOOP_HIT. */
+static u16 pc_puppet_reflect_label(int have_tgt, const xyz_t* tgt, mActor_name_t fg) {
+    int type;
+
+    if (!have_tgt) {
+        return NA_SE_SCOOP_HIT;
+    }
+    if (mCoBG_Wpos2Attribute(*tgt, NULL) == mCoBG_ATTRIBUTE_BUSH) {
+        return NA_SE_SCOOP_SHIGEMI;
+    }
+    if (IS_ITEM_COLLIDEABLE_TREE(fg) || fg == DUMMY_RESERVE) {
+        return NA_SE_SCOOP_TREE_HIT;
+    }
+    type = ITEM_NAME_GET_TYPE(fg);
+    if (type == NAME_TYPE_FTR0 || type == NAME_TYPE_ITEM1 || type == NAME_TYPE_FTR1) {
+        return NA_SE_SCOOP_ITEM_HIT;
+    }
+    return mCoBG_WoodSoundEffect(tgt) ? NA_SE_SCOOP_TREE_HIT : NA_SE_SCOOP_HIT;
+}
+
+static void pc_puppet_scoop_diag(PCRemotePlayerActor* self, const char* name, float frame, int found, const xyz_t* tgt,
+                                 mActor_name_t fg) {
+    int ux = -1, uz = -1;
+
+    if (!pc_puppet_diag_allow(self, "scoop", name, "ok")) {
+        return;
+    }
+    if (found) {
+        (void)mFI_Wpos2UtNum(&ux, &uz, *tgt);
+    }
+    printf("[NET][PUPPET][DIAG] player %d scoop target event=%s frame=%.1f found=%d tile=(%d,%d) item=0x%04X stump=%d\n",
+           (int)self->peer, name, (double)frame, found, ux, uz, (unsigned)fg, found && IS_ITEM_TREE_STUMP(fg) ? 1 : 0);
+}
+
+static int pc_puppet_tool_fire(PCRemotePlayerActor* self, PCRemotePlayerSlot* slot, GAME* game, const PCToolEvent* e, float cur,
+                               int retry) {
+    xyz_t pos;
+    xyz_t tgt;
+    mActor_name_t tfg = (mActor_name_t)EMPTY_NO;
+    int have_tgt = 0;
+    int need_tgt = (e->pos == PC_TPOS_SCOOP_TGT || e->pos == PC_TPOS_REFLECT || e->cond != PC_TCOND_ANY);
+    int mode = e->pos;
+    u16 id = e->id;
+    PCFxOpts opts;
+
+    memset(&tgt, 0, sizeof(tgt));
+    opts.attr_pos = NULL;
+    opts.attr_force = -1;
+    opts.angle_zero = (e->fl & PC_TFL_ANGLE0) != 0;
+    opts.dig_src = (e->fl & PC_TFL_DIGSRC) != 0;
+    if (need_tgt || mode == PC_TPOS_GRASS) {
+        const char* gate = pc_pk_gate(self, slot, game);
+
+        if (gate != NULL) {
+            /* scene / hidden / pause / null / local player / range: do not read any field data for a puppet that is not in the
+             * local scene or not near the local player. Review R3-L1: an event that needs a target (or a stump / not-stump
+             * condition, or the grass position) is NEVER fired with an unknown target: log the token and finish it, so the
+             * sounds' wider range (600 vs 500), a NULL bg_item_clip or similar can neither play both conditional sounds nor
+             * spawn a ground effect read at (0,0,0). */
+            if (e->kind == PC_TOOL_SND) {
+                slot->cos_stats.sounds_suppressed++;
+                pc_puppet_fx_diag(self, e->name, e->name, cur, -1, gate);
+            } else {
+                slot->cos_stats.suppressed++;
+                pc_puppet_fx_diag(self, "effect", e->name, cur, -1, gate);
+            }
+            return 1;
+        }
+    }
+    if (need_tgt) {
+        have_tgt = pc_puppet_scoop_target(self, &tgt, &tfg);
+        pc_puppet_scoop_diag(self, e->name, cur, have_tgt, &tgt, tfg);
+        if ((e->cond == PC_TCOND_NOT_STUMP && have_tgt && IS_ITEM_TREE_STUMP(tfg)) ||
+            (e->cond == PC_TCOND_STUMP && !(have_tgt && IS_ITEM_TREE_STUMP(tfg)))) {
+            return 1; /* the other variant of this frame (stump vs ground) handles it */
+        }
+    }
+    pc_puppet_tool_pos(self, mode, game->frame_counter, &pos);
+    switch (mode) {
+        case PC_TPOS_SCOOP_TGT:
+            if (e->kind == PC_TOOL_FX) {
+                if (!have_tgt) {
+                    pc_puppet_fx_diag(self, "effect", e->name, cur, -1, "notarget");
+                    return 1;
+                }
+                pos = tgt;
+                opts.attr_pos = &tgt;
+            }
+            break;
+        case PC_TPOS_REFLECT: {
+            s16 rot = self->actor_class.shape_info.rotation.y;
+            f32 s = sin_s(rot);
+            f32 c = cos_s(rot);
+            int attr = -1;
+            int type = ITEM_NAME_GET_TYPE(tfg);
+
+            pos = self->actor_class.world.position;
+            pos.x += (37.0f * s) + (2.0f * c);
+            pos.z += (37.0f * c) - (2.0f * s);
+            if (have_tgt && IS_ITEM_COLLIDEABLE_TREE(tfg)) {
+                attr = mCoBG_ATTRIBUTE_STONE;
+            }
+            if (have_tgt && IS_ITEM_STONE_TC(tfg) && attr < 0) {
+                attr = mCoBG_ATTRIBUTE_STONE;
+            }
+            if (attr < 0 && (type >= 4 || type < 1)) {
+                attr = (int)mCoBG_Wpos2Attribute(pos, NULL);
+            }
+            if (attr < 0) { /* furniture / item targets: vanilla spawns nothing */
+                pc_puppet_fx_diag(self, "effect", e->name, cur, -1, "noop");
+                return 1;
+            }
+            opts.attr_force = attr;
+            id = (u16)eEC_EFFECT_DIG_SCOOP;
+            break;
+        }
+        case PC_TPOS_FEEL:
+            if (self->cos.feel_frame != 0u && (game->frame_counter + 1u) - self->cos.feel_frame <= 3u) {
+                pos = self->cos.feel_pos; /* captured by this puppet's own draw */
+                if (pc_puppet_diag_allow(self, "feel", e->name, "ok")) {
+                    printf("[NET][PUPPET][DIAG] player %d feel pos source=captured event=%s\n", (int)self->peer, e->name);
+                }
+            } else if (retry) {
+                return 0; /* no recent draw yet: wait (bounded by the retry window), then use the fallback */
+            } else {
+                pos.y += 40.0f; /* approximate head height */
+                if (pc_puppet_diag_allow(self, "feel", e->name, "ok")) {
+                    printf("[NET][PUPPET][DIAG] player %d feel pos source=fallback event=%s\n", (int)self->peer, e->name);
+                }
+            }
+            break;
+        case PC_TPOS_GRASS:
+            if (!pc_puppet_find_grass(self, &pos)) {
+                if (e->kind == PC_TOOL_FX) {
+                    pc_puppet_fx_diag(self, "effect", e->name, cur, -1, "notarget");
+                }
+                return 1; /* vanilla: no grass at the target any more -> nothing happens */
+            }
+            opts.attr_pos = &pos;
+            break;
+        default:
+            break;
+    }
+    if (e->kind == PC_TOOL_SND) {
+        if (id == PC_TID_ARAIIKI) {
+            id = (slot->appearance.gender == mPr_SEX_MALE) ? (u16)NA_SE_ARAIIKI_BOY : (u16)NA_SE_ARAIIKI_GIRL;
+        } else if (id == PC_TID_REFLECT_SND) {
+            id = pc_puppet_reflect_label(have_tgt, &tgt, tfg);
+            pos = self->actor_class.world.position; /* sound at the digger */
+        }
+        return pc_puppet_tool_snd(self, slot, game, e->name, id, &pos, cur, retry);
+    }
+    {
+        int before = slot->cos_stats.spawned;
+        int done;
+
+        if (e->fl & PC_TFL_ATTR0) {
+            opts.attr_force = 0;
+        } else if (e->fl & PC_TFL_ATTR_TGT) {
+            opts.attr_pos = (mode == PC_TPOS_GRASS) ? &pos : &tgt;
+        }
+        done = pc_puppet_fx_emit_core(self, slot, game, (int)id, e->name, &pos, self->actor_class.shape_info.rotation.y, cur,
+                                      e->arg1, 0, retry, &opts);
+        if (slot->cos_stats.spawned != before) {
+            slot->cos_stats.tool_effects++;
+            if (id == (u16)eEC_EFFECT_ASE2) {
+                self->cos.sweat_active = 1; /* review H1: killed again when the run ends (pc_puppet_sweat_kill) */
+            }
+        }
+        return done;
+    }
+}
+
+static void pc_puppet_tool_tick(PCRemotePlayerActor* self, PCRemotePlayerSlot* slot, GAME* game, double now, float cur,
+                                float last, int have_last, float max_frames, double row_start_now, int first_sight) {
+    PCRemotePlayerCosmetic* c = &self->cos;
+    PCRemotePlayerVisual* v = &self->visual;
+    const PCToolRow* tr = v->row_active ? pc_puppet_tool_row_for(v->row_idx) : NULL;
+    int i;
+
+    if (tr == NULL) {
+        pc_puppet_sweat_kill(self, "left-row"); /* review H1 */
+        if (c->tool_due != 0) { /* the run ended/was replaced while events still waited for the budget */
+            slot->cos_stats.tool_dropped++;
+        }
+        c->tool_row_start = 0.0;
+        c->tool_done = 0;
+        c->tool_due = 0;
+        return;
+    }
+    if (c->tool_row_start != row_start_now) { /* entry edge of a new run (also a repeated same-state entry) */
+        pc_puppet_sweat_kill(self, "left-row"); /* review H1: previous run's sweat (a new pitfall run spawns a fresh one below) */
+        if (c->tool_due != 0) {
+            slot->cos_stats.tool_dropped++;
+        }
+        c->tool_row_start = row_start_now;
+        c->tool_done = 0;
+        c->tool_due = 0;
+        c->tool_due_time = 0.0;
+        for (i = 0; i < tr->n; i++) {
+            if (tr->ev[i].frame == 0.0f) {
+                if (first_sight) {
+                    c->tool_done |= 1u << i; /* a steady row adopted on a fresh actor: no entry edge happened here */
+                } else {
+                    c->tool_due |= 1u << i;
+                    c->tool_due_time = now;
+                }
+            }
+        }
+    } else if (have_last) {
+        for (i = 0; i < tr->n; i++) {
+            const PCToolEvent* e = &tr->ev[i];
+            unsigned bit = 1u << i;
+
+            if (e->frame <= 0.0f || (c->tool_done & bit) || (c->tool_due & bit)) {
+                continue;
+            }
+            if (pc_puppet_frame_crossed(last, cur, max_frames, e->frame)) {
+                if (e->repeat) {
+                    if (now - c->tool_repeat_last < PC_PUPPET_TOOL_REPEAT_GUARD) {
+                        continue;
+                    }
+                    c->tool_repeat_last = now;
+                }
+                if (c->tool_due == 0) {
+                    c->tool_due_time = now;
+                }
+                c->tool_due |= bit;
+            }
+        }
+    }
+    if (c->tool_due == 0) {
+        return;
+    }
+    {
+        int expired = (now - c->tool_due_time) > PC_PUPPET_TOOL_RETRY_FRAMES;
+
+        for (i = 0; i < tr->n; i++) {
+            unsigned bit = 1u << i;
+
+            if (!(c->tool_due & bit)) {
+                continue;
+            }
+            if (pc_puppet_tool_fire(self, slot, game, &tr->ev[i], cur, !expired)) {
+                c->tool_due &= ~bit;
+                if (!tr->ev[i].repeat) {
+                    c->tool_done |= bit;
+                }
+            } else if (expired) {
+                c->tool_due &= ~bit;
+                slot->cos_stats.tool_dropped++;
+            }
+        }
+    }
+}
+
+/* Review R3-L4: a frame step above PC_PUPPET_MAX_DT_FRAMES clears the frame window, so held-tool events whose frame lies in
+ * the skipped window are lost; count them in tool_dropped (visible in the destroy summary) instead of losing them silently. */
+static void pc_puppet_tool_count_hitch(const PCRemotePlayerCosmetic* c, const PCRemotePlayerVisual* v,
+                                       PCRemotePlayerSlot* slot, float last, float cur, float max_frames, double row_start_now) {
+    const PCToolRow* tr = v->row_active ? pc_puppet_tool_row_for(v->row_idx) : NULL;
+    int i;
+
+    if (tr == NULL || c->tool_row_start != row_start_now) {
+        return;
+    }
+    for (i = 0; i < tr->n; i++) {
+        const PCToolEvent* e = &tr->ev[i];
+        unsigned bit = 1u << i;
+
+        if (e->frame > 0.0f && !(c->tool_done & bit) && !(c->tool_due & bit) &&
+            pc_puppet_frame_crossed(last, cur, max_frames, e->frame)) {
+            slot->cos_stats.tool_dropped++;
+        }
+    }
+}
+
+static void pc_puppet_pending_run(PCRemotePlayerActor* self, PCRemotePlayerSlot* slot, GAME* game, double now) {
+    PCRemotePlayerCosmetic* c = &self->cos;
+    int idx;
+
+    for (idx = 0; idx < 2 && c->pending != 0; idx++) {
+        unsigned bit_fp = 1u << (idx * 3 + PC_PIECE_FOOTPRINT);
+        unsigned bit_snd = 1u << (idx * 3 + PC_PIECE_SOUND);
+        unsigned bit_fx = 1u << (idx * 3 + PC_PIECE_DUST);
+        float frame = (idx == 0) ? PC_PUPPET_FOOT_LEFT_FRAME : PC_PUPPET_FOOT_RIGHT_FRAME;
+        xyz_t fpos;
+        s16 fang;
+
+        if ((c->pending & (bit_fp | bit_snd | bit_fx)) == 0) {
+            continue;
+        }
+        pc_puppet_foot_get(self, game, idx, &fpos, &fang);
+        if ((c->pending & bit_fp) &&
+            pc_puppet_fx_emit_ex(self, slot, game, eEC_EFFECT_FOOTPRINT, "footprint", &fpos, fang, frame, 0, 0, 1)) {
+            c->pending &= ~bit_fp;
+        }
+        if ((c->pending & bit_snd) && pc_puppet_snd_emit_ex(self, slot, game, 0, frame, 1)) {
+            c->pending &= ~bit_snd;
+        }
+        if ((c->pending & bit_fx) &&
+            pc_puppet_fx_emit_ex(self, slot, game, c->pending_dash ? eEC_EFFECT_DASH_ASIMOTO : eEC_EFFECT_WALK_ASIMOTO,
+                                 c->pending_dash ? "dash_asimoto" : "walk_asimoto", &fpos, fang, frame, 0, 1, 1)) {
+            c->pending &= ~bit_fx;
+        }
+    }
+    if (c->pending != 0 && now > c->pending_until) {
+        unsigned m = c->pending;
+
+        for (idx = 0; idx < 2; idx++) {
+            if (m & (1u << (idx * 3 + PC_PIECE_FOOTPRINT))) {
+                slot->cos_stats.capped++;
+            }
+            if (m & (1u << (idx * 3 + PC_PIECE_SOUND))) {
+                slot->cos_stats.sounds_suppressed++;
+            }
+            if (m & (1u << (idx * 3 + PC_PIECE_DUST))) {
+                slot->cos_stats.capped++;
+            }
+        }
+        pc_puppet_fx_diag(self, "effect", "foot_step", 0.0f, -1, "capped");
+        c->pending = 0;
+    }
+}
+
+/* Called once per puppet move after the body clip advanced (and the state row was updated). */
+static void pc_remote_player_cosmetics(PCRemotePlayerActor* self, PCRemotePlayerSlot* slot, GAME* game, double now) {
+    PCRemotePlayerCosmetic* c = &self->cos;
+    PCRemotePlayerVisual* v = &self->visual;
+    cKF_FrameControl_c* fc = &v->keyframe0.frame_control;
+    ACTOR* actor = &self->actor_class;
+    int anim = v->current_anim_idx;
+    int state = PC_COS_NONE;
+    int clip_id;
+    double row_start_now;
+    int have_last;
+    int restarted;
+    int was_tumble;
+    float cur = fc->current_frame;
+    float last;
+    float dt = (float)game->graph->dt_num_60fps_frames;
+
+    if (v->row_active) {
+        if (v->row_idx == mPlayer_INDEX_TUMBLE) {
+            state = PC_COS_TUMBLE;
+        }
+        clip_id = 1000 + v->row_idx;
+        row_start_now = v->row_start_time;
+    } else {
+        if (anim == mPlayer_ANIM_WALK1 || anim == mPlayer_ANIM_RUN1 || anim == mPlayer_ANIM_DASH1) {
+            state = PC_COS_MOVE;
+        } else if (anim == mPlayer_ANIM_RUN_SLIP1) {
+            state = PC_COS_TURN;
+        } else if (anim == mPlayer_ANIM_WAIT1) {
+            state = (self->cosmetic_move_state == PC_MOVE_STATE_TUMBLE) ? PC_COS_TUMBLE_MV : PC_COS_IDLE;
+        }
+        clip_id = anim;
+        row_start_now = 0.0;
+    }
+
+    have_last = c->last_valid && c->last_clip == clip_id;
+    restarted = c->last_valid && c->last_row_start != row_start_now;
+    last = have_last ? c->last_frame : cur;
+    if (restarted) {
+        last = cur; /* a (re)started row: no window over the previous run's frames */
+        have_last = 0;
+    }
+    if (have_last && fc->mode == cKF_FRAMECONTROL_STOP && cur < last) {
+        last = cur; /* a one-shot clip cannot wrap: it was restarted */
+    }
+    if (!(dt <= PC_PUPPET_MAX_DT_FRAMES)) {
+        if (have_last) {
+            pc_puppet_tool_count_hitch(c, v, slot, last, cur, fc->max_frames, row_start_now);
+        }
+        last = cur; /* hitch: never alias a long step into spurious triggers */
+        have_last = 0;
+    }
+    c->last_frame = cur;
+    c->last_clip = clip_id;
+    c->last_row_start = row_start_now;
+    c->last_valid = 1;
+
+    /* ---- state edges (own interpolated state; first sight adopts silently) ---- */
+    was_tumble = (c->state == PC_COS_TUMBLE || c->state == PC_COS_TUMBLE_MV);
+    if (!c->known) {
+        c->known = 1;
+        c->state = state;
+    } else {
+        int tumble_in = (state == PC_COS_TUMBLE || state == PC_COS_TUMBLE_MV) &&
+                        (!was_tumble || (state == PC_COS_TUMBLE && restarted));
+
+        if (state == PC_COS_TURN && c->state != PC_COS_TURN && now >= c->turn_in_block) {
+            /* setup_main_Turn_dash_common (m_player_main_turn_dash.c_inc:17-32): skid sound 0x4129 is already played by the
+             * Stage 4B.1 block in pc_remote_player_mv; here only the dust/water effect at the puppet position. */
+            c->turn_in_block = now + PC_PUPPET_EDGE_COOLDOWN_FRAMES;
+            pc_puppet_fx_emit(self, slot, game, eEC_EFFECT_TURN_ASIMOTO, "turn_asimoto", &actor->world.position,
+                              actor->world.angle.y, cur, 0, 0);
+        }
+        if (c->state == PC_COS_TURN && state != PC_COS_TURN && now >= c->turn_out_block) {
+            /* settle_main_Turn_dash (:38): turn footprint at the right foot. */
+            xyz_t rpos;
+            s16 rang;
+
+            c->turn_out_block = now + PC_PUPPET_EDGE_COOLDOWN_FRAMES;
+            pc_puppet_foot_get(self, game, 1, &rpos, &rang);
+            pc_puppet_fx_emit(self, slot, game, eEC_EFFECT_TURN_FOOTPRINT, "turn_footprint", &rpos, actor->world.angle.y,
+                              cur, 0, 0);
+        }
+        if (tumble_in && now >= c->tumble_block) {
+            /* setup_main_Tumble (m_player_main_tumble.c_inc:63-72): sound + TUMBLE effect (arg1 0). */
+            c->tumble_block = now + PC_PUPPET_EDGE_COOLDOWN_FRAMES;
+            pc_puppet_snd_emit(self, slot, game, 1, cur);
+            pc_puppet_fx_emit(self, slot, game, eEC_EFFECT_TUMBLE, "tumble", &actor->world.position,
+                              actor->world.angle.y, cur, 0, 0);
+        }
+        c->state = state;
+    }
+
+    /* ---- frame triggers ---- */
+    if (state == PC_COS_MOVE && have_last && now >= c->foot_block) {
+        int left = pc_puppet_frame_crossed(last, cur, fc->max_frames, PC_PUPPET_FOOT_LEFT_FRAME);
+        int right = pc_puppet_frame_crossed(last, cur, fc->max_frames, PC_PUPPET_FOOT_RIGHT_FRAME);
+        int dash = (anim == mPlayer_ANIM_DASH1);
+
+        if (left || right) {
+            c->foot_block = now + PC_PUPPET_FOOT_COOLDOWN_FRAMES;
+            c->pending = (left ? 7u : 0u) | (right ? (7u << 3) : 0u);
+            c->pending_dash = dash;
+            c->pending_until = now + PC_PUPPET_PENDING_FRAMES;
+        }
+    }
+    if (state == PC_COS_MOVE) {
+        if (c->pending != 0) {
+            pc_puppet_pending_run(self, slot, game, now);
+        }
+    } else {
+        c->pending = 0; /* left the foot-step clips: drop leftovers */
+    }
+    if (state == PC_COS_TUMBLE && have_last) {
+        /* Player_actor_SetEffect_Tumble (m_player_main_tumble.c_inc:89-103): frame 15 -> TUMBLE (arg1 1), frame 17 ->
+         * TUMBLE_BODYPRINT (frame 10 is controller rumble only: not reproduced). */
+        if (pc_puppet_frame_crossed(last, cur, fc->max_frames, 15.0f)) {
+            pc_puppet_fx_emit(self, slot, game, eEC_EFFECT_TUMBLE, "tumble", &actor->world.position,
+                              actor->world.angle.y, 15.0f, 1, 0);
+        } else if (pc_puppet_frame_crossed(last, cur, fc->max_frames, 17.0f)) {
+            pc_puppet_fx_emit(self, slot, game, eEC_EFFECT_TUMBLE_BODYPRINT, "tumble_bodyprint", &actor->world.position,
+                              actor->world.angle.y, 17.0f, 0, 0);
+        }
+    }
+
+    /* ---- M9-C Phase 4: remote tree shake at SHAKE1 frame 10 ---- */
+    pc_puppet_tree_shake_tick(self, slot, game, now, cur, last, have_last, fc->max_frames, row_start_now);
+
+    /* ---- M9-C Phase 5: remote pickup (flying item pairing + clip-frame sounds) ---- */
+    pc_puppet_pickup_tick(self, slot, game, now, cur, last, have_last, fc->max_frames, row_start_now);
+
+    /* ---- M9-C Phase 6a: held-tool sounds/effects (axe, net, rod, fan, umbrella) keyed on the state row + clip frame ---- */
+    pc_puppet_tool_tick(self, slot, game, now, cur, last, have_last, fc->max_frames, row_start_now, v->row_adopted);
+
+    /* ---- idle ripple (Player_actor_set_ripple, m_player_common.c_inc:6883): ef_wait_asimoto only does something when
+     * the ground attribute is WAVE/SEA (it spawns the TURI_HAMON ripple); on any other ground vanilla's call just burns a
+     * pool slot for one tick, so the puppet spawns it only for water. ---- */
+    if (state == PC_COS_IDLE) {
+        c->ripple_accum += dt;
+        if (c->ripple_accum >= PC_PUPPET_RIPPLE_PERIOD) {
+            c->ripple_accum = 0.0f;
+            if (pc_remote_player_scene_is_local_field(slot, (GAME_PLAY*)game)) {
+                u32 attr = mCoBG_Wpos2Attribute(actor->world.position, NULL);
+
+                if (attr == mCoBG_ATTRIBUTE_WAVE || attr == mCoBG_ATTRIBUTE_SEA) {
+                    xyz_t fpos;
+                    s16 fang;
+
+                    pc_puppet_foot_get(self, game, c->ripple_foot, &fpos, &fang);
+                    c->ripple_foot ^= 1;
+                    pc_puppet_fx_emit(self, slot, game, eEC_EFFECT_WAIT_ASIMOTO, "wait_asimoto", &fpos, fang, cur, 0, 0);
+                }
+            }
+        }
+    } else {
+        c->ripple_accum = 0.0f;
+    }
+}
+
+static void pc_puppet_fx_dump_stats(const PCRemotePlayerSlot* slot, int player) {
+    if (pc_remote_player_puppet_diag()) {
+        const PCRemotePlayerCosStats* st = &slot->cos_stats;
+
+        printf("[NET][PUPPET][DIAG] player %d cosmetics summary: effects spawned=%d capped=%d suppressed=%d sounds=%d "
+               "sounds_suppressed=%d peak_frame_spawns=%d tree_effects=%d tree_sounds=%d tree_skipped=%d pickup_events=%d "
+               "pickup_started=%d pickup_late=%d pickup_dropped=%d pickup_bell=%d pickup_ignored=%d pickup_sounds=%d "
+               "tool_effects=%d tool_sounds=%d tool_noop=%d tool_dropped=%d\n",
+               player, st->spawned, st->capped, st->suppressed, st->sounds, st->sounds_suppressed,
+               s_puppet_fx_peak_frame, st->tree_effects, st->tree_sounds, st->tree_skipped, st->pk_events, st->pk_started,
+               st->pk_late, st->pk_dropped, st->pk_bell, st->pk_ignored, st->pk_sounds, st->tool_effects, st->tool_sounds,
+               st->tool_noop, st->tool_dropped);
+    }
+}
+
+/* Building interactions: a scene event (on_scene) arms slot->snap_req. The puppet stays hidden (dw) until the ring holds a MOVE
+ * received at or after the event; then every older sample (the owner's pre-scene MOVEs, e.g. interior coordinates) is dropped so the
+ * puppet is placed at the first post-scene sample instead of sliding/teleporting through stale positions. Returns 1 when resolved. */
+static int pc_remote_player_scene_snap_resolve(PCRemotePlayerSlot* slot, double now) {
+    PCRemoteMoveSnapshot keep[PC_REMOTE_PLAYER_SNAPSHOT_COUNT];
+    int n = slot->snapshot_count;
+    int oldest, i, kept = 0;
+
+    if (n == 0) {
+        return 0;
+    }
+    if (now < slot->scene_accept_frame) { /* the frame clock restarted (new GAME_PLAY): nothing to wait for */
+        slot->snap_req = 0;
+        return 1;
+    }
+    oldest = (slot->snapshot_head - n + PC_REMOTE_PLAYER_SNAPSHOT_COUNT) % PC_REMOTE_PLAYER_SNAPSHOT_COUNT;
+    for (i = 0; i < n; i++) {
+        const PCRemoteMoveSnapshot* sn = &slot->snapshots[(oldest + i) % PC_REMOTE_PLAYER_SNAPSHOT_COUNT];
+        if (sn->recv_local_frame >= slot->scene_accept_frame) {
+            keep[kept++] = *sn;
+        }
+    }
+    if (kept == 0) {
+        if ((now - slot->scene_accept_frame) > PC_REMOTE_PLAYER_SCENE_FRESH_TIMEOUT_FRAMES) {
+            slot->snap_req = 0; /* the owner sent nothing: show the last position rather than staying invisible */
+            return 1;
+        }
+        return 0;
+    }
+    for (i = 0; i < kept; i++) {
+        slot->snapshots[i] = keep[i];
+    }
+    slot->snapshot_count = kept;
+    slot->snapshot_head = kept % PC_REMOTE_PLAYER_SNAPSHOT_COUNT;
+    slot->snap_req = 0;
+    return 1;
+}
+
+/* ===== PUPPET ACTION_EXT BEGIN (worker P2; msg 96, pc_action_ext.h) =====
+ * A DYNAMIC ROW per owner: the owner's ACTION_EXT messages are kept in a small store (pc_aext_store_put) and applied by
+ * pc_puppet_aext_apply() (called from pc_remote_player_mv right after the static row bookkeeping) only while this puppet's interpolated
+ * MOVE pair (main index, entry counter) equals a stored record's pair. While it applies it OWNS the body clips exactly like an active
+ * static row (the fallback move_state block, the tempo retune and pc_remote_player_row_post are skipped for it): a static row of the same
+ * pair is released first ("action_ext"), the clips are bound with the existing player (pc_remote_player_bind_body: anim0 on keyframe0,
+ * anim1 on keyframe1, mode STOP / REPEAT, the owner's speed and start frame), the part table is DMA'd, and a non-zero root-pin mask uses the
+ * existing PC_ROWF_ROOT_PIN mechanism (Set_base_shape_trs + animation_enabled = the vanilla AnimationMove_ct_base flags). A newer record of
+ * the same pair restarts the clip (new clip_seq) or only retunes its speed (same clip_seq: radio tempo). The overlay ends with the pair.
+ * Extras owned here: the bed tilt (LIE / ROLL / WAIT / STANDUP_BED rotate the body on shape_info.rotation.x/y in vanilla), the constant
+ * face of a clip without eye / mouth tables (talk GAAAN2 6 / 5), and the state cues (bed / trade sounds, the talk SHOCK effect, the
+ * change-cloth KIGAE / HALLOWEEN effects + wear sound). Sounds use their own gate (the puppet is shown here: town field OR the same shared
+ * interior -- bed sounds are interior sounds), effects the field-only pc_puppet_fx_emit_core gate and budget.
+ * INTEGRATION POINTS for worker P1's row infrastructure (left to the lead): (1) PC_AEXT_FL_REVERSE is ignored (played forward) until the
+ * reverse playback ('Base3') exists; (2) the pin mask is applied directly (bits = cKF TRANS_XZ / TRANS_Y / ROT_Y) and could map onto P1's
+ * generalized root-pin masks; (3) the cues could move into P1's sounds / effects tables (keyed by the dynamic row); (4) morph blending is
+ * not applied (snap, like every row); (5) aux (the traded item) is carried but not drawn (held-item drawing is P1's). Read-only towards the
+ * game: writes only this puppet's own visual, its shape rotation and positional one-shot sounds / effects. */
+#include "pc_action_ext.h"
+
+enum { PC_AEXT_CUE_SND = 0, PC_AEXT_CUE_FX = 1, PC_AEXT_CUE_FXC = 2 /* EMOTE WHEEL: a continuous effect, killed when the row ends */ };
+typedef struct PCAextCue {
+    uint8_t     idx;   /* mPlayer_INDEX_* */
+    s16         anim0; /* -1 = any clip of the state */
+    float       frame; /* 0 = at the clip start (not when adopted late), else the keyframe0 frame crossed */
+    uint8_t     kind;
+    u16         id;    /* NA_SE_* / eEC_EFFECT_* (PC_TID_ARAIIKI: the owner's gendered breath) */
+    const char* name;
+    uint8_t     variant; /* EMOTE WHEEL: 0 = any message; else only a message with this `variant` (the emote id of a DEMO_WAIT emote row) */
+} PCAextCue;
+/* Sources: lie_bed.c_inc:91 sound_JUMP at setup, :109-114 BED_IN at frame 20; roll_bed.c_inc:80 BED_NEGAERI at setup; standup_bed.c_inc:131
+ * BED_OUT at setup, :138-143 LANDING at frame 23; give.c_inc:78 / recieve_putaway.c_inc:48 GASAGOSO at setup; talk.c_inc:76-83 (also
+ * demo_wait.c_inc:73-80) SHOCK at GAAAN1 frame 5 (drawn at feel_pos); change_cloth.c_inc:65-68 HALLOWEEN at the ITAZURA1 setup, :94-106
+ * wear sound + KIGAE at MENU_CHANGE1 frame 16. */
+static const PCAextCue s_aext_cues[] = {
+    { mPlayer_INDEX_LIE_BED, -1, 0.0f, PC_AEXT_CUE_SND, NA_SE_JUMP, "bed_jump", 0 },
+    { mPlayer_INDEX_LIE_BED, -1, 20.0f, PC_AEXT_CUE_SND, NA_SE_BED_IN, "bed_in", 0 },
+    { mPlayer_INDEX_ROLL_BED, -1, 0.0f, PC_AEXT_CUE_SND, NA_SE_BED_NEGAERI, "bed_negaeri", 0 },
+    { mPlayer_INDEX_STANDUP_BED, -1, 0.0f, PC_AEXT_CUE_SND, NA_SE_BED_OUT, "bed_out", 0 },
+    { mPlayer_INDEX_STANDUP_BED, -1, 23.0f, PC_AEXT_CUE_SND, NA_SE_LANDING, "bed_landing", 0 },
+    { mPlayer_INDEX_RECIEVE_PUTAWAY, -1, 0.0f, PC_AEXT_CUE_SND, NA_SE_GASAGOSO, "putaway_gasagoso", 0 },
+    { mPlayer_INDEX_GIVE, -1, 0.0f, PC_AEXT_CUE_SND, NA_SE_GASAGOSO, "give_gasagoso", 0 },
+    { mPlayer_INDEX_TALK, mPlayer_ANIM_GAAAN1, 5.0f, PC_AEXT_CUE_FX, eEC_EFFECT_SHOCK, "talk_shock", 0 },
+    { mPlayer_INDEX_DEMO_WAIT, mPlayer_ANIM_GAAAN1, 5.0f, PC_AEXT_CUE_FX, eEC_EFFECT_SHOCK, "demo_shock", 0 },
+    { mPlayer_INDEX_CHANGE_CLOTH, mPlayer_ANIM_ITAZURA1, 0.0f, PC_AEXT_CUE_FX, eEC_EFFECT_HALLOWEEN, "cloth_halloween", 0 },
+    { mPlayer_INDEX_CHANGE_CLOTH, mPlayer_ANIM_MENU_CHANGE1, 16.0f, PC_AEXT_CUE_SND, NA_SE_WEAR, "cloth_wear", 0 },
+    { mPlayer_INDEX_CHANGE_CLOTH, mPlayer_ANIM_MENU_CHANGE1, 16.0f, PC_AEXT_CUE_FX, eEC_EFFECT_KIGAE, "cloth_kigae", 0 },
+    /* EMOTE WHEEL (pc_emote.h): the emote overlay is reported as DEMO_WAIT with the emote id in `variant` (1 Hooray .. 8 Exercise); these rows
+     * mirror the sender's cues (src/game/m_player_pc_emote.c_inc l_pc_emote_cues): the marks villagers show (SIAWASE_HANA flowers,
+     * KANTANHU '!', ASE2 sweat) and the vanilla cues of the borrowed clips (tired.c_inc:26-35, change_cloth.c_inc:65-68 / :97-106). */
+    { mPlayer_INDEX_DEMO_WAIT, mPlayer_ANIM_YATTA1, 0.0f, PC_AEXT_CUE_FXC, eEC_EFFECT_SIAWASE_HANA, "emote_hooray_flowers", 1 },
+    { mPlayer_INDEX_DEMO_WAIT, mPlayer_ANIM_BIKU1, 0.0f, PC_AEXT_CUE_FX, eEC_EFFECT_KANTANHU, "emote_surprised_mark", 3 },
+    { mPlayer_INDEX_DEMO_WAIT, mPlayer_ANIM_TIRED1, 0.0f, PC_AEXT_CUE_FXC, eEC_EFFECT_ASE2, "emote_phew_sweat", 5 },
+    { mPlayer_INDEX_DEMO_WAIT, mPlayer_ANIM_TIRED1, 10.0f, PC_AEXT_CUE_SND, PC_TID_ARAIIKI, "emote_phew_araiiki", 5 },
+    { mPlayer_INDEX_DEMO_WAIT, mPlayer_ANIM_TIRED1, 10.0f, PC_AEXT_CUE_FX, eEC_EFFECT_DUST, "emote_phew_dust", 5 },
+    { mPlayer_INDEX_DEMO_WAIT, mPlayer_ANIM_ITAZURA1, 0.0f, PC_AEXT_CUE_FX, eEC_EFFECT_HALLOWEEN, "emote_boo_smoke", 6 },
+    { mPlayer_INDEX_DEMO_WAIT, mPlayer_ANIM_MENU_CHANGE1, 16.0f, PC_AEXT_CUE_SND, NA_SE_WEAR, "emote_twirl_wear", 7 },
+    { mPlayer_INDEX_DEMO_WAIT, mPlayer_ANIM_MENU_CHANGE1, 16.0f, PC_AEXT_CUE_FX, eEC_EFFECT_KIGAE, "emote_twirl_sparkle", 7 },
+};
+_Static_assert(sizeof(s_aext_cues) / sizeof(s_aext_cues[0]) <= 32, "cue bitmask is 32 bits");
+
+typedef struct PCAextPuppet {
+    PCAextStore    st;
+    PCAextView     v;
+    const void*    actor;     /* the puppet actor the view belongs to (re-created actor = fresh view) */
+    PCActionExtMsg cur;       /* the applied message */
+    uint32_t       cue_done;
+    uint32_t       fxc_live;  /* EMOTE WHEEL: bit i = continuous cue i spawned on this puppet (killed when the row's pair ends) */
+    float          last_cur;
+    int            have_last;
+    int            tilt_on;   /* this overlay wrote shape_info.rotation.x (bed): restored to 0 once the bed states end */
+    uint32_t       rx, starts, retunes, ends;
+} PCAextPuppet;
+static PCAextPuppet s_aext_pp[PC_PUPPET_ID_LIMIT];
+
+void pc_remote_player_on_action_ext(int player_id, const PCActionExtMsg* m) {
+    PCAextPuppet* pp;
+    double now = (gamePT != NULL && gamePT->exec == play_main) ? graph_dt_frame_time(gamePT) : 0.0;
+
+    if (player_id < 0 || player_id >= PC_PUPPET_ID_LIMIT || m == NULL || !pc_aext_msg_ok(m)) {
+        return;
+    }
+    pp = &s_aext_pp[player_id];
+    pc_aext_store_put(&pp->st, m, now);
+    pp->rx++;
+    if (pc_remote_player_puppet_diag()) {
+        printf("[NET][PUPPET][DIAG] player %d action_ext rx main_index=%u counter=%u anim0=%u anim1=%u part_table=%u flags=0x%02X speed_q=%u "
+               "frame=%u face=0x%02X variant=%u aux=%u seq=%u\n",
+               player_id, (unsigned)m->main_index, (unsigned)m->entry_counter, (unsigned)m->anim0, (unsigned)m->anim1, (unsigned)m->part_table,
+               (unsigned)m->flags, (unsigned)m->speed_q, (unsigned)m->start_frame, (unsigned)m->face, (unsigned)m->variant, (unsigned)m->aux,
+               (unsigned)m->clip_seq);
+    }
+}
+
+/* A cue sound: positional one-shot at the puppet, allowed wherever the puppet is SHOWN (field or the same shared interior), near the local
+ * player, not hidden, not paused; budgeted by the shared per-frame sound cap through pc_puppet_fx_diag's counters. */
+static void pc_puppet_aext_snd(PCRemotePlayerActor* self, PCRemotePlayerSlot* slot, GAME* game, const PCAextCue* c, float cur) {
+    GAME_PLAY* play = (GAME_PLAY*)game;
+    PLAYER_ACTOR* local;
+    const char* why = NULL;
+    xyz_t pos = self->actor_class.world.position;
+
+    if (!pc_remote_player_scene_is_local_shown(slot, play) || slot->snap_req) {
+        why = "scene";
+    } else if (pc_remote_player_body_hidden(self)) {
+        why = "hidden";
+    } else if (_Game_play_isPause(play) == 1) {
+        why = "pause";
+    } else if (!Common_Get(player_actor_exists) || (local = GET_PLAYER_ACTOR(play)) == NULL ||
+               (uint64_t)(uintptr_t)local >= PC_LOWADDR_LIMIT) {
+        why = "scene";
+    } else {
+        float dx = pos.x - local->actor_class.world.position.x;
+        float dz = pos.z - local->actor_class.world.position.z;
+        float dy = pos.y - local->actor_class.world.position.y;
+        if (!(fabsf(dx) <= PC_PUPPET_FX_SOUND_RANGE && fabsf(dz) <= PC_PUPPET_FX_SOUND_RANGE && fabsf(dy) <= PC_PUPPET_FX_SOUND_RANGE)) {
+            why = "range";
+        }
+    }
+    if (why == NULL) {
+        u16 snd = c->id;
+        if (snd == PC_TID_ARAIIKI) { /* EMOTE WHEEL (Phew): the owner's gendered breath, as the TIRED tool row */
+            snd = (slot->appearance.gender == mPr_SEX_MALE) ? (u16)NA_SE_ARAIIKI_BOY : (u16)NA_SE_ARAIIKI_GIRL;
+        }
+        sAdo_OngenTrgStart(snd, &pos);
+        slot->cos_stats.sounds++;
+        pc_puppet_fx_diag(self, c->name, c->name, cur, (int)c->id, "ok");
+    } else {
+        slot->cos_stats.sounds_suppressed++;
+        pc_puppet_fx_diag(self, c->name, c->name, cur, -1, why);
+    }
+}
+
+static void pc_puppet_aext_fx(PCRemotePlayerActor* self, PCRemotePlayerSlot* slot, GAME* game, const PCAextCue* c, float cur) {
+    xyz_t pos = self->actor_class.world.position;
+    PCFxOpts opts;
+
+    if (self->cos.feel_frame != 0u && (game->frame_counter + 1u) - self->cos.feel_frame <= 3u) {
+        pos = self->cos.feel_pos; /* captured by this puppet's own draw (vanilla: Player_actor_draw_After_feel) */
+    } else {
+        pos.y += 40.0f; /* approximate head height */
+    }
+    memset(&opts, 0, sizeof(opts));
+    opts.attr_force = 0; /* vanilla passes arg0 0 (m_player_draw.c_inc:113 / change_cloth.c_inc:66,103) */
+    (void)pc_puppet_fx_emit_core(self, slot, game, (int)c->id, c->name, &pos, self->actor_class.shape_info.rotation.y, cur, 0, 0, 0, &opts);
+}
+
+static void pc_puppet_aext_cues(PCRemotePlayerActor* self, PCRemotePlayerSlot* slot, GAME* game, PCAextPuppet* pp, int at_start) {
+    PCRemotePlayerVisual* v = &self->visual;
+    float cur = v->keyframe0.frame_control.current_frame;
+    float max = v->keyframe0.frame_control.max_frames;
+    size_t i;
+
+    for (i = 0; i < sizeof(s_aext_cues) / sizeof(s_aext_cues[0]); i++) {
+        const PCAextCue* c = &s_aext_cues[i];
+        uint32_t bit = 1u << i;
+        int fire;
+
+        if ((int)c->idx != (int)pp->cur.main_index || (c->anim0 >= 0 && (int)c->anim0 != (int)pp->cur.anim0) || (pp->cue_done & bit) ||
+            (c->variant != 0u && c->variant != pp->cur.variant)) {
+            continue;
+        }
+        if (c->kind == PC_AEXT_CUE_FXC && (pp->fxc_live & bit)) {
+            continue; /* EMOTE WHEEL: still alive from an earlier clip of the same row (Phew's second breath) */
+        }
+        if (c->frame <= 0.0f) {
+            fire = at_start && pp->cur.start_frame <= 3u; /* an entry cue never replays when the clip was adopted late */
+        } else {
+            fire = pp->have_last && pc_puppet_frame_crossed(pp->last_cur, cur, max, c->frame);
+        }
+        if (!fire) {
+            continue;
+        }
+        pp->cue_done |= bit;
+        if (c->kind == PC_AEXT_CUE_SND) {
+            pc_puppet_aext_snd(self, slot, game, c, cur);
+        } else {
+            const int before = slot->cos_stats.spawned;
+            pc_puppet_aext_fx(self, slot, game, c, cur);
+            if (c->kind == PC_AEXT_CUE_FXC && slot->cos_stats.spawned != before) {
+                pp->fxc_live |= bit;
+            }
+        }
+    }
+    pp->last_cur = cur;
+    pp->have_last = 1;
+}
+
+/* EMOTE WHEEL: kill this puppet's continuous emote effects (SIAWASE_HANA flowers / ASE2 sweat), spawned with its own item_name (only its own
+ * die, never the local player's RSV_NO ones; the vanilla emotion effects end the same way: effect_kill_proc). */
+static void pc_puppet_aext_fxc_kill(PCRemotePlayerActor* self, PCAextPuppet* pp, const char* why) {
+    size_t i;
+
+    if (pp->fxc_live == 0u) {
+        return;
+    }
+    for (i = 0; i < sizeof(s_aext_cues) / sizeof(s_aext_cues[0]); i++) {
+        if ((pp->fxc_live & (1u << i)) && eEC_CLIP != NULL && eEC_CLIP->effect_kill_proc != NULL) {
+            eEC_CLIP->effect_kill_proc(s_aext_cues[i].id, (u16)(PC_PUPPET_FX_ITEM_NAME_BASE + (u32)self->peer));
+            if (pc_remote_player_puppet_diag()) {
+                printf("[NET][PUPPET][DIAG] player %d cosmetic effect kill %s reason=%s\n", (int)self->peer, s_aext_cues[i].name, why);
+            }
+        }
+    }
+    pp->fxc_live = 0u;
+}
+
+/* Bed tilt (vanilla shape rotation of the bed states; the puppet's mv rewrites rotation.y = world.angle.y every frame, rotation.x is ours):
+ * LIE_BED lie_bed.c_inc:116-146 (x -> -0x4000 and y +-0x4000 over frames 4..19), ROLL / WAIT_BED lying (x = -0x4000; the owner's facing
+ * already holds the turned angle, lie_bed settle :95-101), STANDUP_BED standup_bed.c_inc:145-175 (x back to 0 over 1..21, y +-0x4000 over
+ * 1..18). The vanilla add_calc easing is replaced by the target value (cosmetic). */
+static void pc_puppet_aext_tilt(PCRemotePlayerActor* self, PCAextPuppet* pp, int valid, int idx) {
+    ACTOR* a = &self->actor_class;
+    float cur = self->visual.keyframe0.frame_control.current_frame;
+    int on = pp->v.on && valid && idx == (int)pp->cur.main_index;
+
+    if (on && idx == mPlayer_INDEX_LIE_BED) {
+        float per = sqrtf(get_percent_forAccelBrake(cur, 4.0f, 19.0f, 0.0f, 0.0f));
+        float mod = (pp->cur.anim0 == mPlayer_ANIM_INBED_R1) ? 16384.0f : -16384.0f;
+        a->shape_info.rotation.x = (s16)(int)(-16384.0f * per);
+        a->shape_info.rotation.y = (s16)(a->world.angle.y + (s16)(int)(mod * per));
+        pp->tilt_on = 1;
+    } else if (on && idx == mPlayer_INDEX_STANDUP_BED) {
+        float per = get_percent_forAccelBrake(cur, 1.0f, 21.0f, 3.0f, 3.0f);
+        float per_y = get_percent_forAccelBrake(cur, 1.0f, 18.0f, 3.0f, 3.0f);
+        float mod = (pp->cur.anim0 == mPlayer_ANIM_OUTBED_R1) ? 16384.0f : -16384.0f;
+        a->shape_info.rotation.x = (s16)(int)(-16384.0f * (1.0f - per));
+        a->shape_info.rotation.y = (s16)(a->world.angle.y + (s16)(int)(mod * per_y));
+        pp->tilt_on = 1;
+    } else if ((on && idx == mPlayer_INDEX_ROLL_BED) || (pp->tilt_on && valid && idx == mPlayer_INDEX_WAIT_BED)) {
+        a->shape_info.rotation.x = -0x4000;
+        pp->tilt_on = 1;
+    } else if (pp->tilt_on) {
+        a->shape_info.rotation.x = 0;
+        pp->tilt_on = 0;
+    }
+}
+
+/* ===== PUPPET CLOTH CHANGE BEGIN (worker CL; receiver only, no wire) =====
+ * Root cause of "other players do not see me change clothes": equipping a shirt from the inventory never puts the real player actor into
+ * mPlayer_INDEX_CHANGE_CLOTH (101). m_hand_ovl.c:532-545 / :786-800 write Now_Private->cloth and swap the texture at the drop, and
+ * m_tag_ovl.c:7991-7993 (also :5873 wear-my-design) only animate the MENU DOLL (mIV_ANIM_CHANGE = MENU_CHANGE1 @1.0 + NA_SE_WEAR,
+ * m_inventory_ovl.c:394-411 / :493-505 / :556-561). 101 is only requested by NPCs (shop try-on, needlework, Halloween), so the ACTION_EXT
+ * sender (which samples the real actor) never sees the menu change and the puppet just snapped to the new shirt (APPEARANCE).
+ * Fix: a received APPEARANCE whose clothing differs from the shown one is HELD (raw fields updated at once for relay / backfill, the render
+ * buffers keep the old shirt) and presented on the puppet:
+ *  - the owner is in 101 (its ACTION_EXT row plays MENU_CHANGE1 / ITAZURA1 with the KIGAE / wear / HALLOWEEN cues): the new shirt is
+ *    resolved when the puppet's clip crosses the vanilla texture frame (change_cloth.c_inc:109-128: 36 for MENU_CHANGE1, 18 for ITAZURA1);
+ *  - otherwise (the menu path) a synthesized clip like the menu doll: MENU_CHANGE1, frame 1, speed 1.0, STOP, morph -5, normal part table,
+ *    with the in-world change-cloth cues at frame 16 (wear sound + KIGAE, change_cloth.c_inc:93-106) and the shirt swap at frame 36 (the
+ *    vanilla texture frame; the menu itself writes Now_Private->cloth at doll frame 36, m_hand_ovl.c:533-545, so the APPEARANCE reaches us
+ *    ~36 frames after the owner's drop and this whole clip lags the owner's doll by that much). It is bound to the puppet's MOVE pair: it ends at the clip end, when the pair changes (the owner walks off /
+ *    enters another state), when any row takes over, or after a safety timeout;
+ *  - not shown / hidden / moving / no clip: the shirt is resolved at once (moving: with the puff + sound where the gates allow).
+ * The hold always ends within PC_CLOTH_HOLD_FRAMES (pc_remote_player_poll() releases an expired or actor-less hold). Env
+ * PC_PUPPET_CLOTH_ANIM=0 restores the instant swap. */
+#define PC_CLOTH_HOLD_FRAMES   150.0 /* longest delay of a new shirt (an unshown puppet / a 101 row that never came) */
+#define PC_CLOTH_MENU_CUE      16.0f /* synthesized clip: wear + KIGAE (change_cloth.c_inc:101-104) */
+#define PC_CLOTH_MENU_SWAP     36.0f /* ... and the shirt swap (change_cloth.c_inc:113-127; the menu writes Now_Private->cloth at doll frame 36 too, m_hand_ovl.c:533-545) */
+typedef struct PCClothChg {
+    int         hold;      /* 1 = slot->appearance holds a new outfit not yet resolved (pending_resolve stays set) */
+    double      deadline;  /* graph_dt_frame_time() bound of the hold */
+    int         playing;   /* the synthesized clip owns the body */
+    const void* actor;     /* the puppet the clip was bound on */
+    int         idx, ctr;  /* the MOVE pair it is bound to */
+    float       last_cur;
+    int         have_last;
+    uint32_t    held, menu_clips, state101, instant, timeouts;
+} PCClothChg;
+static PCClothChg s_cloth_chg[PC_PUPPET_ID_LIMIT];
+static uint32_t s_cloth_log_n = 0;
+static const PCAextCue s_cloth_menu_cues[2] = {
+    { mPlayer_INDEX_CHANGE_CLOTH, mPlayer_ANIM_MENU_CHANGE1, PC_CLOTH_MENU_CUE, PC_AEXT_CUE_SND, NA_SE_WEAR, "menu_cloth_wear", 0 },
+    { mPlayer_INDEX_CHANGE_CLOTH, mPlayer_ANIM_MENU_CHANGE1, PC_CLOTH_MENU_CUE, PC_AEXT_CUE_FX, eEC_EFFECT_KIGAE, "menu_cloth_kigae", 0 },
+};
+
+static int pc_puppet_cloth_enabled(void) {
+    static int s_on = -1;
+    if (s_on < 0) {
+        const char* e = getenv("PC_PUPPET_CLOTH_ANIM");
+        s_on = (e != NULL && e[0] == '0') ? 0 : 1; /* ON by default */
+    }
+    return s_on;
+}
+
+static void pc_puppet_cloth_log(int id, const char* what, const char* why, float frame) {
+    if (s_cloth_log_n++ < 200u) { /* a rare, human-triggered event: always logged, budgeted */
+        printf("[NET][REMOTE] player %d: cloth change %s (%s) frame=%.1f\n", id, what, why, (double)frame);
+    }
+}
+
+/* Ends a hold: the new outfit is resolved into the render buffers now. */
+static void pc_puppet_cloth_release(PCRemotePlayerSlot* slot, int id, const char* why, float frame) {
+    PCClothChg* cc;
+
+    if (id < 0 || id >= PC_PUPPET_ID_LIMIT) {
+        return;
+    }
+    cc = &s_cloth_chg[id];
+    if (!cc->hold) {
+        return;
+    }
+    cc->hold = 0;
+    if (slot != NULL && slot->appearance.valid && slot->appearance.pending_resolve) {
+        pc_remote_player_apply_appearance(slot);
+    }
+    pc_puppet_cloth_log(id, "shirt swapped", why, frame);
+}
+
+/* 1 = the clothing of `a` differs from the stored raw appearance (catalog item, design flag, or the custom design pixels). */
+static int pc_puppet_cloth_differs(const PCRemotePlayerAppearance* cur, const PCNetPlayerAppearance* a) {
+    if (cur->cloth_item != a->cloth_item || (cur->is_custom_design ? 1 : 0) != (a->is_custom_design ? 1 : 0)) {
+        return 1;
+    }
+    return a->is_custom_design && memcmp(&cur->design, a->design_record, sizeof(cur->design)) != 0;
+}
+
+/* Called from pc_puppet_aext_apply() after the dynamic-row decision. Returns 1 while the synthesized menu clip owns the body clips. */
+static int pc_puppet_cloth_step(PCRemotePlayerActor* self, PCRemotePlayerSlot* slot, GAME* game, PCAextPuppet* pp, int valid, int idx,
+                                int ctr, double now) {
+    PCRemotePlayerVisual* v = &self->visual;
+    int id = (int)self->peer;
+    PCClothChg* cc = &s_cloth_chg[id];
+    float cur = v->keyframe0.frame_control.current_frame;
+
+    if (cc->actor != (const void*)self) { /* a (re)created puppet: nothing of a clip on the old actor is bound here */
+        cc->actor = (const void*)self;
+        cc->playing = 0;
+    }
+    if (cc->playing) {
+        int ended = cur >= v->keyframe0.frame_control.end_frame - 0.01f;
+        int stop = ended || pp->v.on || v->row_active || !valid || idx != cc->idx || ctr != cc->ctr || slot->snap_req ||
+                   now > cc->deadline + 120.0 || now < cc->deadline - PC_CLOTH_HOLD_FRAMES - 1.0;
+
+        if (!stop) {
+            if (cc->have_last && pc_puppet_frame_crossed(cc->last_cur, cur, v->keyframe0.frame_control.max_frames, PC_CLOTH_MENU_CUE)) {
+                pc_puppet_aext_snd(self, slot, game, &s_cloth_menu_cues[0], cur);
+                pc_puppet_aext_fx(self, slot, game, &s_cloth_menu_cues[1], cur);
+            }
+            if (cc->have_last && cc->hold && pc_puppet_frame_crossed(cc->last_cur, cur, v->keyframe0.frame_control.max_frames, PC_CLOTH_MENU_SWAP)) {
+                pc_puppet_cloth_release(slot, id, "menu_clip", cur);
+            }
+            cc->last_cur = cur;
+            cc->have_last = 1;
+            return 1;
+        }
+        cc->playing = 0;
+        if (!pp->v.on && !v->row_active) { /* same release rebind as an ACTION_EXT end */
+            v->current_anim_idx = -1;
+            v->current_anim1_idx = -1;
+            v->current_part_table = -1;
+            v->keyframe0.animation_enabled = 0;
+            v->rebind_from_row = 1;
+        }
+        if (pc_remote_player_puppet_diag()) {
+            printf("[NET][PUPPET][DIAG] player %d cloth_menu end (%s) frame=%.1f pair %d/%d\n", id, ended ? "clip_end" : "interrupted",
+                   (double)cur, idx, ctr);
+        }
+        pc_puppet_cloth_release(slot, id, ended ? "menu_clip_end" : "menu_clip_interrupted", cur);
+        return 0;
+    }
+    if (!cc->hold) {
+        return 0;
+    }
+    if (now > cc->deadline || now < cc->deadline - PC_CLOTH_HOLD_FRAMES - 1.0 || !slot->resolved_appearance.ready) {
+        cc->timeouts++;
+        pc_puppet_cloth_release(slot, id, "timeout", cur);
+        return 0;
+    }
+    if (pp->v.on && (int)pp->cur.main_index == mPlayer_INDEX_CHANGE_CLOTH) {
+        /* the owner's real 101 row: swap at the vanilla texture frame of its clip */
+        float swap = ((int)pp->cur.anim0 == mPlayer_ANIM_ITAZURA1) ? 18.0f : 36.0f;
+        if (cur + 0.5f >= swap || cur >= v->keyframe0.frame_control.end_frame - 0.01f) {
+            cc->state101++;
+            pc_puppet_cloth_release(slot, id, "state101", cur);
+        }
+        return 0;
+    }
+    {
+        int newest_idx = -1;
+        if (slot->snapshot_count > 0) {
+            const PCRemoteMoveSnapshot* s =
+                &slot->snapshots[(slot->snapshot_head + PC_REMOTE_PLAYER_SNAPSHOT_COUNT - 1) % PC_REMOTE_PLAYER_SNAPSHOT_COUNT];
+            newest_idx = s->action_valid ? (int)s->action_index : -1;
+        }
+        if ((valid && idx == mPlayer_INDEX_CHANGE_CLOTH) || newest_idx == mPlayer_INDEX_CHANGE_CLOTH) {
+            return 0; /* the owner is (about to be shown) in 101: its ACTION_EXT row presents the change (bounded by the deadline) */
+        }
+    }
+    {
+        GAME_PLAY* play = (GAME_PLAY*)game;
+        int shown = pc_remote_player_scene_is_local_shown(slot, play) && !slot->snap_req && slot->snapshot_count > 0 &&
+                    !pc_remote_player_body_hidden(self) && v->initialized;
+        int standing = self->cosmetic_move_state == PC_MOVE_STATE_IDLE || self->cosmetic_move_state == PC_MOVE_STATE_OTHER;
+
+        if (!shown) {
+            cc->instant++;
+            pc_puppet_cloth_release(slot, id, "not_shown", cur);
+            return 0;
+        }
+        if (!standing || !valid || v->row_active || pp->v.on || mPlib_Get_Pointer_Animation(mPlayer_ANIM_MENU_CHANGE1) == NULL) {
+            cc->instant++;
+            pc_puppet_aext_snd(self, slot, game, &s_cloth_menu_cues[0], cur);
+            pc_puppet_aext_fx(self, slot, game, &s_cloth_menu_cues[1], cur);
+            pc_puppet_cloth_release(slot, id, standing ? "busy" : "moving", cur);
+            return 0;
+        }
+        /* the menu doll's clip (m_inventory_ovl.c:394-400: MENU_CHANGE1, frame 1, speed 1.0, STOP) on the puppet */
+        pc_remote_player_bind_body(v, mPlayer_ANIM_MENU_CHANGE1, mPlayer_ANIM_MENU_CHANGE1, 1.0f, 1.0f, cKF_FRAMECONTROL_STOP, PC_FALLBACK_MORPH, 0);
+        if (v->current_part_table != mPlayer_PART_TABLE_NORMAL) {
+            mPlib_DMA_player_Part_Table(v->part_table, mPlayer_PART_TABLE_NORMAL);
+            v->current_part_table = mPlayer_PART_TABLE_NORMAL;
+        }
+        cc->playing = 1;
+        cc->idx = idx;
+        cc->ctr = ctr;
+        cc->have_last = 0;
+        cc->last_cur = 1.0f;
+        cc->menu_clips++;
+        if (pc_remote_player_puppet_diag()) {
+            printf("[NET][PUPPET][DIAG] player %d state main_index=%d counter=%d row=cloth_menu anim0=%d anim1=%d part_table=%d mode=stop "
+                   "speed=1.00 frame=1\n",
+                   id, idx, ctr, (int)mPlayer_ANIM_MENU_CHANGE1, (int)mPlayer_ANIM_MENU_CHANGE1, (int)mPlayer_PART_TABLE_NORMAL);
+        }
+        pc_puppet_cloth_log(id, "menu clip started", "menu", 1.0f);
+        return 1;
+    }
+}
+/* ===== PUPPET CLOTH CHANGE END ===== */
+
+/* Called from pc_remote_player_mv after pc_remote_player_row_pre. Returns 1 while the dynamic row owns the body clips this frame. */
+static int pc_puppet_aext_apply(PCRemotePlayerActor* self, PCRemotePlayerSlot* slot, GAME* game, double now) {
+    PCRemotePlayerVisual* v = &self->visual;
+    PCAextPuppet* pp;
+    const PCAextRecord* rec = NULL;
+    int valid = self->cosmetic_action_valid ? 1 : 0;
+    int idx = valid ? (int)self->cosmetic_action_index : -1;
+    int ctr = valid ? (int)self->cosmetic_action_counter : -1;
+    int d;
+    int diag = pc_remote_player_puppet_diag();
+
+    if ((int)self->peer < 0 || (int)self->peer >= PC_PUPPET_ID_LIMIT) {
+        return 0;
+    }
+    pp = &s_aext_pp[(int)self->peer];
+    if (pp->actor != (const void*)self) { /* a (re)created puppet: nothing of the old actor's clip is bound here */
+        memset(&pp->v, 0, sizeof(pp->v));
+        pp->actor = (const void*)self;
+        pp->tilt_on = 0;
+        pp->fxc_live = 0u; /* EMOTE WHEEL: the old actor's effects went with its scene */
+    }
+    if (slot->snapshot_count == 0 || slot->snap_req) {
+        s_cloth_chg[(int)self->peer].playing = 0; /* CL: a scene snap drops the synthesized cloth clip (the fallback rebinds; the hold expires) */
+        pc_puppet_aext_tilt(self, pp, 0, -1);
+        return 0; /* no fresh MOVE pair yet (same rule as the static rows) */
+    }
+    d = pc_aext_decide(&pp->st, &pp->v, valid, idx, ctr, now, &rec);
+    if (d == PC_AEXT_D_END) {
+        pp->ends++;
+        pc_puppet_aext_fxc_kill(self, pp, "row_end"); /* EMOTE WHEEL */
+        if (!v->row_active) { /* a static row started by the new pair already bound its own clips */
+            v->current_anim_idx = -1; /* the fallback block rebinds both layers + the part table next */
+            v->current_anim1_idx = -1;
+            v->current_part_table = -1;
+            v->keyframe0.animation_enabled = 0;
+            v->rebind_from_row = 1; /* a release rebind, not a state entry edge (no skid sound replay) */
+        }
+        if (diag) {
+            printf("[NET][PUPPET][DIAG] player %d action_ext end main_index=%u counter=%u -> pair %d/%d\n", (int)self->peer,
+                   (unsigned)pp->cur.main_index, (unsigned)pp->cur.entry_counter, idx, ctr);
+        }
+    }
+    if (d == PC_AEXT_D_START && rec != NULL) {
+        int a0 = (int)rec->m.anim0;
+        int a1 = (int)rec->m.anim1;
+        int pt = (int)rec->m.part_table;
+        int pin = (int)((rec->m.flags & PC_AEXT_FL_PIN_MASK) >> PC_AEXT_FL_PIN_SHIFT);
+        int mode = (rec->m.flags & PC_AEXT_FL_REPEAT) ? cKF_FRAMECONTROL_REPEAT : cKF_FRAMECONTROL_STOP;
+        f32 speed = pc_aext_speed_f(rec->m.speed_q);
+        f32 f0 = rec->m.start_frame >= 1u ? (f32)rec->m.start_frame : 1.0f;
+
+        if (mPlib_Get_Pointer_Animation(a0) == NULL) {
+            pp->v.on = 0; /* the clip is missing on this build: stay on the static row / fallback */
+            pc_puppet_aext_tilt(self, pp, valid, idx);
+            return 0;
+        }
+        if (mPlib_Get_Pointer_Animation(a1) == NULL) {
+            a1 = a0;
+        }
+        if (v->row_active) {
+            pc_remote_player_row_release(self, "action_ext"); /* the dynamic row of this pair replaces the static one */
+        }
+        /* P1's bind: vanilla morph -5 (most allowlisted setups pass -5); a negative owner speed (REVERSE) uses P1's reverse playback */
+        pc_remote_player_bind_body(v, a0, a1, f0, speed, mode, PC_FALLBACK_MORPH, (rec->m.flags & PC_AEXT_FL_REVERSE) ? 1 : 0);
+        if (!(rec->m.flags & PC_AEXT_FL_REVERSE) && v->keyframe0.frame_control.current_frame > v->keyframe0.frame_control.end_frame) {
+            v->keyframe0.frame_control.current_frame = v->keyframe0.frame_control.end_frame;
+            v->keyframe1.frame_control.current_frame = v->keyframe0.frame_control.end_frame;
+        }
+        if (pt != v->current_part_table) {
+            mPlib_DMA_player_Part_Table(v->part_table, pt);
+            v->current_part_table = pt;
+        }
+        if (pin != 0) {
+            /* vanilla AnimationMove_ct_base flags + Set_base_shape_trs(0, 1000, z): the furniture states pass z 200 (open / wait_open /
+             * close_furniture.c_inc), the bed states 0; the synced position already contains the root motion (see PC_ROWF_ROOT_PIN) */
+            int idx_m = (int)rec->m.main_index;
+            f32 bz = (idx_m == mPlayer_INDEX_OPEN_FURNITURE || idx_m == mPlayer_INDEX_WAIT_OPEN_FURNITURE ||
+                      idx_m == mPlayer_INDEX_CLOSE_FURNITURE) ? 200.0f : 0.0f;
+            cKF_SkeletonInfo_R_Animation_Set_base_shape_trs(&v->keyframe0, 0.0f, 1000.0f, bz, 0, 0, 0x4000);
+            v->keyframe0.animation_enabled = pin;
+        }
+        if (pp->cur.main_index != rec->m.main_index || pp->cur.entry_counter != rec->m.entry_counter || pp->cur.variant != rec->m.variant) {
+            pc_puppet_aext_fxc_kill(self, pp, "new_row"); /* EMOTE WHEEL: a new pair (another emote) */
+        }
+        pp->cur = rec->m;
+        pp->cue_done = 0;
+        pp->have_last = 0;
+        pp->starts++;
+        if (diag) {
+            printf("[NET][PUPPET][DIAG] player %d state main_index=%u counter=%u row=action_ext anim0=%d anim1=%d part_table=%d mode=%s "
+                   "pin=%d speed=%.2f frame=%.0f face=0x%02X seq=%u%s\n",
+                   (int)self->peer, (unsigned)rec->m.main_index, (unsigned)rec->m.entry_counter, a0, a1, pt,
+                   mode == cKF_FRAMECONTROL_REPEAT ? "repeat" : "stop", pin, (double)speed, (double)f0, (unsigned)rec->m.face,
+                   (unsigned)rec->m.clip_seq, (rec->m.flags & PC_AEXT_FL_REVERSE) ? " reverse=1" : "");
+        }
+        pc_puppet_aext_cues(self, slot, game, pp, 1);
+    } else if (d == PC_AEXT_D_RETUNE && rec != NULL) {
+        f32 speed = pc_aext_speed_f(rec->m.speed_q);
+        v->keyframe0.frame_control.speed = speed;
+        v->keyframe1.frame_control.speed = speed;
+        pp->cur = rec->m;
+        pp->retunes++;
+        if (diag && pp->retunes <= 20u) {
+            printf("[NET][PUPPET][DIAG] player %d action_ext retune main_index=%u anim0=%u speed=%.2f\n", (int)self->peer,
+                   (unsigned)rec->m.main_index, (unsigned)rec->m.anim0, (double)speed);
+        }
+        pc_puppet_aext_cues(self, slot, game, pp, 0);
+    } else if (d == PC_AEXT_D_HOLD) {
+        pc_puppet_aext_cues(self, slot, game, pp, 0);
+    }
+    pc_puppet_aext_tilt(self, pp, valid, idx);
+    if (pc_puppet_cloth_enabled() && pc_puppet_cloth_step(self, slot, game, pp, valid, idx, ctr, now)) {
+        return 1; /* PUPPET CLOTH CHANGE (CL): the synthesized menu change clip owns the body clips */
+    }
+    return pp->v.on;
+}
+
+/* The constant face of the applied clip (talk GAAAN2: eye 6 / mouth 5), only where the clip has no eye / mouth table. */
+static void pc_puppet_aext_face(const PCRemotePlayerActor* self, int a0, int* eye, int* mouth) {
+    const PCAextPuppet* pp;
+
+    if ((int)self->peer < 0 || (int)self->peer >= PC_PUPPET_ID_LIMIT) {
+        return;
+    }
+    pp = &s_aext_pp[(int)self->peer];
+    if (!pp->v.on || pp->actor != (const void*)self || pp->cur.face == PC_AEXT_FACE_NONE || a0 != (int)pp->cur.anim0 ||
+        a0 < 0 || a0 >= mPlayer_ANIM_NUM) {
+        return;
+    }
+    if (mPlib_Get_PlayerEyeTexAnimation_p(a0) == NULL) {
+        *eye = (int)(pp->cur.face >> 4);
+    }
+    if (mPlib_Get_PlayerMouthTexAnimation_p(a0) == NULL) {
+        *mouth = (int)(pp->cur.face & 0x0Fu);
+    }
+}
+/* ===== PUPPET ACTION_EXT END ===== */
+
+static void pc_remote_player_mv(ACTOR* actor, GAME* game) {
+    PCRemotePlayerActor* self = (PCRemotePlayerActor*)actor;
+    PCRemotePlayerSlot* slot = pc_remote_player_find_slot(self->peer);
+    PCRemotePlayerRenderState render;
+    double target_time;
+    int just_placed = 0; /* building interactions: this frame resolved a pending scene event (see pc_remote_player_scene_snap_resolve) */
+    int pos_snapped = 0; /* M9-C v7: an interpolator teleport snap / placement jump this frame (clears a one-shot latch) */
+
+    if (slot == NULL) {
+        return; /* extremely defensive: self->peer is only ever set from an already-validated
+                  * slot index at creation time, but never trust that blindly in a callback. */
+    }
+
+    /* Stage 3: the sender's own frame counter never appears here -- this is entirely THIS
+     * process's own local presentation timeline, built from when samples arrived (see
+     * pc_remote_player_interpolate()'s doc). A fixed delay behind "now" guarantees there is
+     * almost always a real newer snapshot to interpolate towards rather than extrapolating into
+     * the unknown. */
+    target_time = graph_dt_frame_time(game) - PC_REMOTE_PLAYER_INTERP_DELAY_FRAMES;
+
+    if (slot->snap_req && pc_remote_player_scene_snap_resolve(slot, graph_dt_frame_time(game))) {
+        just_placed = 1;
+    }
+    if (!slot->snap_req && pc_remote_player_interpolate(slot, target_time, &render)) {
+        {
+            /* M9-B: an interpolator teleport-snap (or the first placement) moves the puppet far in a single frame;
+             * keep its collider out of the OC pass for a couple of frames so it cannot deep-overlap-pop the player. */
+            float jdx = render.pos.x - actor->world.position.x;
+            float jdz = render.pos.z - actor->world.position.z;
+            if ((jdx * jdx + jdz * jdz) > (PC_REMOTE_PLAYER_COLLIDE_SNAP_DIST * PC_REMOTE_PLAYER_COLLIDE_SNAP_DIST)) {
+                self->collide_hold = PC_REMOTE_PLAYER_COLLIDE_SNAP_HOLD_FRAMES;
+                pos_snapped = 1;
+            }
+            if (just_placed) {
+                /* first placement after a scene event: a jump to the door is expected and must NOT release a row (it would
+                 * cancel the exit row that is about to start) */
+                self->collide_hold = PC_REMOTE_PLAYER_COLLIDE_SNAP_HOLD_FRAMES;
+                pos_snapped = 0;
+            }
+        }
+        actor->world.position = render.pos;
+        actor->world.angle.y = render.angle;
+        actor->shape_info.rotation.y = render.angle; /* mirrors how the local player's own
+                                                       * main-state functions keep these two in
+                                                       * sync, e.g. Player_actor_Movement_Walk() */
+
+        self->cosmetic_speed = render.speed;
+        self->cosmetic_move_state = render.move_state;
+        self->cosmetic_item_kind = render.item_kind;
+        self->cosmetic_action_index = render.action_index;
+        self->cosmetic_action_counter = render.action_counter;
+        self->cosmetic_action_valid = render.action_valid;
+    }
+    /* else: no movement data yet -- hold at the creation-time spawn position. Visual bring-up
+     * below still proceeds regardless, so the idle model is ready as soon as possible rather than
+     * waiting for the first network sample. */
+
+    /* Stage 4A: bring up the real skeleton/animation once the LOCAL player's own appearance
+     * resources are known-good. common_data.player_actor_exists is set at the very start of
+     * Player_actor_ct() (src/game/m_player.c), which is itself only invoked from within this
+     * same per-frame Actor_info_call_actor() sweep -- and ACTOR_PART_UNUSED (this actor's part)
+     * is processed before ACTOR_PART_PLAYER in that sweep's part loop, so on the one frame where
+     * the local player's ct_proc actually runs, THIS check still sees the pre-frame (FALSE)
+     * value; it only reads TRUE starting the frame after Player_actor_ct() (and the face-texture
+     * bank fill inside it, mPlib_change_player_face()) has fully completed. That is exactly the
+     * ordering pc_remote_player_dw() below depends on for mPlib_get_player_face_p()/
+     * mPlib_get_player_tex_p() to return non-stale data (Stage 4A's own local-appearance reads,
+     * now superseded for rendering purposes -- see below -- but this readiness signal is still a
+     * reasonable proxy for "the game/actor system is far enough along to build a skeleton" and is
+     * kept for Stage 4C-1 too). This does not touch gamePT/Actor_info directly and does not
+     * replace the existing low-address guard in pc_remote_player_poll() -- it is an additional,
+     * independent readiness signal for player *appearance* resources specifically, as recommended
+     * by the Stage 4 investigation.
+     *
+     * Stage 4C-1: additionally gated on slot->resolved_appearance.ready -- this remote player's
+     * OWN appearance (gender/face/clothing) must have already arrived and been resolved (see
+     * pc_remote_player_on_appearance()/pc_remote_player_apply_appearance()) before a skeleton is
+     * selected for it, otherwise pc_remote_player_visual_init() would have nothing valid to read
+     * appearance->skeleton from. Until then this actor simply stays un-visualized (no draw, see
+     * pc_remote_player_dw()'s own initialized check) -- never falls back to the local player's
+     * skeleton/appearance. */
+    if (!self->visual.initialized && Common_Get(player_actor_exists) && slot->resolved_appearance.ready) {
+        pc_remote_player_visual_init(&self->visual, &slot->resolved_appearance);
+    }
+
+    if (self->visual.initialized) {
+        /* Stage 4B: pick the animation for the interpolated (or, absent movement data yet,
+         * last-known/default-zero i.e. IDLE) move_state. self->cosmetic_move_state was already
+         * updated above from render.move_state when interpolation succeeded, so this always
+         * reflects the same value the investigation traced -- no separate lookup of `render`
+         * needed here. Mapping verified against pc_net_game.c's own PCMoveState classifier, which
+         * already sources move_state from the real player's mPlayer_INDEX_WAIT/WALK/RUN/DASH
+         * constants (see the Stage 4B investigation). Anything outside the four basic states
+         * (AIRBORNE/TUMBLE/ITEM_USE/OTHER) falls back to WAIT1 here; since M9-C Phase 2 the state-row table
+         * (pc_remote_player_row_pre) owns every action main index and overrides this fallback block while a row is
+         * active, so this mapping only covers states WITHOUT a row (PCFB fallbacks and v6 senders). */
+        int desired_anim_idx;
+        switch (self->cosmetic_move_state) {
+            case PC_MOVE_STATE_WALK:      desired_anim_idx = mPlayer_ANIM_WALK1;     break;
+            case PC_MOVE_STATE_RUN:       desired_anim_idx = mPlayer_ANIM_RUN1;      break;
+            case PC_MOVE_STATE_DASH:      desired_anim_idx = mPlayer_ANIM_DASH1;     break;
+            /* Stage 4B.1: the real player's sprint sharp-turn/skid state (mPlayer_INDEX_TURN_DASH)
+             * -- see pc_net_game.c's classifier, which now reports this separately from ordinary
+             * DASH. Confirmed by source: uses mPlayer_ANIM_RUN_SLIP1, NOT DASH1. */
+            case PC_MOVE_STATE_TURN_DASH: desired_anim_idx = mPlayer_ANIM_RUN_SLIP1; break;
+            default:                      desired_anim_idx = mPlayer_ANIM_WAIT1;    break;
+        }
+#ifdef TARGET_PC
+        /* T3: DEMO_WALK (scripted walks: the arrival walk to the station exit, NPC-driven walks) is classified OTHER by the sender, which
+         * mapped it to WAIT1 and made the puppet slide in idle. The vanilla state plays WALK1 with the walk tempo (demo_walk.c_inc). It has
+         * no state row (PCFB), so this fallback block owns it; the tempo formula below applies because the clip is WALK1. */
+        if (pcarr_demo_walk_plays_walk(self->cosmetic_action_valid, (int)self->cosmetic_action_index, (int)mPlayer_INDEX_DEMO_WALK,
+                                       self->cosmetic_move_state == PC_MOVE_STATE_OTHER)) {
+            desired_anim_idx = mPlayer_ANIM_WALK1;
+        }
+#endif
+
+        /* M9-C Phase 1: held item. The EFFECTIVE kind comes from the same interpolation result as move_state
+         * (self->cosmetic_item_kind, set above from render.item_kind). Deferred/unknown kinds behave exactly like
+         * "no item": idle arms and no model, i.e. identical to the pre-M9-C puppet. */
+        int raw_kind = (int)self->cosmetic_item_kind;
+        if (raw_kind < 0 && self->visual.row_active && self->visual.row_idx == (int)mPlayer_INDEX_PUTIN_ITEM && self->visual.scale_kind >= 0) {
+            raw_kind = self->visual.scale_kind; /* P1: the item being put away stays in the hand (shrinking) until the put-in run ends */
+        }
+        int held_cls = pc_remote_player_held_class(raw_kind);
+        int held_kind = (held_cls == PC_HELD_NONE || held_cls == PC_HELD_DEFERRED) ? mPlayer_ITEM_KIND_NONE : raw_kind;
+        if (held_kind >= 0) {
+            self->visual.last_held_kind = held_kind; /* P1: put-in fallback kind */
+        }
+        int held_moving = (desired_anim_idx == mPlayer_ANIM_WALK1 || desired_anim_idx == mPlayer_ANIM_RUN1 ||
+                           desired_anim_idx == mPlayer_ANIM_DASH1);
+        int desired_anim1_idx = desired_anim_idx; /* upper-body/item layer clip: same clip as layer 0 unless an item */
+        int desired_part_table = mPlayer_PART_TABLE_NORMAL;
+
+        if (held_kind >= 0) {
+            /* Vanilla binds keyframe1 to the item pose clip and the part table to its row for every state that
+             * calls Player_actor_SetupItem_Base1/3 (wait/walk/run/dash/turn-dash: SetupItem_Base0 ->
+             * mPlib_Get_BasicPlayerAnimeIndex_fromItemKind / mPlib_Get_BasicPartTableIndex_fromAnimeIndex,
+             * m_player_common.c_inc). This fallback block only runs while no state row is active, so every state this puppet maps to
+             * WAIT1/WALK1/RUN1/DASH1/RUN_SLIP1 (incl. ITEM_USE/AIRBORNE/TUMBLE/OTHER -> WAIT1) shows the carried pose. */
+            int a1 = mPlib_Get_BasicPlayerAnimeIndex_fromItemKind(held_kind);
+            if (a1 >= 0 && mPlib_Get_Pointer_Animation(a1) != NULL) {
+                int pt = mPlib_Get_BasicPartTableIndex_fromAnimeIndex(a1);
+                desired_anim1_idx = a1;
+                desired_part_table = (pt >= 0 && pt < mPlayer_PART_TABLE_NUM) ? pt : mPlayer_PART_TABLE_NORMAL;
+            }
+        }
+
+        if (held_kind != self->visual.held_kind) {
+            self->visual.held_kind = held_kind;
+            self->visual.held_class = (held_kind >= 0) ? held_cls : PC_HELD_NONE;
+            self->visual.item_ready = 0;
+            if (held_cls == PC_HELD_NET || held_cls == PC_HELD_ROD || held_cls == PC_HELD_BALLOON || held_cls == PC_HELD_WINDMILL) {
+                pc_remote_player_item_skeleton_setup(&self->visual, held_kind, held_cls, held_moving); /* P1: + balloon / pinwheel */
+            }
+        }
+        if (pc_remote_player_puppet_diag() &&
+            (!self->visual.diag_valid || self->visual.diag_raw_kind != raw_kind)) {
+            self->visual.diag_valid = 1;
+            self->visual.diag_raw_kind = raw_kind;
+            printf("[NET][PUPPET][DIAG] player %d held item kind=%d model=%s layer1_anim=%d part_table=%d\n",
+                   (int)self->peer, raw_kind,
+                   (held_cls == PC_HELD_DEFERRED) ? "deferred" : pc_remote_player_held_name(raw_kind, held_cls),
+                   (held_kind >= 0) ? desired_anim1_idx : -1, desired_part_table);
+        }
+
+        /* M9-C Phase 2a: state rows (protocol v7). Entry-edge detection + latch bookkeeping; when a row is active it owns
+         * the body clips / part table / tempo, and the fallback blocks below (move_state mapping + carried pose) are skipped. */
+        double now_time = graph_dt_frame_time(game);
+        int row_on;
+        int play_state;
+        int rebind_from_row;
+
+        pc_remote_player_row_pre(self, slot, now_time, raw_kind, held_kind, desired_anim_idx, desired_anim1_idx,
+                                 desired_part_table, pos_snapped);
+        row_on = pc_puppet_aext_apply(self, slot, game, now_time) || self->visual.row_active; /* PUPPET ACTION_EXT (P2): a dynamic row owns the clips like a row */
+        rebind_from_row = self->visual.rebind_from_row;
+        self->visual.rebind_from_row = 0;
+
+        if (!row_on && desired_anim_idx != self->visual.current_anim_idx) {
+            /* State changed -- (re)start both layers on the new clip at frame 0, the same call
+             * the real player's own Player_actor_InitAnimation_Base1() makes on every state entry
+             * (src/game/m_player_common.c_inc). The keyframe structs themselves were already
+             * cKF_SkeletonInfo_R_ct()'d once, in pc_remote_player_visual_init(), and never need
+             * that again -- only this call, which rebinds the animation pointer/frame/speed
+             * without touching the joint/morph buffer wiring cKF_SkeletonInfo_R_ct() set up.
+             * M9-C Phase 1: layer 1 gets the item pose clip when an item is carried (desired_anim1_idx ==
+             * desired_anim_idx otherwise, i.e. exactly the pre-M9-C behaviour). */
+            cKF_Animation_R_c* new_anim = mPlib_Get_Pointer_Animation(desired_anim_idx);
+            cKF_Animation_R_c* new_anim1 = mPlib_Get_Pointer_Animation(desired_anim1_idx);
+            if (pc_remote_player_puppet_diag()) { /* review R1-L3: was unconditional (one line per remote action end) */
+                printf("[NET][REMOTE][DIAG] player %d: animation %d -> %d (move_state=%d)\n", (int)self->peer,
+                       self->visual.current_anim_idx, desired_anim_idx, (int)self->cosmetic_move_state);
+            }
+            /* vanilla wait (m_player_main_wait.c_inc InitAnimation_Base1) is frame 1.0 / speed 0.5; walk/run/dash tempo and RUN_SLIP retune below. Was 0.0/1.0 = idle at 2x after every action row. */
+            /* P1: blended like vanilla (every locomotion setup / request_main_wait/walk after an action passes morph -5), no more snap. */
+            cKF_SkeletonInfo_R_init_standard_repeat_setframeandspeedandmorph(&self->visual.keyframe0, new_anim, NULL,
+                                                                             1.0f, 0.5f, PC_FALLBACK_MORPH);
+            cKF_SkeletonInfo_R_init_standard_repeat_setframeandspeedandmorph(&self->visual.keyframe1, new_anim1, NULL,
+                                                                             1.0f, 0.5f, PC_FALLBACK_MORPH);
+            self->visual.current_anim_idx = desired_anim_idx;
+            self->visual.current_anim1_idx = desired_anim1_idx;
+
+            if (desired_anim_idx == mPlayer_ANIM_RUN_SLIP1) {
+                /* Stage 4B.1: RUN_SLIP1 does not use the movement-speed formula below -- the real
+                 * player's own Player_actor_setup_main_Turn_dash_common() (m_player_main_turn_dash.c_inc)
+                 * passes a fixed frame_speed=0.5f into its InitAnimation_Base1() call, and its
+                 * per-frame advance is Player_actor_CulcAnimation_Base() (plain advance), never
+                 * Player_actor_CulcAnimation_Walk() (the formula below). Set once, here, at the
+                 * same state-entry point the animation itself is (re)bound, and never touched
+                 * again while RUN_SLIP1 remains current -- see the exclusion below. */
+                self->visual.keyframe0.frame_control.speed = 0.5f;
+                self->visual.keyframe1.frame_control.speed = 0.5f;
+
+                /* Fire the skid sound exactly once, on this same state-change edge -- never
+                 * per-frame, never re-fired while RUN_SLIP1 remains current (this whole block only
+                 * runs when desired_anim_idx just changed), and never retriggered by a stale or
+                 * reordered packet (those are already rejected in pc_remote_player_on_move()
+                 * before ever reaching the snapshot ring, so they cannot produce a "new"
+                 * cosmetic_move_state value here). sAdo_OngenTrgStart() is the same generic,
+                 * actor-agnostic, positional one-shot trigger the real Player_actor_sound_slip()/
+                 * set_sound_common2() ultimately call (src/game/m_player_sound.c_inc) -- it only
+                 * reads world.position, a base ACTOR field, so it is safe to call directly with
+                 * this remote actor's own position; no new event/dedup system needed. */
+                if (!rebind_from_row) { /* review R1-L3: a row release rebind is not a skid entry (no late replay) */
+                    sAdo_OngenTrgStart(0x4129, &actor->world.position);
+                }
+            }
+        } else if (!row_on && desired_anim1_idx != self->visual.current_anim1_idx) {
+            /* M9-C Phase 1: only the carried item changed (equip/unequip while the body clip keeps playing): rebind
+             * just the upper-body layer, at frame 0 and the body layer's current tempo, leaving keyframe0 (the
+             * walk/run cycle) untouched. */
+            cKF_SkeletonInfo_R_init_standard_repeat_setframeandspeedandmorph(
+                &self->visual.keyframe1, mPlib_Get_Pointer_Animation(desired_anim1_idx), NULL, 0.0f,
+                self->visual.keyframe0.frame_control.speed, 0.0f);
+            self->visual.current_anim1_idx = desired_anim1_idx;
+        }
+
+        if (!row_on && desired_part_table != self->visual.current_part_table) {
+            /* Part table row for the item pose clip (mPlayer_PART_TABLE_NORMAL again once the item is gone); the
+             * same mPlib_DMA_player_Part_Table() the visual bring-up uses, into this puppet's own buffer. */
+            mPlib_DMA_player_Part_Table(self->visual.part_table, desired_part_table);
+            self->visual.current_part_table = desired_part_table;
+        }
+
+        /* Stage 4B: retune playback tempo every frame regardless of whether the state just
+         * changed -- exactly like the real player's Player_actor_CulcAnimation_Walk() does
+         * (shared verbatim by Walk/Run/Dash, src/game/m_player_main_walk.c_inc): never
+         * reinitializes the animation, just updates frame_control.speed so
+         * cKF_SkeletonInfo_R_combine_play() below advances at the right tempo. WAIT1 and
+         * RUN_SLIP1 are excluded: the real player never runs this formula for Wait, and
+         * RUN_SLIP1 uses a fixed 0.5x speed set once at entry above (see the Stage 4B.1
+         * investigation) rather than a continuously-recalculated movement-speed tempo. */
+        if (!row_on && self->visual.current_anim_idx != mPlayer_ANIM_WAIT1 &&
+            self->visual.current_anim_idx != mPlayer_ANIM_RUN_SLIP1) {
+            float raw_speed = self->cosmetic_speed;
+            float sp;
+
+            if (!(raw_speed > 0.0f)) {
+                /* Guards zero, any unexpected negative value, and NaN (all fail `> 0.0f`) --
+                 * sqrtf() of a negative input is undefined, and a legitimate WALK/RUN/DASH state
+                 * always carries positive speed, so this is strictly a defensive floor. */
+                raw_speed = 0.0f;
+            }
+
+            /* Verified real-player formula (src/game/m_player_main_walk.c_inc's
+             * Player_actor_CulcAnimation_Walk()), normalize == 1.0f: the real player's
+             * terrain/slope normalization factor is derived from local collision data that is
+             * never network-synced (see the Stage 4B investigation) -- an intentional,
+             * cosmetic-only approximation. */
+            sp = (raw_speed * 1.0f) / 7.5f;
+            sp = sqrtf(sp);
+            sp = 0.59999996f * sp;
+            if (sp < 0.22f) {
+                sp = 0.22f;
+            }
+
+            self->visual.keyframe0.frame_control.speed = sp;
+            self->visual.keyframe1.frame_control.speed = sp;
+        }
+
+        if (row_on && self->visual.row_active) { /* (P2: not for an ACTION_EXT dynamic row: row_idx is not its row) */
+            const PCStateRow* arow = pc_remote_player_row_for(self->visual.row_idx);
+            if (arow != NULL && arow->tempo == PC_TEMPO_READY_WALK_NET) {
+                /* Player_actor_CulcAnimation_Ready_walk_net (m_player_main_ready_walk_net.c_inc): 0.252*sqrt(speed*over_norm/
+                 * 1.8), floor 0.22; over_norm and the wall modifiers are not network-synced (1.0 / none). */
+                float rs = (self->cosmetic_speed > 0.0f) ? self->cosmetic_speed : 0.0f;
+                float sp = 0.252f * sqrtf(rs / 1.8f);
+                if (sp < 0.22f) {
+                    sp = 0.22f;
+                }
+                self->visual.keyframe0.frame_control.speed = sp;
+                self->visual.keyframe1.frame_control.speed = sp;
+            }
+            pc_remote_player_row_tick(self, now_time); /* P1: take-out / put-in item_scale curve + the take-out pose switch */
+        }
+
+        play_state = cKF_SkeletonInfo_R_combine_play(&self->visual.keyframe0, &self->visual.keyframe1,
+                                                     self->visual.part_table);
+        pc_remote_player_row_post(self, play_state, now_time);
+
+        /* M9-C Phase 3: footsteps / effects keyed on this puppet's own clip timing and edges (after the clip advanced). */
+        pc_remote_player_cosmetics(self, slot, game, now_time);
+
+        /* M9-C Phase 1: puppet-owned net/rod skeleton instance, advanced once per puppet move like
+         * Player_actor_Item_main_net_normal / _rod_normal (cKF_SkeletonInfo_R_play + the net carried angle). Phase 2a: the
+         * clip is chosen by pc_remote_player_item_tick() (carried default, or the active state row's item clip). */
+        if (self->visual.item_ready &&
+            (self->visual.held_class == PC_HELD_NET || self->visual.held_class == PC_HELD_ROD)) {
+            pc_remote_player_item_tick(self, held_moving);
+            cKF_SkeletonInfo_R_play(&self->visual.item_keyframe);
+            if (self->visual.held_class == PC_HELD_NET) {
+                pc_remote_player_net_angle_update(self);
+            }
+        }
+        if (self->visual.item_ready &&
+            (self->visual.held_class == PC_HELD_BALLOON || self->visual.held_class == PC_HELD_WINDMILL)) {
+            pc_remote_player_toy_tick(self); /* P1: balloon sway / pinwheel spin */
+        }
+    }
+
+    /* M9-B: player<->player collision (registers the puppet's pipe when every arming condition holds). */
+    pc_remote_player_collide_update(self, slot, game);
+}
+
+/* Facial expression of a puppet, derived from what it already mirrors (no wire field: MOVE carries no eye / mouth data). Vanilla
+ * sets the player's eye / mouth texture two ways: (1) Player_actor_set_tex_anime_pattern (m_player_common.c_inc:959-983): the
+ * per-frame eye / mouth index tables of the CLIP (mPlib_Get_PlayerEyeTexAnimation_p / _MouthTexAnimation_p, pure data) indexed
+ * by keyframe0's frame - 1: KOKERU (tumble), GAAAN1 (shock), MOSQUITO1 (flinch), and every other clip that has a table; the puppet
+ * plays the same clip on its own keyframe0, so the same lookup gives the same face. (2) constant patterns some states set for a
+ * clip without a table: SHOCK's GAAAN2 eye 6 / mouth 5 (shock.c_inc:117-130), NOTICE_MOSQUITO / TIRED 4 / 4, STRUGGLE_PITFALL eye 6,
+ * SWING_FAN eye 5, WAIT_BED eye 2. P1: anything else blinks like Player_actor_set_eye_pattern_normal (pc_remote_player_blink_eye);
+ * the face diag line keeps reporting the derived (non-blink) pattern so it changes only with the state. Read-only. */
+
+/* P1: Player_actor_set_eye_pattern_normal (m_player_common.c_inc:900-937) for one puppet: a 16-frame blink (pattern table 0,0,0,0,
+ * 1,1,2,2,2,2,2,2,1,1,0,0 read backwards from timer 16) after a 60..179 frame wait, 0..2 extra blinks in a row. The waits come from a
+ * PRIVATE per-puppet LCG (vanilla get_random_timer draws from the gameplay fqrand() stream, which a remote puppet must never touch).
+ * Advanced by the graph frame clock (dt clamped to 4 frames). Returns the eye pattern. */
+static int pc_remote_player_blink_eye(PCRemotePlayerVisual* v, double now) {
+    static const s8 pattern_table[] = { 0, 0, 0, 0, 1, 1, 2, 2, 2, 2, 2, 2, 1, 1, 0, 0 };
+    double dt = now - v->blink_last;
+    int idx;
+    int pattern;
+
+    if (v->blink_rng == 0u) {
+        v->blink_rng = 0x9E3779B9u ^ (u32)(uintptr_t)v; /* per-puppet seed: puppets do not blink in sync */
+        dt = 0.0;
+    }
+    if (!(dt >= 0.0) || dt > 4.0) {
+        dt = (dt > 4.0) ? 4.0 : 0.0;
+    }
+    v->blink_last = now;
+    idx = (int)v->blink_timer;
+    if (idx != 0) {
+        v->blink_timer -= (f32)dt;
+        if (v->blink_timer < 0.0f) {
+            v->blink_timer = 0.0f;
+        }
+        idx = (int)v->blink_timer;
+    }
+    if (idx == 0) {
+        if (v->blink_count <= 0) {
+            v->blink_rng = v->blink_rng * 1664525u + 1013904223u;
+            v->blink_count = (int)((v->blink_rng >> 16) % 3u);          /* get_random_timer(0, 3): 0..2 */
+            v->blink_rng = v->blink_rng * 1664525u + 1013904223u;
+            v->blink_timer = (f32)(60 + (int)((v->blink_rng >> 16) % 120u)); /* get_random_timer(60, 120): 60..179 */
+        } else {
+            v->blink_timer = 16.0f;
+            v->blink_count--;
+        }
+    }
+    pattern = (int)v->blink_timer;
+    if (pattern >= 16 || pattern < 0) {
+        pattern = 0;
+    }
+    return pattern_table[pattern];
+}
+
+static void pc_remote_player_face_pattern(PCRemotePlayerActor* self, int* eye, int* mouth) {
+    PCRemotePlayerVisual* v = &self->visual;
+    const int a0 = v->current_anim_idx;
+    const float cur = v->keyframe0.frame_control.current_frame;
+    const float max = v->keyframe0.frame_control.max_frames;
+    u8* et = (a0 >= 0 && a0 < mPlayer_ANIM_NUM) ? mPlib_Get_PlayerEyeTexAnimation_p(a0) : NULL;
+    u8* mt = (a0 >= 0 && a0 < mPlayer_ANIM_NUM) ? mPlib_Get_PlayerMouthTexAnimation_p(a0) : NULL;
+    int e = 0, m = 0;
+    int eye_fixed = (et != NULL); /* P1: a clip table or a constant state eye: no blinking */
+    int e_before_ext;
+
+    if (1.0f <= cur && cur <= max) {
+        const int p = (int)(cur - 1.0f);
+        if (et != NULL) {
+            e = et[p];
+        }
+        if (mt != NULL) {
+            m = mt[p];
+        }
+    }
+    if (v->row_active) {
+        int ce = -1, cm = -1;
+        switch (v->row_idx) {
+            case mPlayer_INDEX_SHOCK:
+                if (a0 == mPlayer_ANIM_GAAAN2) {
+                    ce = 6;
+                    cm = 5;
+                }
+                break;
+            case mPlayer_INDEX_NOTICE_MOSQUITO:
+            case mPlayer_INDEX_TIRED:
+                ce = 4;
+                cm = 4;
+                break;
+            case mPlayer_INDEX_STRUGGLE_PITFALL:
+                ce = 6;
+                break;
+            case mPlayer_INDEX_SWING_FAN:
+                ce = 5;
+                break;
+            case mPlayer_INDEX_WAIT_BED:
+                ce = 2;
+                break;
+            default:
+                break;
+        }
+        if (ce >= 0 && et == NULL) {
+            e = ce;
+            eye_fixed = 1;
+        }
+        if (cm >= 0 && mt == NULL) {
+            m = cm;
+        }
+        if (v->row_idx == (int)mPlayer_INDEX_NOTICE_BEE && v->row_finished) {
+            e = 0; /* P1: notice_bee.c_inc:51-58: the HATI3 table while the clip runs, the normal (blinking) eye after it ended */
+            eye_fixed = 0;
+        }
+    }
+    e_before_ext = e;
+    pc_puppet_aext_face(self, a0, &e, &m); /* PUPPET ACTION_EXT (P2): the dynamic row's constant face (talk GAAAN2 6 / 5) */
+    if (e != e_before_ext) {
+        eye_fixed = 1; /* P1: a P2 constant face is not blinked over */
+    }
+    if (e < 0 || e >= mPlayer_EYE_TEX_NUM) {
+        e = 0;
+    }
+    if (m < 0 || m >= mPlayer_MOUTH_TEX_NUM) {
+        m = 0;
+    }
+    if ((e != v->diag_face_eye || m != v->diag_face_mouth) && pc_remote_player_puppet_diag()) {
+        printf("[NET][PUPPET][DIAG] player %d face eye=%d mouth=%d anim0=%d row=%d frame=%.1f\n", (int)self->peer, e, m, a0,
+               v->row_active ? v->row_idx : -1, (double)cur);
+    }
+    v->diag_face_eye = e;
+    v->diag_face_mouth = m;
+    if (!eye_fixed && e == 0 && gamePT != NULL) {
+        e = pc_remote_player_blink_eye(v, graph_dt_frame_time(gamePT)); /* P1: after the diag line (blinks are not state changes) */
+    }
+    *eye = e;
+    *mouth = m;
+}
+
+/* ===== P3 FISHING VIEW BEGIN (worker P3): bobber + caught creature on the puppets. PRESENTATION ONLY. =====
+ * Draws, from the puppet's own dw (after the body and the carried item, so the hand / net captures of THIS frame are fresh):
+ *  - the BOBBER (BOBBER_VIEW id 97 via pc_net_game_bobber_view_get): the vanilla tol_uki1 / tol_uki2 (golden rod) display list exactly like
+ *    aUKI_actor_draw (ac_uki_draw.c_inc: scale 0.01, RotateY toward the rod, RotateX by stage, prim colour white), at the relayed position eased per
+ *    frame (the view is ~10 Hz). Only while the puppet carries a rod. Vanilla draws NO fishing line (no line draw exists in ac_uki / m_player_item_rod),
+ *    so none is drawn here either. NOT a UKI actor: the local fish AI (and the host's) never sees it.
+ *  - the CAUGHT CREATURE (PLAYER_ACTION kind 2 CATCH, pc_remote_player_on_catch): bound to the NOTICE_NET (47) / NOTICE_ROD (56) run that starts
+ *    within PC_FV_PP_BIND_FRAMES of the event; drawn with the ground-item model (bg_item_clip->single_draw_proc, the same draw the remote PICKUP
+ *    flying item uses) at the left hand (56); fish and junk only: an insect / spirit item has no FIELD ground model (CAGE type, police data only),
+ *    so in the net (47) only its arrow is drawn (see pc_fv_pp_item_drawable). The vanilla fish / insect actors themselves cannot be borrowed (the fish model
+ *    needs the GYOEI controller's texture segments, an insect is a live wildlife actor). The YAJIRUSHI arrow of notice_net.c_inc:162-173 (ant,
+ *    mosquito) / notice_rod.c_inc:231-258 (killifish) is drawn directly (ef_kore_modelT, the ef_yajirushi.c draw) instead of spawning the effect:
+ *    the vanilla kill (effect_kill_proc(YAJIRUSHI, RSV_NO)) kills EVERY arrow, including the local player's own.
+ *  - RELEASE_CREATURE (83) right after such a run: the creature leaves the hand in a short arc and shrinks away (PC_FV_PP_RELEASE_FRAMES); the
+ *    vanilla release actors (GYO_RELEASE touches the GYOEI controller's segments, an insect release makes a REAL insect) are not created.
+ * Nothing here writes the field, the inventory, wildlife or any gameplay state; no effect pool slot or sound is used. */
+#include "pc_fishing_view.h"
+#include "ac_gyoei.h"   /* aGYO_TYPE_KILLIFISH (the fish YAJIRUSHI type, notice_rod.c_inc:232) */
+#include "ac_insect_h.h" /* aINS_INSECT_TYPE_ANT / _MOSQUITO (the insect YAJIRUSHI types, notice_net.c_inc:16-19) */
+extern Gfx tol_uki1_model[];
+extern Gfx tol_uki2_model[];
+extern Gfx ef_kore_modelT[];
+
+#define PC_FV_PP_BIND_FRAMES 300.0     /* a CATCH binds to a NOTICE run starting within this many frames of it (either order) */
+#define PC_FV_PP_RELEASE_FRAMES 60.0   /* the cosmetic release arc */
+#define PC_FV_PP_ROD_ARROW_FRAMES 42.0 /* notice_rod: the message (and the arrow) waits for its 42-frame timer (notice_rod.c_inc:336) */
+
+typedef struct PCFvPuppet {
+    uint8_t  catch_valid;   /* a CATCH not bound yet */
+    uint16_t catch_item;
+    double   catch_time;
+    uint8_t  run_known;
+    int      run_idx, run_ctr;
+    double   run_start;
+    uint8_t  shown;         /* the current NOTICE run shows shown_item */
+    uint16_t shown_item;
+    xyz_t    held_pos;      /* where the creature was drawn last (the release starts there) */
+    uint8_t  rel_active;
+    uint16_t rel_item;
+    double   rel_start;
+    xyz_t    rel_from;
+    s16      rel_angle;
+    uint8_t  bob_have;
+    uint32_t bob_since;
+    xyz_t    bob_pos;
+    double   bob_last_log;
+    uint32_t n_bob_draws, n_catch_shown, n_release, n_arrow;
+} PCFvPuppet;
+static PCFvPuppet s_fv_pp[PC_REMOTE_PLAYER_ID_LIMIT + 1];
+
+void pc_remote_player_on_catch(int origin, uint16_t item, uint16_t seq) {
+    PCFvPuppet* p;
+
+    if (origin < 0 || origin > PC_REMOTE_PLAYER_ID_LIMIT || gamePT == NULL) {
+        return;
+    }
+    p = &s_fv_pp[origin];
+    p->catch_valid = 1;
+    p->catch_item = item;
+    p->catch_time = graph_dt_frame_time(gamePT);
+    if (pc_remote_player_puppet_diag()) {
+        printf("[NET][PUPPET][DIAG] player %d catch event item=0x%04X seq=%u\n", origin, (unsigned)item, (unsigned)seq);
+    }
+}
+
+/* 1 = the item has a ground-item model in the FIELD bg_item tables: fish (mNT_ITEM_TYPE_FISH) and the three junk items (TRASH). Insects / spirits map
+ * to mNT_ITEM_TYPE_CAGE, whose model exists only in the police lost-and-found item data: single_draw_proc on one in the town CRASHES (seen in the
+ * real test), so an insect is never drawn with it (only its arrow is). */
+static int pc_fv_pp_item_drawable(uint16_t item) {
+    if (item >= (uint16_t)ITM_FISH_START && item < (uint16_t)ITM_FISH_END) {
+        return mNT_get_itemTableNo((mActor_name_t)item) == mNT_ITEM_TYPE_FISH;
+    }
+    if (item == (uint16_t)ITM_DUST0_EMPTY_CAN || item == (uint16_t)ITM_DUST1_BOOT || item == (uint16_t)ITM_DUST2_OLD_TIRE) {
+        return mNT_get_itemTableNo((mActor_name_t)item) == mNT_ITEM_TYPE_TRASH;
+    }
+    return 0;
+}
+
+static int pc_fv_pp_arrow_item(uint16_t item) {
+    return item == (uint16_t)(ITM_FISH_START + aGYO_TYPE_KILLIFISH) || item == (uint16_t)(ITM_INSECT00 + aINS_INSECT_TYPE_ANT) ||
+           item == (uint16_t)(ITM_INSECT00 + aINS_INSECT_TYPE_MOSQUITO);
+}
+
+/* the vanilla bobber draw (aUKI_actor_draw) at `pos` */
+static void pc_fv_pp_draw_bobber(PCRemotePlayerActor* self, GAME* game, const PCFvSample* s, const xyz_t* pos) {
+    GRAPH* graph = game->graph;
+    f32 dx = self->actor_class.world.position.x - pos->x;
+    f32 dz = self->actor_class.world.position.z - pos->z;
+    s16 rx = 0;
+    Mtx* mtx;
+
+    if (s->uki_status == PC_FV_UKI_STATUS_CAST) {
+        rx = DEG2SHORT_ANGLE2(90.0f); /* aUKI_PROC_CAST: lying along the flight */
+    } else if (s->gyo_status == 4) {
+        rx = DEG2SHORT_ANGLE2(-90.0f); /* aUKI_PROC_BITE, gyo_status 4: pulled under */
+    }
+    Matrix_push();
+    Matrix_translate(pos->x, pos->y, pos->z, MTX_LOAD);
+    Matrix_scale(0.01f, 0.01f, 0.01f, MTX_MULT);
+    Matrix_RotateY(atans_table(dz, dx), MTX_MULT);
+    Matrix_RotateX(rx, MTX_MULT);
+    mtx = _Matrix_to_Mtx_new(graph);
+    if (mtx != NULL) {
+        _texture_z_light_fog_prim(graph);
+        OPEN_POLY_OPA_DISP(graph);
+        gSPMatrix(POLY_OPA_DISP++, mtx, G_MTX_NOPUSH | G_MTX_LOAD | G_MTX_MODELVIEW);
+        gDPSetPrimColor(POLY_OPA_DISP++, 0, 128, 255, 255, 255, 255);
+        gSPDisplayList(POLY_OPA_DISP++, s->rod_type ? tol_uki2_model : tol_uki1_model);
+        CLOSE_POLY_OPA_DISP(graph);
+    }
+    Matrix_pull();
+}
+
+/* the ef_yajirushi.c draw (alpha 255: its continuous phase) */
+static void pc_fv_pp_draw_arrow(GAME* game, const xyz_t* pos) {
+    xyz_t p = *pos;
+    xyz_t sc = { 0.01f, 0.01f, 0.01f }; /* eEC_MakeEffect's default effect scale */
+
+    if (eEC_CLIP == NULL || eEC_CLIP->auto_matrix_xlu_proc == NULL) {
+        return;
+    }
+    eEC_CLIP->auto_matrix_xlu_proc(game, &p, &sc);
+    OPEN_DISP(game->graph);
+    gDPSetPrimColor(NEXT_POLY_XLU_DISP, 0, 255, 255, 80, 30, 255);
+    gSPDisplayList(NEXT_POLY_XLU_DISP, ef_kore_modelT);
+    CLOSE_DISP(game->graph);
+}
+
+static void pc_fv_pp_draw(PCRemotePlayerActor* self, GAME* game) {
+    PCRemotePlayerSlot* slot;
+    PCFvPuppet* p;
+    PCFvSample s;
+    uint32_t since = 0;
+    double now;
+    int idx, ctr, diag = pc_remote_player_puppet_diag();
+    int peer = (int)self->peer;
+
+    if (peer < 0 || peer > PC_REMOTE_PLAYER_ID_LIMIT || gamePT == NULL) {
+        return;
+    }
+    p = &s_fv_pp[peer];
+    now = graph_dt_frame_time(gamePT);
+    slot = pc_remote_player_find_slot(self->peer);
+
+    /* ---- the bobber ---- */
+    if (self->visual.held_class == PC_HELD_ROD && pc_net_game_bobber_view_get(peer, &s, &since)) {
+        xyz_t t;
+        f32 ddx, ddy, ddz;
+
+        t.x = s.x;
+        t.y = s.y;
+        t.z = s.z;
+        ddx = t.x - p->bob_pos.x;
+        ddy = t.y - p->bob_pos.y;
+        ddz = t.z - p->bob_pos.z;
+        if (!p->bob_have || p->bob_since != since || ddx * ddx + ddy * ddy + ddz * ddz > 300.0f * 300.0f) {
+            p->bob_pos = t; /* a new cast (or a jump): snap */
+            p->bob_since = since;
+            if (diag) {
+                printf("[NET][PUPPET][DIAG] player %d bobber drawn (new) pos=(%.0f,%.0f,%.0f) uki=%u gyo=%d rod=%u\n", peer, (double)t.x, (double)t.y,
+                       (double)t.z, (unsigned)s.uki_status, (int)s.gyo_status, (unsigned)s.rod_type);
+            }
+        } else {
+            p->bob_pos.x += ddx * 0.3f; /* ~10 Hz samples eased over a few frames */
+            p->bob_pos.y += ddy * 0.3f;
+            p->bob_pos.z += ddz * 0.3f;
+        }
+        p->bob_have = 1;
+        pc_fv_pp_draw_bobber(self, game, &s, &p->bob_pos);
+        p->n_bob_draws++;
+        if (diag && (now - p->bob_last_log) > 120.0) {
+            p->bob_last_log = now;
+            printf("[NET][PUPPET][DIAG] player %d bobber drawn pos=(%.0f,%.0f,%.0f) uki=%u gyo=%d draws=%u\n", peer, (double)p->bob_pos.x,
+                   (double)p->bob_pos.y, (double)p->bob_pos.z, (unsigned)s.uki_status, (int)s.gyo_status, (unsigned)p->n_bob_draws);
+        }
+    } else if (p->bob_have) {
+        p->bob_have = 0;
+        if (diag) {
+            printf("[NET][PUPPET][DIAG] player %d bobber hidden (draws=%u)\n", peer, (unsigned)p->n_bob_draws);
+        }
+    }
+
+    /* ---- the NOTICE run / CATCH binding ---- */
+    idx = self->cosmetic_action_valid ? (int)self->cosmetic_action_index : -1;
+    ctr = self->cosmetic_action_valid ? (int)self->cosmetic_action_counter : -1;
+    if (!p->run_known || idx != p->run_idx || ctr != p->run_ctr) {
+        int prev_notice = p->run_known && (p->run_idx == (int)mPlayer_INDEX_NOTICE_NET || p->run_idx == (int)mPlayer_INDEX_NOTICE_ROD);
+
+        if (prev_notice && p->shown && idx == (int)mPlayer_INDEX_RELEASE_CREATURE) {
+            p->rel_active = 1; /* released from the notice dialogue (the 'release' choice) */
+            p->rel_item = p->shown_item;
+            p->rel_start = now;
+            p->rel_from = p->held_pos;
+            p->rel_angle = self->actor_class.shape_info.rotation.y;
+            p->n_release++;
+            if (diag) {
+                printf("[NET][PUPPET][DIAG] player %d release shown item=0x%04X\n", peer, (unsigned)p->rel_item);
+            }
+        }
+        p->run_known = 1;
+        p->run_idx = idx;
+        p->run_ctr = ctr;
+        p->run_start = now;
+        p->shown = 0;
+    }
+    if (p->catch_valid && fabs(now - p->catch_time) > PC_FV_PP_BIND_FRAMES && !(p->run_idx == (int)mPlayer_INDEX_NOTICE_NET ||
+                                                                               p->run_idx == (int)mPlayer_INDEX_NOTICE_ROD)) {
+        p->catch_valid = 0; /* never met a NOTICE run */
+    }
+    if ((idx == (int)mPlayer_INDEX_NOTICE_NET || idx == (int)mPlayer_INDEX_NOTICE_ROD) && !p->shown && p->catch_valid &&
+        fabs(p->catch_time - p->run_start) <= PC_FV_PP_BIND_FRAMES) {
+        p->shown = 1;
+        p->shown_item = p->catch_item;
+        p->catch_valid = 0;
+        p->n_catch_shown++;
+        if (diag) {
+            printf("[NET][PUPPET][DIAG] player %d catch shown item=0x%04X state=%d arrow=%d\n", peer, (unsigned)p->shown_item, idx,
+                   pc_fv_pp_arrow_item(p->shown_item));
+        }
+    }
+
+    if (slot == NULL || pc_pk_gate(self, slot, game) != NULL || mFI_GET_TYPE(mFI_GetFieldId()) != mFI_FIELD_FG) {
+        return; /* the ground-item draw: FG scenes only, in range, not paused / hidden */
+    }
+
+    /* ---- the held creature (+ arrow) ---- */
+    if (p->shown && (idx == (int)mPlayer_INDEX_NOTICE_NET || idx == (int)mPlayer_INDEX_NOTICE_ROD)) {
+        xyz_t pos;
+        int have = 0;
+
+        if (idx == (int)mPlayer_INDEX_NOTICE_NET && self->cos.net_frame == game->frame_counter + 1u) {
+            pos = self->cos.net_pos; /* the insect sits in the net head */
+            have = 1;
+        } else if (self->cos.hand_frame == game->frame_counter + 1u) {
+            pos = self->cos.hand_pos; /* the fish is held up in the left hand */
+            have = 1;
+        }
+        if (have) {
+            p->held_pos = pos;
+            if (pc_fv_pp_item_drawable(p->shown_item)) {
+                Common_Get(clip).bg_item_clip->single_draw_proc(game, (mActor_name_t)p->shown_item, &pos, 0.01f, NULL, NULL, NULL);
+            }
+            if (pc_fv_pp_arrow_item(p->shown_item) &&
+                (idx == (int)mPlayer_INDEX_NOTICE_NET || (now - p->run_start) >= PC_FV_PP_ROD_ARROW_FRAMES)) {
+                pc_fv_pp_draw_arrow(game, &pos);
+                if (p->n_arrow++ == 0u && diag) {
+                    printf("[NET][PUPPET][DIAG] player %d yajirushi shown item=0x%04X\n", peer, (unsigned)p->shown_item);
+                }
+            }
+        }
+    }
+
+    /* ---- the release arc ---- */
+    if (p->rel_active) {
+        double t = now - p->rel_start;
+
+        if (t < 0.0 || t >= PC_FV_PP_RELEASE_FRAMES || idx != (int)mPlayer_INDEX_RELEASE_CREATURE) {
+            p->rel_active = 0;
+        } else {
+            f32 k = (f32)(t / PC_FV_PP_RELEASE_FRAMES);
+            int insect = (p->rel_item >= (uint16_t)ITM_INSECT_START && p->rel_item <= (uint16_t)ITM_SPIRIT0 + 3u);
+            f32 scale = (k < 0.5f) ? 0.01f : 0.01f * (1.0f - (k - 0.5f) * 2.0f);
+            xyz_t pos = p->rel_from;
+
+            pos.x += sin_s(p->rel_angle) * 60.0f * k;
+            pos.z += cos_s(p->rel_angle) * 60.0f * k;
+            pos.y += insect ? 50.0f * k : 25.0f * sin_s((s16)(int)(k * 32768.0f)) - 30.0f * k * k; /* a bug flies up, a fish arcs down */
+            if (scale > 0.0f && pc_fv_pp_item_drawable(p->rel_item)) {
+                Common_Get(clip).bg_item_clip->single_draw_proc(game, (mActor_name_t)p->rel_item, &pos, scale, NULL, NULL, NULL);
+            }
+        }
+    }
+}
+/* ===== P3 FISHING VIEW END ===== */
+
+static void pc_remote_player_dw(ACTOR* actor, GAME* game) {
+    GRAPH* graph = game->graph;
+    PCRemotePlayerActor* self = (PCRemotePlayerActor*)actor;
+    PCRemotePlayerSlot* slot = pc_remote_player_find_slot(self->peer);
+    const PCRemotePlayerResolvedAppearance* appearance;
+    Mtx* mtx;
+    u8* eye_tex_p;
+    u8* mouth_tex_p;
+    Gfx* gfx;
+
+    if (!self->visual.initialized) {
+        return; /* not ready yet (see pc_remote_player_mv()) -- draw nothing this frame, retried
+                  * automatically next frame */
+    }
+
+    if (slot == NULL || !slot->resolved_appearance.ready) {
+        return; /* extremely defensive: pc_remote_player_mv() never sets visual.initialized until
+                  * resolved_appearance.ready is true, so this should be unreachable -- but this
+                  * dw_proc must never fall back to the local player's own segments, so it draws
+                  * nothing rather than guessing. */
+    }
+    appearance = &slot->resolved_appearance;
+
+    /* M9-C Phase 2b: HIDE (mPlayer_INDEX_HIDE 81) has vanilla draw type NONE (m_player.c, Player_actor_draw table), so the
+     * peer's body and carried item are not drawn while that state is the active row. */
+    if (pc_remote_player_body_hidden(self)) {
+        return;
+    }
+    /* Building interactions: a puppet is shown only while its announced scene is the town this process shows (the owner's
+     * MOVEs from inside a building carry interior coordinates: an interior is never shared), and not while a scene event
+     * still waits for its first fresh MOVE. */
+    if (slot->snap_req || !pc_remote_player_scene_is_local_shown(slot, (GAME_PLAY*)game)) {
+        return;
+    }
+    if (!pc_remote_player_scene_is_local_field(slot, (GAME_PLAY*)game) && gamePT != NULL &&
+        (graph_dt_frame_time(gamePT) - slot->last_move_recv_local_frame) > PC_REMOTE_PLAYER_ACTION_GAP_FRAMES) {
+        return; /* interior presence: the owner stopped sending MOVE (e.g. an unannounced scene such as the save screen): no stale ghost */
+    }
+
+    /* Per-frame scratch matrices, exactly like the inventory preview (mIV_pl_shape_draw) --
+     * never a persistent per-instance buffer like PLAYER_ACTOR's own work_mtx[2][13]. */
+    mtx = (Mtx*)GRAPH_ALLOC_TYPE(graph, Mtx, self->visual.keyframe0.skeleton->num_shown_joints);
+    if (mtx == NULL) {
+        return;
+    }
+
+    /* Stage 4C-1 appearance: THIS remote player's own eye/mouth/cloth/face resources, resolved
+     * once at pc_remote_player_on_appearance() time into slot->resolved_appearance (see
+     * pc_remote_player_apply_appearance()) -- no longer the local singleton banks Stage 4A used,
+     * so each connected player now renders with their own gender/face/clothing. Pattern 0 (the
+     * first 0x100-byte eye slot / first mouth slot within appearance->face_tex) is simply "not
+     * blinking, default mouth"; blink/mouth-pattern animation is not synchronized, same as Stage
+     * 4A. */
+    {
+        int eye = 0, mouth = 0;
+        pc_remote_player_face_pattern(self, &eye, &mouth);
+        eye_tex_p = (u8*)appearance->face_tex + eye * 0x100;
+        mouth_tex_p = (u8*)appearance->face_tex + (mPlayer_EYE_TEX_NUM + mouth) * 0x100;
+    }
+
+    /* Reset RDP/RSP mode (texture/z/light/fog/prim) to a known baseline before emitting our own
+     * commands -- the same call the real player's own Player_actor_draw_Normal() makes first. */
+    _texture_z_light_fog_prim(graph);
+
+    OPEN_DISP(graph);
+    gfx = NOW_POLY_OPA_DISP;
+
+    /* Same five segments Player_actor_draw_Normal() binds, but now sourced from THIS remote
+     * player's own resolved buffers instead of the local singleton getters -- see the struct doc
+     * comment on PCRemotePlayerResolvedAppearance. Kept immediately adjacent to the draw call
+     * below within this same function, per the Stage 4C investigation: the local player's next
+     * dw_proc call later this same frame rebinds these same segment registers to its own
+     * resources before drawing itself, so a remote player's bindings must never be separated from
+     * its own draw by any other actor's dw_proc or by a frame boundary. */
+    gSPSegment(gfx++, ANIME_1_TXT_SEG, eye_tex_p);
+    gSPSegment(gfx++, ANIME_2_TXT_SEG, mouth_tex_p);
+    gSPSegment(gfx++, ANIME_3_TXT_SEG, (u8*)appearance->cloth_tex);
+    gSPSegment(gfx++, ANIME_4_TXT_SEG, (u16*)appearance->cloth_pallet);
+    gSPSegment(gfx++, ANIME_5_TXT_SEG, (u16*)appearance->face_pallet);
+
+    SET_POLY_OPA_DISP(gfx);
+    CLOSE_DISP(graph);
+
+    /* No Matrix_translate/gSPMatrix here on purpose: the generic Actor_draw() (src/game/m_actor.c)
+     * already loaded the root matrix from actor->world.position/shape_info.rotation/actor->scale
+     * before calling this dw_proc, exactly like it does for the real PLAYER_ACTOR. Overriding it
+     * (as the Stage 2/3 pyramid marker used to) would discard that and is not needed here. */
+    /* M9-C Phase 1: the puppet's OWN right-hand after-callback (arg == this PCRemotePlayerActor, never a
+     * PLAYER_ACTOR) captures the world hand matrix during this very draw; the carried item is then drawn at it,
+     * right after the body, in the same function (no one-frame lag, no state shared with the local player). */
+    self->hand_mtx_valid = 0;
+    cKF_Si3_draw_R_SV(game, &self->visual.keyframe0, mtx, NULL, pc_remote_player_draw_after, self);
+    pc_remote_player_draw_item(self, game);
+    pc_remote_player_draw_pickup_item(self, game); /* M9-C Phase 5: flying item of a remote PICKUP (event-paired) */
+    pc_fv_pp_draw(self, game); /* worker P3: bobber (BOBBER_VIEW) + caught creature / arrow / release (PLAYER_ACTION CATCH) */
+}
+
+/* 1 only if slot->actor still belongs to the GAME_PLAY that is alive right now. game_dt() frees every
+ * actor and sets gamePT to NULL, and graph_proc() does this both between scenes and on quit (before
+ * main.c calls pc_net_game_shutdown()); pc_remote_player_poll()'s generation check has not run yet
+ * for a replaced GAME_PLAY when an event handler gets here, so compare the GAME_PLAY identity too.
+ * gamePT is also the title/player-select/logo GAME, which may reuse a freed GAME_PLAY's address, so
+ * only a GAME running play_main (the only exec a constructed GAME_PLAY has) can own live actors. */
+static int pc_remote_player_actor_is_live(const PCRemotePlayerSlot* slot) {
+    if (slot->actor == NULL || gamePT == NULL || gamePT->exec != play_main) {
+        return 0;
+    }
+    if (slot->scene_generation != s_scene_generation) {
+        return 0;
+    }
+    return gamePT == s_last_seen_game && gamePT->frame_counter >= s_last_seen_frame_counter;
+}
+
+/* keep_scene == 0: genuine departure paths (on_disconnect, on_ready replacing a tracked slot, shutdown) --
+ * the stored M9-A scene identity is wiped. keep_scene == 1: ONLY the client-side relay-liveness timeout
+ * (a relayed peer merely stopped sending MOVE while its transport is still up, e.g. it is inside the NES
+ * emulator or paused): the puppet presentation is torn down but the scene identity is PRESERVED, because
+ * the peer's scene dedup will not re-announce an unchanged scene when it comes back. A real departure
+ * still clears it later (host CLEARED notice, host-link loss, on_ready's own memset). */
+static void pc_remote_player_destroy_slot(PCRemotePlayerSlot* slot, int keep_scene) {
+    /* M9-A: a scene can be stored for a relay-discovered player that never became in_use, so clear it
+     * BEFORE the in_use early-out: no stale interior presence may survive a disconnect. */
+    if (!keep_scene) {
+        memset(&slot->scene, 0, sizeof(slot->scene));
+        slot->prev_scene_id = 0;
+    }
+    if (!slot->in_use) {
+        return;
+    }
+    if (slot->collide_armed) { /* M9-B: the puppet (and so its collider) is going away */
+        printf("[NET][COLLIDE] player %d: collider DISARMED reason=gone\n", slot->peer_id);
+    }
+    pc_puppet_fx_dump_stats(slot, slot->peer_id);
+    memset(&slot->cos_stats, 0, sizeof(slot->cos_stats));
+    memset(slot->pk_ev, 0, sizeof(slot->pk_ev)); /* M9-C Phase 5: queued pickup events die with the player */
+    slot->collide_armed = 0;
+    slot->collide_target_ok = 0;
+    slot->latch_clear_req = 0; /* the actor (and its latch) is going away; a new actor starts with a clean visual */
+    if (pc_remote_player_actor_is_live(slot)) {
+        pc_puppet_sweat_kill((PCRemotePlayerActor*)slot->actor, "destroy"); /* review H1 */
+        /* Two-phase, matching every other actor kind: this only nulls mv_proc/dw_proc. The actor
+         * system reaps the memory and unlinks it from Actor_info during its normal per-frame
+         * sweep (Actor_info_call_actor / Actor_info_delete). Never free this pointer directly. */
+        Actor_delete(slot->actor);
+    }
+    slot->in_use = 0;
+    slot->pending_create = 0;
+    slot->lazily_discovered = 0;
+    slot->actor = NULL;
+    slot->has_sender_frame = 0;
+    slot->newest_sender_frame = 0;
+    slot->snapshot_count = 0;
+    slot->snapshot_head = 0;
+    slot->snap_req = 0;
+
+    /* Stage 4C-1: a genuine disconnect (unlike a scene-generation staleness event, which never
+     * calls this function) means whoever reconnects into this slot next -- possibly a completely
+     * different player -- must not start out able to render with the PREVIOUS occupant's
+     * appearance. resolved_appearance.ready gates pc_remote_player_visual_init() (see
+     * pc_remote_player_mv()), so clearing it here guarantees a freshly (re)connected peer always
+     * waits for its own real PC_NETGAME_MSG_APPEARANCE before ever becoming visible. */
+    slot->appearance.valid = 0;
+    slot->appearance.pending_resolve = 0;
+    slot->resolved_appearance.ready = 0;
+}
+
+void pc_remote_player_on_ready(PCNetPlayerId player_id, const PCNetGameIdentity* identity) {
+    PCRemotePlayerSlot* slot = pc_remote_player_acquire_slot(player_id);
+
+    if (slot == NULL) {
+        return;
+    }
+
+    if (slot->in_use) {
+        /* Shouldn't normally happen (a player id isn't reused while still tracked), but don't
+         * leak a stale actor if it somehow does. */
+        pc_remote_player_destroy_slot(slot, 0);
+    }
+
+    memset(&slot->scene, 0, sizeof(slot->scene)); /* M9-A: a new READY starts with no known scene */
+    slot->prev_scene_id = 0;
+    slot->in_use = 1;
+    slot->pending_create = 1;
+    slot->lazily_discovered = 0; /* a direct handshake, not a relay discovery */
+    slot->actor = NULL;
+    if (identity != NULL) {
+        slot->identity = *identity;
+    } else {
+        memset(&slot->identity, 0, sizeof(slot->identity));
+    }
+
+    printf("[NET][REMOTE] player %d READY -- remote-player actor creation pending\n", (int)player_id);
+}
+
+void pc_remote_player_on_disconnect(PCNetPlayerId player_id) {
+    PCRemotePlayerSlot* slot = pc_remote_player_find_slot(player_id);
+    if (slot == NULL) {
+        return;
+    }
+    if (slot->in_use) {
+        printf("[NET][REMOTE] player %d disconnected -- destroying remote-player actor\n", (int)player_id);
+    }
+    pc_remote_player_destroy_slot(slot, 0);
+    pc_puppet_pool_release(&s_pool, (int)player_id); /* capacity phase 6: the slot (its appearance, scene and snapshot ring) is gone: a reused id starts from nothing */
+}
+
+/* A relayed player the host says is gone (CLEARED notice) or whose id this client can no longer trust: everything about it is dropped, like a disconnect. */
+void pc_remote_player_forget(PCNetPlayerId player_id) {
+    pc_remote_player_on_disconnect(player_id);
+}
+
+void pc_remote_player_on_move(PCNetPlayerId player_id, const PCNetMoveSample* sample) {
+    PCRemotePlayerSlot* slot = pc_remote_player_acquire_slot(player_id);
+    PCRemoteMoveSnapshot* snap;
+    double now;
+
+    if (slot == NULL || sample == NULL) {
+        return;
+    }
+
+    if (!slot->in_use) {
+        /* Learned about this player purely through movement data -- e.g. a client seeing another
+         * client's movement relayed by the host, having never handshaken with them directly.
+         * Create the tracking slot lazily, matching on_ready()'s bookkeeping but with no captured
+         * identity (there was no IDENTITY exchange to capture one from). Only slots created this
+         * way are ever cleaned up by poll()'s liveness timeout below, since this is the only path
+         * that has no matching PC_NET_EVENT_PEER_DISCONNECTED to rely on instead. */
+        slot->in_use = 1;
+        slot->pending_create = 1;
+        slot->lazily_discovered = 1;
+        slot->actor = NULL;
+        memset(&slot->identity, 0, sizeof(slot->identity));
+        printf("[NET][REMOTE] player %d discovered via movement relay -- remote-player actor creation pending\n",
+               (int)player_id);
+    }
+
+    if (slot->has_sender_frame && sample->sender_frame <= slot->newest_sender_frame) {
+        printf("[NET][REMOTE][DIAG] rejected stale/duplicate/reordered sample for player %d: "
+               "incoming.frame=%u <= newest=%u\n",
+               (int)player_id, (unsigned)sample->sender_frame, (unsigned)slot->newest_sender_frame);
+        return; /* stale, duplicate, or reordered -- reject (see PCNetMoveSample's doc) */
+    }
+    slot->newest_sender_frame = sample->sender_frame;
+    slot->has_sender_frame = 1;
+
+    now = (gamePT != NULL) ? graph_dt_frame_time(gamePT) : 0.0;
+
+    snap = &slot->snapshots[slot->snapshot_head];
+    snap->recv_local_frame = now;
+    snap->pos_x = sample->pos_x;
+    snap->pos_y = sample->pos_y;
+    snap->pos_z = sample->pos_z;
+    snap->facing_angle = sample->facing_angle;
+    snap->speed = sample->speed;
+    snap->move_state = sample->move_state;
+    snap->item_kind = sample->item_kind;
+    snap->action_index = sample->action_index;
+    snap->action_counter = sample->action_counter;
+    snap->action_valid = sample->action_valid;
+
+    slot->snapshot_head = (slot->snapshot_head + 1) % PC_REMOTE_PLAYER_SNAPSHOT_COUNT;
+    if (slot->snapshot_count < PC_REMOTE_PLAYER_SNAPSHOT_COUNT) {
+        slot->snapshot_count++;
+    }
+    slot->last_move_recv_local_frame = now;
+}
+
+int pc_remote_player_on_action(PCNetPlayerId player_id, int kind, int ut_x, int ut_z, uint16_t item, uint16_t seq) {
+    PCRemotePlayerSlot* slot = pc_remote_player_find_slot(player_id);
+    PCRemotePickupEvent* ev = NULL;
+    double now;
+    int i;
+
+    if (slot == NULL || !slot->in_use || kind != 1 || ut_x < 0 || ut_x > 255 || ut_z < 0 || ut_z > 255 || item == 0u ||
+        item == 0xFFFFu) {
+        pc_pk_diag_event((int)player_id, seq, ut_x, ut_z, item, "ignored", "invalid");
+        return 0;
+    }
+    now = (gamePT != NULL) ? graph_dt_frame_time(gamePT) : 0.0;
+    for (i = 0; i < PC_PUPPET_PK_RING; i++) {
+        if (!slot->pk_ev[i].valid) {
+            ev = &slot->pk_ev[i];
+            break;
+        }
+    }
+    if (ev == NULL) { /* ring full: the oldest one is evicted (it can no longer be paired in order anyway) */
+        ev = &slot->pk_ev[0];
+        for (i = 1; i < PC_PUPPET_PK_RING; i++) {
+            if (slot->pk_ev[i].arrival < ev->arrival) {
+                ev = &slot->pk_ev[i];
+            }
+        }
+        slot->cos_stats.pk_dropped++;
+        pc_pk_diag_event((int)player_id, ev->seq, ev->ux, ev->uz, ev->item, "dropped", "evicted");
+    }
+    ev->valid = 1;
+    ev->seq = seq;
+    ev->ux = (uint8_t)ut_x;
+    ev->uz = (uint8_t)ut_z;
+    ev->item = item;
+    ev->arrival = now;
+    slot->cos_stats.pk_events++;
+    pc_pk_diag_event((int)player_id, seq, ut_x, ut_z, item, "pending", NULL);
+    return 1;
+}
+
+void pc_remote_player_on_appearance(PCNetPlayerId player_id, const PCNetPlayerAppearance* appearance) {
+    PCRemotePlayerSlot* slot = pc_remote_player_acquire_slot(player_id);
+    PCClothChg* cc;
+    int cloth_new;
+
+    if (slot == NULL || appearance == NULL) {
+        return;
+    }
+    /* PUPPET CLOTH CHANGE (CL): a clothing change of a shown outfit is held for the puppet's change animation (see the block above) */
+    cc = ((int)player_id >= 0 && (int)player_id < PC_PUPPET_ID_LIMIT) ? &s_cloth_chg[(int)player_id] : NULL;
+    if (cc != NULL && !slot->appearance.valid) {
+        cc->hold = 0; /* a new occupant of this id: its first appearance is never animated */
+    }
+    cloth_new = slot->appearance.valid && slot->resolved_appearance.ready && pc_puppet_cloth_differs(&slot->appearance, appearance);
+
+    /* Deliberately no `slot->in_use` gate here, matching pc_remote_player_on_move()'s own
+     * lazy-discovery pattern above: appearance is tracked independently of the handshake/movement
+     * bookkeeping (see this function's own doc comment in pc_remote_player.h), so it must be
+     * captured whichever of on_ready()/on_move()/on_appearance() happens to arrive first for this
+     * player_id. */
+    slot->appearance.valid = 1;
+    slot->appearance.gender = appearance->gender;
+    slot->appearance.face = appearance->face;
+    slot->appearance.sunburn_rank = (uint8_t)(appearance->sunburn_rank & ~PC_REMOTE_APPEAR_SWELL_BIT);
+    slot->appearance.is_custom_design = appearance->is_custom_design;
+    slot->appearance.bee_swell = (appearance->sunburn_rank & PC_REMOTE_APPEAR_SWELL_BIT) ? 1 : 0; /* P1 */
+    slot->appearance.cloth_item = appearance->cloth_item;
+    if (appearance->is_custom_design) {
+        /* Only copied when actually meaningful -- design_record is otherwise unpacked but unused
+         * padding on the wire for a catalog-clothing player (see PCNetPlayerAppearance's doc). */
+        memcpy(&slot->appearance.design, appearance->design_record, sizeof(slot->appearance.design));
+    }
+
+    /* Set unconditionally on every arrival, BEFORE attempting to resolve -- pc_remote_player_poll()
+     * uses this (never resolved_appearance.ready) to know a retry is needed, since `ready` can
+     * still be 1 from an earlier, different appearance. See pc_remote_player_apply_appearance()'s
+     * doc comment. */
+    slot->appearance.pending_resolve = 1;
+
+    if (cc != NULL && cloth_new && !cc->hold && pc_puppet_cloth_enabled() && gamePT != NULL && gamePT->exec == play_main &&
+        slot->in_use && slot->actor != NULL) {
+        cc->hold = 1;
+        cc->deadline = graph_dt_frame_time(gamePT) + PC_CLOTH_HOLD_FRAMES;
+        cc->held++;
+        pc_puppet_cloth_log((int)player_id, "held for the change animation", "appearance", 0.0f);
+    }
+    if (cc == NULL || !cc->hold) {
+        pc_remote_player_apply_appearance(slot);
+    } /* else: resolved by pc_puppet_cloth_step() at the change frame, or by pc_remote_player_poll() when the hold expires */
+
+    printf("[NET][REMOTE][DIAG] player %d: appearance received (gender=%d face=%d sunburn=%d cloth_item=%d %s)\n",
+           (int)player_id, (int)appearance->gender, (int)appearance->face, (int)slot->appearance.sunburn_rank,
+           (int)appearance->cloth_item, appearance->is_custom_design ? "custom-design" : "catalog");
+    printf("[NET][REMOTE][DIAG] player %d: bee swell face %s\n", (int)player_id, slot->appearance.bee_swell ? "on" : "off"); /* P1 */
+}
+
+int pc_remote_player_get_appearance(PCNetPlayerId player_id, PCNetPlayerAppearance* out) {
+    PCRemotePlayerSlot* slot = pc_remote_player_find_slot(player_id);
+
+    if (slot == NULL || out == NULL || !slot->appearance.valid) {
+        return 0;
+    }
+
+    /* Zero first: `design_record` must never carry stale bytes onto the wire. If this slot was
+     * previously occupied by a custom-design-wearing player and is now occupied by a
+     * catalog-clothing one, slot->appearance.design still physically holds the PREVIOUS
+     * occupant's design bytes (pc_remote_player_on_appearance() only overwrites `design` when the
+     * NEW appearance itself is custom -- see its own doc comment) -- zeroing here, then copying it
+     * out only when is_custom_design is set, matches the exact "only meaningful when
+     * is_custom_design" convention PCNetPlayerAppearance/PCNetGameAppearanceMsg already use, and
+     * guarantees a resent/backfilled catalog-clothing appearance never leaks anyone else's
+     * leftover design pixels. */
+    memset(out, 0, sizeof(*out));
+    out->gender = slot->appearance.gender;
+    out->face = slot->appearance.face;
+    out->sunburn_rank = (uint8_t)(slot->appearance.sunburn_rank |
+                                  (slot->appearance.bee_swell ? PC_REMOTE_APPEAR_SWELL_BIT : 0u)); /* P1: relayed / backfilled */
+    out->is_custom_design = slot->appearance.is_custom_design;
+    out->cloth_item = slot->appearance.cloth_item;
+    if (slot->appearance.is_custom_design) {
+        memcpy(out->design_record, &slot->appearance.design, sizeof(out->design_record));
+    }
+
+    return 1;
+}
+
+/* M9-A: see pc_remote_player.h. Accepts only a scene whose seq is strictly newer than the stored one. */
+int pc_remote_player_on_scene(PCNetPlayerId player_id, const PCNetPlayerScene* scene) {
+    PCRemotePlayerSlot* slot = pc_remote_player_acquire_slot(player_id);
+
+    if (slot == NULL || scene == NULL || !scene->valid) {
+        return 0;
+    }
+    if (slot->scene.valid && scene->seq <= slot->scene.seq) {
+        return 0;
+    }
+    if (slot->scene.valid && slot->scene.scene_id != scene->scene_id) {
+        slot->prev_scene_id = slot->scene.scene_id; /* the interior an arriving OUTDOOR row came out of (door class) */
+    }
+    slot->scene = *scene;
+    slot->scene.valid = 1;
+    slot->latch_clear_req = 1; /* M9-C v7: scene presence changed -> drop any one-shot latch at the next puppet move */
+    slot->snap_req = 1;        /* building interactions: hidden until the first MOVE received after this event; older samples are dropped */
+    slot->scene_accept_frame = (gamePT != NULL) ? graph_dt_frame_time(gamePT) : 0.0;
+    return 1;
+}
+
+void pc_remote_player_clear_scene(PCNetPlayerId player_id) {
+    PCRemotePlayerSlot* slot = pc_remote_player_find_slot(player_id);
+    if (slot != NULL) {
+        memset(&slot->scene, 0, sizeof(slot->scene));
+        slot->prev_scene_id = 0;
+        slot->latch_clear_req = 1; /* M9-C v7: see pc_remote_player_on_scene() */
+        if (!slot->in_use && !slot->appearance.valid && slot->actor == NULL) {
+            pc_puppet_pool_release(&s_pool, (int)player_id); /* capacity phase 6: an empty slot is not kept */
+        }
+    }
+}
+
+/* M9-B TEST-ONLY accessor: see pc_remote_player.h. */
+int pc_remote_player_collide_test_target(float* out_x, float* out_y, float* out_z) {
+    int i;
+
+    for (i = pc_puppet_pool_next(&s_pool, 0); i >= 0; i = pc_puppet_pool_next(&s_pool, i + 1)) {
+        PCRemotePlayerSlot* slot = pc_remote_player_find_slot(i);
+        if (slot->in_use && slot->collide_target_ok && pc_remote_player_actor_is_live(slot) &&
+            (uint64_t)(uintptr_t)slot->actor < PC_LOWADDR_LIMIT) {
+            *out_x = slot->actor->world.position.x;
+            *out_y = slot->actor->world.position.y;
+            *out_z = slot->actor->world.position.z;
+            return 1;
+        }
+    }
+    return 0;
+}
+
+/* HOST villager push (called only from ac_npc_move.c_inc aNPC_pc_host_puppet_push, which is HOST-role gated). The puppet pipe
+ * pairs only with the local player (flags {0x09,0x10}), so on the host a CLIENT player walking into a villager never pushed it,
+ * and the client's own push is overwritten by the host pose (the villager behaved like a wall). This replays, for one
+ * villager, exactly what CollisionCheck_setOC_HitInfo would add to the NPC's collision_vec for a real player pipe at each
+ * eligible puppet's position: player pipe radius 20 / height 60, player NORMAL weight 50 (not the puppet's light passability
+ * weight), NPC fraction 50/(w+50) for a NORMAL NPC, 0 for HEAVY/IMMOVABLE/priority/DONT_UPDATE_POS. It does NOT touch the OC
+ * collider table (cannot starve the player<->puppet pair) or collided_actor. Eligible puppet: live, town FIELD scene shared with
+ * this process, visible, initialised, no door/knock/outdoor row, not stale (collide_hold is NOT consulted: it is only decremented
+ * on the armed local-player path, so it sticks on an observer host / out of range). Returns the number of contacts. */
+int pc_remote_player_host_npc_push(GAME* game, const ACTOR* npc, float npc_radius, float npc_offset, float npc_height,
+                                   int npc_pipe_flags0, float* out_dx, float* out_dz) {
+    GAME_PLAY* play = (GAME_PLAY*)game;
+    float frac;
+    int i;
+    int contacts = 0;
+    u8 w;
+
+    *out_dx = 0.0f;
+    *out_dz = 0.0f;
+    if (game == NULL || npc == NULL || _Game_play_isPause(play) == 1 ||
+        (npc_pipe_flags0 & (ClObj_FLAG_DONT_UPDATE_POS | ClObj_FLAG_COLLISION_PRIORITY)) != 0) {
+        return 0;
+    }
+    w = npc->status_data.weight;
+    if (w == MASSTYPE_IMMOVABLE || w == MASSTYPE_HEAVY) {
+        return 0; /* NORMAL player vs HEAVY/IMMOVABLE NPC: the NPC takes none of the push */
+    }
+    frac = 50.0f / ((float)w + 50.0f);
+    for (i = pc_puppet_pool_next(&s_pool, 0); i >= 0; i = pc_puppet_pool_next(&s_pool, i + 1)) {
+        PCRemotePlayerSlot* slot = pc_remote_player_find_slot(i);
+        PCRemotePlayerActor* self;
+        float dx, dz, dist, overlap;
+        float py, ny;
+
+        if (!slot->in_use || !pc_remote_player_actor_is_live(slot) || (uint64_t)(uintptr_t)slot->actor >= PC_LOWADDR_LIMIT) {
+            continue;
+        }
+        self = (PCRemotePlayerActor*)slot->actor;
+        if (!pc_remote_player_scene_is_local_field(slot, play) || slot->snapshot_count == 0 || !self->visual.initialized ||
+            slot->snap_req || pc_remote_player_body_hidden(self) ||
+            (self->visual.row_active && (self->visual.row_idx == (int)mPlayer_INDEX_KNOCK_DOOR ||
+                                         self->visual.row_idx == (int)mPlayer_INDEX_DOOR ||
+                                         self->visual.row_idx == (int)mPlayer_INDEX_OUTDOOR)) ||
+            (graph_dt_frame_time(game) - slot->last_move_recv_local_frame) > PC_REMOTE_PLAYER_ACTION_GAP_FRAMES) {
+            continue;
+        }
+        /* Math3D_pipeVsPipe_cl: XZ distance <= r1 + r2 and overlapping vertical spans */
+        dx = npc->world.position.x - self->actor_class.world.position.x;
+        dz = npc->world.position.z - self->actor_class.world.position.z;
+        dist = sqrtf(dx * dx + dz * dz);
+        if (!(dist <= npc_radius + 20.0f)) {
+            continue; /* also rejects NaN */
+        }
+        py = self->actor_class.world.position.y;
+        ny = npc->world.position.y + npc_offset;
+        if (py + 60.0f < ny || py > ny + npc_height) {
+            continue;
+        }
+        overlap = npc_radius + 20.0f - dist;
+        if (dist != 0.0f) {
+            *out_dx += dx * (overlap / dist) * frac;
+            *out_dz += dz * (overlap / dist) * frac;
+        } else {
+            *out_dx += overlap * frac;
+        }
+        contacts++;
+    }
+    return contacts;
+}
+
+/* ---- player-vs-player tool hits (pc_pvp_authority.h): read-only puppet queries ---- */
+extern int pc_net_game_pvp_test_off(void); /* pc_net_game.c: TEST-ONLY AC_TEST_PVP_OFF (0 in normal play) */
+
+int pc_pvp_is_puppet_actor(const void* actor) {
+    const ACTOR* a = (const ACTOR*)actor;
+    return a != NULL && a->mv_proc == pc_remote_player_mv && a->dw_proc == pc_remote_player_dw && !pc_net_game_pvp_test_off();
+}
+
+/* "world behind menus" (m_play.c Game_play_pc_submenu_live_tick): 1 iff ACTOR is a live remote-player puppet (no pvp test gate) */
+int pc_remote_player_is_puppet_actor(const void* actor) {
+    const ACTOR* a = (const ACTOR*)actor;
+    return a != NULL && a->mv_proc == pc_remote_player_mv && a->dw_proc == pc_remote_player_dw;
+}
+
+/* the pvp-eligible puppet of a slot: live, in the SAME town field as this process, visible, placed, not stale, no door row */
+static PCRemotePlayerActor* pc_remote_player_pvp_eligible(PCRemotePlayerSlot* slot, GAME_PLAY* play) {
+    PCRemotePlayerActor* self;
+    if (!slot->in_use || !pc_remote_player_actor_is_live(slot) || (uint64_t)(uintptr_t)slot->actor >= PC_LOWADDR_LIMIT) {
+        return NULL;
+    }
+    self = (PCRemotePlayerActor*)slot->actor;
+    if (!pc_remote_player_scene_is_local_field(slot, play) || slot->snapshot_count == 0 || !self->visual.initialized || slot->snap_req ||
+        pc_remote_player_body_hidden(self) ||
+        (self->visual.row_active && (self->visual.row_idx == (int)mPlayer_INDEX_KNOCK_DOOR || self->visual.row_idx == (int)mPlayer_INDEX_DOOR ||
+                                     self->visual.row_idx == (int)mPlayer_INDEX_OUTDOOR)) ||
+        (graph_dt_frame_time((GAME*)play) - slot->last_move_recv_local_frame) > PC_REMOTE_PLAYER_ACTION_GAP_FRAMES) {
+        return NULL;
+    }
+    return self;
+}
+
+int pc_pvp_puppet_targets(int* ids, float (*pos)[3], int max) {
+    GAME_PLAY* play;
+    int i, n = 0;
+    if (gamePT == NULL || gamePT->exec != play_main || ids == NULL || pos == NULL || max <= 0 || !s_pool_ready) {
+        return 0;
+    }
+    play = (GAME_PLAY*)gamePT;
+    for (i = pc_puppet_pool_next(&s_pool, 0); i >= 0 && n < max; i = pc_puppet_pool_next(&s_pool, i + 1)) {
+        PCRemotePlayerSlot* slot = pc_remote_player_find_slot(i);
+        PCRemotePlayerActor* self = (slot != NULL) ? pc_remote_player_pvp_eligible(slot, play) : NULL;
+        if (self == NULL) {
+            continue;
+        }
+        ids[n] = slot->peer_id;
+        pos[n][0] = self->actor_class.world.position.x;
+        pos[n][1] = self->actor_class.world.position.y;
+        pos[n][2] = self->actor_class.world.position.z;
+        n++;
+    }
+    return n;
+}
+
+int pc_pvp_puppet_near(float x, float z, float radius) {
+    int ids[64];
+    float pos[64][3];
+    const int n = pc_net_game_pvp_test_off() ? 0 : pc_pvp_puppet_targets(ids, pos, 64);
+    int i;
+    for (i = 0; i < n; i++) {
+        const float dx = pos[i][0] - x, dz = pos[i][2] - z;
+        if (dx * dx + dz * dz < radius * radius) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+int pc_remote_player_get_scene(PCNetPlayerId player_id, PCNetPlayerScene* out) {
+    PCRemotePlayerSlot* slot = pc_remote_player_find_slot(player_id);
+    if (slot == NULL || out == NULL || !slot->scene.valid) {
+        return 0;
+    }
+    *out = slot->scene;
+    return 1;
+}
+
+/* --dedicated console accessor: see pc_remote_player.h. Read-only. */
+/* Shared train arrival: see pc_remote_arrival_logic.h. Reads the per-slot canonical storage only (scene presence + the newest MOVE sample), never the puppet actors. */
+int pc_remote_arrival_join_query(int* join_class, float* train_x) {
+    const double now = (gamePT != NULL) ? graph_dt_frame_time(gamePT) : 0.0;
+    /* Hotfix 0.2.1: the hold is bounded (pc_remote_arrival_logic.h PCARR_JOIN_*_MS). Its clock is the monotonic ms clock of the net layer; a hold not polled for > 1 s is a new hold
+     * (first_set polls every frame while it holds; a scene change in between starts over). */
+    static int s_hold_active = 0, s_hold_ready_seen = 0, s_hold_polls = 0;
+    static uint32_t s_hold_begin_ms = 0, s_hold_last_ms = 0, s_hold_ready_ms = 0, s_hold_trace_ms = 0;
+    const uint32_t now_ms = pc_net_game_now_ms();
+    PCNetGameLinkState link;
+    int i, n_stopped = 0, n_riding = 0, unknown = 0, others = 0, roster_pending, decided, timeout;
+    unsigned held_ms, since_ready_ms;
+    float riding_x = 0.0f;
+
+    *join_class = PCARR_JOIN_NONE;
+    *train_x = 0.0f;
+    if (pc_net_game_role() != PC_NETGAME_ROLE_CLIENT) {
+        return 1;
+    }
+    link = pc_net_game_client_link_state();
+    if (!s_hold_active || (uint32_t)(now_ms - s_hold_last_ms) > 1000u) {
+        s_hold_active = 1;
+        s_hold_ready_seen = 0;
+        s_hold_polls = 0;
+        s_hold_begin_ms = now_ms;
+        s_hold_trace_ms = now_ms - PCARR_JOIN_HOLD_TRACE_MS; /* the first held poll traces at once */
+    }
+    s_hold_last_ms = now_ms;
+    if (link == PC_NETGAME_LINK_READY && !s_hold_ready_seen) {
+        s_hold_ready_seen = 1;
+        s_hold_ready_ms = now_ms;
+    }
+    held_ms = (unsigned)(now_ms - s_hold_begin_ms);
+    since_ready_ms = s_hold_ready_seen ? (unsigned)(now_ms - s_hold_ready_ms) : 0u;
+    for (i = pc_puppet_pool_next(&s_pool, 0); i >= 0; i = pc_puppet_pool_next(&s_pool, i + 1)) {
+        const PCRemotePlayerSlot* slot = pc_remote_player_find_slot(i);
+        const PCRemoteMoveSnapshot* newest;
+        double since_move, since_scene;
+        int cls;
+
+        if (!slot->in_use || !slot->scene.valid || slot->scene.scene_id != (uint8_t)SCENE_FG || (slot->scene.flags & PC_NETGAME_SCENE_FLAG_IN_TOWN) == 0) {
+            continue;
+        }
+        others++;
+        since_scene = (now >= slot->scene_accept_frame) ? now - slot->scene_accept_frame : 0.0; /* the frame clock restarts with every GAME_PLAY */
+        if (slot->snapshot_count == 0) {
+            /* its first MOVE is still on the way; bounded by the same silence gap the puppet code uses AND (hotfix 0.2.1) by a wall-clock window after READY: the frame clock above
+             * restarts with every GAME_PLAY, so a scene accepted in an earlier GAME_PLAY read 'just accepted' for a long time */
+            if (since_scene <= PC_REMOTE_PLAYER_ACTION_GAP_FRAMES && pcarr_join_unknown_counts(s_hold_ready_seen, since_ready_ms)) {
+                unknown++;
+            }
+            continue;
+        }
+        since_move = (now >= slot->last_move_recv_local_frame) ? now - slot->last_move_recv_local_frame : 0.0;
+        if (since_move > PC_REMOTE_PLAYER_ACTION_GAP_FRAMES) {
+            continue; /* silent (vanished / frozen): not an arrival */
+        }
+        newest = &slot->snapshots[(slot->snapshot_head + PC_REMOTE_PLAYER_SNAPSHOT_COUNT - 1) % PC_REMOTE_PLAYER_SNAPSHOT_COUNT];
+        cls = pcarr_join_class(newest->action_valid, newest->action_index, (int)mPlayer_INDEX_DEMO_STANDING_TRAIN, (int)mPlayer_INDEX_DEMO_GETOFF_TRAIN, (int)mPlayer_INDEX_DEMO_WALK,
+                               (int)mPlayer_INDEX_TALK, (int)mPlayer_INDEX_DEMO_WAIT, newest->pos_x, newest->pos_z);
+        if (cls == PCARR_JOIN_STOPPED) {
+            n_stopped++;
+        } else if (cls == PCARR_JOIN_RIDING) {
+            if (n_riding == 0 || newest->pos_x > riding_x) {
+                riding_x = newest->pos_x; /* the furthest-along passenger: that train is the one to join */
+            }
+            n_riding++;
+        }
+    }
+    roster_pending = link == PC_NETGAME_LINK_READY && !pc_net_game_client_world_synced();
+    if (link == PC_NETGAME_LINK_READY && pc_net_game_test_arrival_roster_stall()) {
+        roster_pending = 1; /* TEST-ONLY (test builds + AC_TEST_HOOKS=1 + AC_TEST_ARRIVAL_ROSTER_STALL=1; always 0 otherwise): exercises the hold limit */
+    }
+    decided = pcarr_join_decide(link == PC_NETGAME_LINK_HANDSHAKE, link == PC_NETGAME_LINK_READY, roster_pending, unknown, n_stopped, n_riding);
+    timeout = decided < 0 ? pcarr_join_hold_timeout(held_ms, s_hold_ready_seen, since_ready_ms) : PCARR_HOLD_KEEP;
+    if (decided < 0 && timeout == PCARR_HOLD_KEEP) {
+        if (s_hold_polls == 0) {
+            printf("[TRAIN] arrival join: the guest's arrival waits for the host's roster of who is arriving (link %s, %d state(s) not known yet)\n", link == PC_NETGAME_LINK_READY ? "READY" : "handshake", unknown);
+        }
+        s_hold_polls++;
+        if ((uint32_t)(now_ms - s_hold_trace_ms) >= PCARR_JOIN_HOLD_TRACE_MS) {
+            s_hold_trace_ms = now_ms;
+            pc_net_game_join_trace("arrival hold: held %u ms (link=%s, roster_pending=%d, unknown=%d, others=%d, stopped=%d, riding=%d, ready_for=%u ms)", held_ms,
+                                   link == PC_NETGAME_LINK_READY ? "READY" : link == PC_NETGAME_LINK_HANDSHAKE ? "HANDSHAKE" : "other", roster_pending, unknown, others, n_stopped,
+                                   n_riding, since_ready_ms);
+        }
+        return 0;
+    }
+    if (decided < 0) {
+        decided = pcarr_join_decide_bounded(decided, timeout, n_stopped, n_riding);
+        printf("[TRAIN] arrival join: hold timed out after %u.%u s (%s; link=%s, roster_pending=%d, unknown=%d, others=%d) -> starting the arrival\n", held_ms / 1000u,
+               (held_ms % 1000u) / 100u, timeout == PCARR_HOLD_TIMEOUT_READY ? "4.5 s after READY" : "15 s in total",
+               link == PC_NETGAME_LINK_READY ? "READY" : link == PC_NETGAME_LINK_HANDSHAKE ? "HANDSHAKE" : "other", roster_pending, unknown, others);
+    }
+    pc_net_game_join_trace("arrival decided after %u ms held (%s): class %s (link=%s, roster_pending=%d, unknown=%d, others=%d, stopped=%d, riding=%d)", held_ms,
+                           timeout != PCARR_HOLD_KEEP ? "hold timed out" : s_hold_polls > 0 ? "roster known" : "at once", decided == PCARR_JOIN_STOPPED ? "STOPPED" : decided == PCARR_JOIN_RIDING ? "RIDING" : "NONE",
+                           link == PC_NETGAME_LINK_READY ? "READY" : link == PC_NETGAME_LINK_HANDSHAKE ? "HANDSHAKE" : "other", roster_pending, unknown, others, n_stopped, n_riding);
+    s_hold_active = 0;
+    *join_class = decided;
+    if (decided == PCARR_JOIN_RIDING) {
+        *train_x = pcarr_join_train_x(riding_x);
+    }
+    printf("[TRAIN] arrival join: %s (%d other player(s) stopped at the station, %d riding)\n",
+           decided == PCARR_JOIN_STOPPED ? "JOINING the arrival that is at the station (the local train starts stopped, doors open)" :
+           decided == PCARR_JOIN_RIDING ? "JOINING the arrival that is riding in (the local train starts where the other passenger's is)" : "no other arrival: the normal arrival starts",
+           n_stopped, n_riding);
+    return 1;
+}
+
+int pc_remote_player_puppet_state(PCNetPlayerId player_id) {
+    PCRemotePlayerSlot* slot = pc_remote_player_find_slot(player_id);
+    if (slot == NULL || !slot->in_use) {
+        return 0;
+    }
+    return pc_remote_player_actor_is_live(slot) ? 2 : 1;
+}
+
+/* ===== CHAT (worker CH) BEGIN: the drawn (interpolated) world position of a live puppet, for the speech bubble above it. Read-only. ===== */
+int pc_remote_player_get_draw_position(PCNetPlayerId player_id, float* out_x, float* out_y, float* out_z) {
+    PCRemotePlayerSlot* slot = pc_remote_player_find_slot(player_id);
+    if (slot == NULL || !slot->in_use || !pc_remote_player_actor_is_live(slot) || (uint64_t)(uintptr_t)slot->actor >= PC_LOWADDR_LIMIT) {
+        return 0;
+    }
+    *out_x = slot->actor->world.position.x;
+    *out_y = slot->actor->world.position.y;
+    *out_z = slot->actor->world.position.z;
+    return 1;
+}
+/* ===== CHAT (worker CH) END ===== */
+
+/* Stage 5A: see the doc comment in pc_remote_player.h. Reads the NEWEST entry of the same
+ * snapshot ring pc_remote_player_interpolate() already consumes for rendering -- `snapshot_head`
+ * is "the index the NEXT snapshot will be written to" (see its own field doc above), so the most
+ * recent one is always one slot behind it. Deliberately does not interpolate/predict: this is an
+ * authorization check, not a render position, so the exact last-confirmed sample is the right
+ * thing to validate against, not a smoothed guess. */
+int pc_remote_player_get_last_position(PCNetPlayerId player_id, float* out_x, float* out_y, float* out_z) {
+    PCRemotePlayerSlot* slot = pc_remote_player_find_slot(player_id);
+    int newest;
+
+    if (slot == NULL || out_x == NULL || out_y == NULL || out_z == NULL || slot->snapshot_count == 0) {
+        return 0;
+    }
+
+    newest = (slot->snapshot_head - 1 + PC_REMOTE_PLAYER_SNAPSHOT_COUNT) % PC_REMOTE_PLAYER_SNAPSHOT_COUNT;
+    *out_x = slot->snapshots[newest].pos_x;
+    *out_y = slot->snapshots[newest].pos_y;
+    *out_z = slot->snapshots[newest].pos_z;
+    return 1;
+}
+
+/* Stage 5B-2: see the doc comment in pc_remote_player.h. Exact sibling of
+ * pc_remote_player_get_last_position() above -- same slot lookup, same "newest = one behind
+ * snapshot_head" index, same no-interpolation reasoning (an authorization input, not a render
+ * value) -- so a caller reading both back-to-back in one synchronous step always gets the position
+ * and facing of the SAME accepted sample. */
+int pc_remote_player_get_last_facing_angle(PCNetPlayerId player_id, int16_t* out_angle) {
+    PCRemotePlayerSlot* slot = pc_remote_player_find_slot(player_id);
+    int newest;
+
+    if (slot == NULL || out_angle == NULL || slot->snapshot_count == 0) {
+        return 0;
+    }
+
+    newest = (slot->snapshot_head - 1 + PC_REMOTE_PLAYER_SNAPSHOT_COUNT) % PC_REMOTE_PLAYER_SNAPSHOT_COUNT;
+    *out_angle = slot->snapshots[newest].facing_angle;
+    return 1;
+}
+
+int pc_remote_player_get_last_motion(PCNetPlayerId player_id, uint8_t* out_move_state, uint8_t* out_action_index) {
+    PCRemotePlayerSlot* slot = pc_remote_player_find_slot(player_id);
+    int newest;
+
+    if (slot == NULL || out_move_state == NULL || out_action_index == NULL || slot->snapshot_count == 0) {
+        return 0;
+    }
+    newest = (slot->snapshot_head - 1 + PC_REMOTE_PLAYER_SNAPSHOT_COUNT) % PC_REMOTE_PLAYER_SNAPSHOT_COUNT;
+    *out_move_state = slot->snapshots[newest].move_state;
+    *out_action_index = slot->snapshots[newest].action_valid ? slot->snapshots[newest].action_index : 0;
+    return 1;
+}
+
+/* Stage 3 diagnostic: periodically logs each tracked remote player's current (interpolated)
+ * actor position, purely so movement replication can be verified from stdout/log output alone --
+ * there is no other way to observe a remote actor's live state without a graphical session. Not
+ * gameplay-affecting; safe to leave in. */
+static float s_diag_dump_accum = 0.0f;
+#define PC_REMOTE_PLAYER_DIAG_DUMP_PERIOD_60FPS_FRAMES 60.0f /* ~1s */
+
+void pc_remote_player_poll(void) {
+    PLAYER_ACTOR* local;
+    GAME_PLAY* play;
+    double now;
+    int i;
+    int dump_now;
+
+    if (gamePT == NULL || gamePT->exec != play_main) {
+        /* No running GAME_PLAY (still booting / at a menu): gamePT may be a much smaller GAME_SECOND etc., and
+         * GET_PLAYER_ACTOR_NOW() / play->collision_check would read adjacent heap (boot-crash root cause). Nothing in this poll
+         * is needed outside a GAME_PLAY: the scene generation is re-derived at the first play poll (gamePT / frame_counter change). */
+        return;
+    }
+    local = GET_PLAYER_ACTOR_NOW();
+    if (local == NULL || (uint64_t)(uintptr_t)local >= PC_LOWADDR_LIMIT) {
+        /* GAME_PLAY exists but the local player actor doesn't (yet) -- defer and retry. The
+         * low-address check catches a real, observed transitional case: right around a scene
+         * transition, gamePT can be non-NULL before that GAME_PLAY's actor_info is actually
+         * constructed (see pc_net_game.c's pcnetgame_is_real_player_actor() for the full
+         * explanation), which otherwise reads a non-NULL but garbage ACTOR* here. */
+        return;
+    }
+    /* Only reached once `local`'s low-address check has confirmed this GAME_PLAY's actor_info (and
+     * therefore everything game_ct()/play_init() sets up before it, including frame_counter) is
+     * genuinely constructed -- see s_scene_generation's doc comment above for why this check must
+     * not run any earlier than this. */
+    if (gamePT != s_last_seen_game || gamePT->frame_counter < s_last_seen_frame_counter) {
+        s_scene_generation++;
+    }
+    s_last_seen_game = gamePT;
+    s_last_seen_frame_counter = gamePT->frame_counter;
+
+    play = (GAME_PLAY*)gamePT;
+    now = graph_dt_frame_time(gamePT);
+
+    /* M9-B diagnostic (read-only): peak size of the shared OC collider table, sampled once per poll. Poll runs
+     * between game frames, so this is the final count of the last completed frame. Logged only on a new peak
+     * and only while a remote player is tracked, so single-player logs stay quiet. */
+    for (i = pc_puppet_pool_next(&s_pool, 0); i >= 0; i = pc_puppet_pool_next(&s_pool, i + 1)) {
+        if (pc_remote_player_find_slot(i)->in_use) {
+            int n = play->collision_check.collider_num;
+            if (n > s_collide_peak_colliders) {
+                s_collide_peak_colliders = n;
+                printf("[NET][COLLIDE][DIAG] OC collider_num new peak=%d (table size %d) failed_setoc=%d\n", n,
+                       Cl_COLLIDER_NUM, s_collide_failed_setoc);
+            }
+            break;
+        }
+    }
+    dump_now = graph_dt_period_elapsed(gamePT, &s_diag_dump_accum, PC_REMOTE_PLAYER_DIAG_DUMP_PERIOD_60FPS_FRAMES);
+
+    pc_remote_player_init_profile();
+
+    s_actor_blocked = 0;
+    if (play->actor_info.total_num > s_actor_peak_total) {
+        s_actor_peak_total = play->actor_info.total_num;
+    }
+    for (i = pc_puppet_pool_next(&s_pool, 0); i >= 0; i = pc_puppet_pool_next(&s_pool, i + 1)) {
+        PCRemotePlayerSlot* slot = pc_remote_player_find_slot(i);
+        ACTOR* actor;
+        PCRemotePlayerOffset ofs_v;
+        f32 x, y, z;
+
+        /* Real-client crash fix: retry resolving any appearance that arrived while gamePT was NULL
+         * (see pc_remote_player_apply_appearance()'s doc comment). Deliberately NOT gated on
+         * slot->in_use -- pc_remote_player_on_appearance() can populate `appearance` before
+         * on_ready()/on_move() ever mark this slot in_use (see its own comment above) -- and
+         * deliberately keyed on `pending_resolve`, never `!resolved_appearance.ready`, since
+         * `ready` may still be 1 from an earlier, unrelated successful resolution. gamePT is
+         * already confirmed non-NULL by this function's own check above, so this call is
+         * guaranteed to actually resolve (and clear pending_resolve) rather than defer again. */
+        if (i >= 0 && i < PC_PUPPET_ID_LIMIT && s_cloth_chg[i].hold) { /* PUPPET CLOTH CHANGE (CL): an expired / actor-less hold resolves now */
+            double t = graph_dt_frame_time(gamePT);
+            if (slot->actor == NULL || !slot->in_use || t > s_cloth_chg[i].deadline || t < s_cloth_chg[i].deadline - PC_CLOTH_HOLD_FRAMES - 1.0) {
+                s_cloth_chg[i].timeouts++;
+                pc_puppet_cloth_release(slot, i, slot->actor == NULL ? "no_actor" : "timeout", 0.0f);
+            }
+        }
+        if (slot->appearance.valid && slot->appearance.pending_resolve && !(i >= 0 && i < PC_PUPPET_ID_LIMIT && s_cloth_chg[i].hold)) {
+            pc_remote_player_apply_appearance(slot);
+        }
+
+        if (!slot->in_use) {
+            continue;
+        }
+
+        /* Stage 4A lifecycle fix: this slot's actor (if any) was created in an earlier scene that
+         * Actor_info_dt() has since fully torn down -- see s_scene_generation's doc comment above.
+         * That teardown already deleted and freed the ACTOR; it must NOT be passed to
+         * Actor_delete() again (it is not merely unlinked, it no longer exists). Just drop the
+         * stale reference and re-arm creation -- the existing pending_create handling below
+         * (unchanged) recreates it in the current scene at the current local player's position.
+         * Peer/network state (in_use, identity, the snapshot ring) is untouched, so movement sync
+         * resumes immediately once the new actor exists, and since a freshly-allocated
+         * PCRemotePlayerActor's embedded `visual` comes back zeroed (Actor_init_actor_class()'s
+         * mem_clear), pc_remote_player_mv()'s existing player_actor_exists gate transparently
+         * reinitializes the Stage 4A visual too -- no separate visual-recreation code needed. */
+        if (slot->actor != NULL && slot->scene_generation != s_scene_generation) {
+            printf("[NET][REMOTE] player %d: scene changed -- remote-player actor was replaced, recreating\n", i);
+            if (slot->collide_armed) { /* M9-B: the old actor (and its collider) no longer exists */
+                printf("[NET][COLLIDE] player %d: collider DISARMED reason=scene\n", i);
+            }
+            slot->collide_armed = 0;
+            slot->collide_target_ok = 0;
+            memset(slot->pk_ev, 0, sizeof(slot->pk_ev)); /* M9-C Phase 5: events of the old scene generation are meaningless */
+            slot->actor = NULL;
+            slot->pending_create = 1;
+            if (slot->snap_req) {
+                /* a remote scene event (e.g. an exit from a building) still awaits its first fresh MOVE: keep waiting, but on THIS
+                 * scene's clock (the frame clock restarted with the new GAME_PLAY) and drop the pre-event samples */
+                slot->snapshot_count = 0;
+                slot->snapshot_head = 0;
+                slot->scene_accept_frame = graph_dt_frame_time(gamePT);
+            }
+            /* else: the new actor is created at the newest sample; the scene gate decides its visibility */
+        }
+
+        /* Liveness timeout: only for relay-discovered peers (see pc_remote_player_on_move()) --
+         * a directly-tracked peer (host: a real client; client: the host) is already destroyed
+         * promptly and unconditionally by the real PC_NET_EVENT_PEER_DISCONNECTED via
+         * on_disconnect(), so this never needs to (and must not) second-guess that path. */
+        if (slot->lazily_discovered && slot->has_sender_frame &&
+            (now - slot->last_move_recv_local_frame) > PC_REMOTE_PLAYER_TIMEOUT_FRAMES) {
+            printf("[NET][REMOTE] player %d timed out (no movement data) -- destroying remote-player actor "
+                   "(scene identity %s)\n", i, slot->scene.valid ? "preserved" : "none");
+            pc_remote_player_destroy_slot(slot, 1); /* keep the scene: see destroy_slot's doc */
+            if (!slot->scene.valid && !slot->appearance.valid) {
+                pc_puppet_pool_release(&s_pool, i); /* capacity phase 6: nothing about it is worth keeping (a stray relayed sample of a player that already left) */
+            }
+            continue;
+        }
+
+        /* Stage 4A lifecycle fix: belt-and-suspenders low-address liveness check, matching the one
+         * already used for `local` above -- defends this direct dereference against any stale
+         * slot->actor the scene-generation check (above) hasn't already caught. */
+        if (dump_now && slot->actor != NULL && (uint64_t)(uintptr_t)slot->actor < PC_LOWADDR_LIMIT) {
+            printf("[NET][REMOTE][DIAG] player %d actor pos=(%.1f,%.1f,%.1f) angle=%d snapshots=%d "
+                   "speed=%.2f move_state=%d item_kind=%d\n",
+                   i, slot->actor->world.position.x, slot->actor->world.position.y, slot->actor->world.position.z,
+                   (int)slot->actor->world.angle.y, slot->snapshot_count,
+                   (double)((PCRemotePlayerActor*)slot->actor)->cosmetic_speed,
+                   (int)((PCRemotePlayerActor*)slot->actor)->cosmetic_move_state,
+                   (int)((PCRemotePlayerActor*)slot->actor)->cosmetic_item_kind);
+        }
+
+        /* review round 2 (R5-LOW-1), premise corrected by the final review (R7): despite its name, setting
+         * ACTOR_STATE_NO_MOVE_WHILE_CULLED makes Actor_info_call_actor (m_actor.c:502) keep running the actor's mv_proc while
+         * it is culled, so the puppet's own move (row release, tool tick, sweat kill) already runs off screen and this block is
+         * REDUNDANT (belt and braces). It is harmless: if this puppet's ASE2 sweat is up, the actor is culled (ACTOR_STATE_NO_CULL
+         * clear: Actor_cull_check clears it when the actor is out of view) and the NEWEST snapshot is no longer STRUGGLE_PITFALL
+         * (or carries no action info), the sweat is killed here a few interpolation frames earlier than the move would. Only
+         * reads actor fields; pc_puppet_sweat_kill is flag-guarded and NULL-checks the effect clip. */
+        if (slot->actor != NULL && (uint64_t)(uintptr_t)slot->actor < PC_LOWADDR_LIMIT &&
+            ((PCRemotePlayerActor*)slot->actor)->cos.sweat_active &&
+            (slot->actor->state_bitfield & ACTOR_STATE_NO_CULL) == 0) {
+            const PCRemoteMoveSnapshot* newest = NULL;
+            if (slot->snapshot_count > 0) {
+                newest = &slot->snapshots[(slot->snapshot_head - 1 + PC_REMOTE_PLAYER_SNAPSHOT_COUNT) %
+                                          PC_REMOTE_PLAYER_SNAPSHOT_COUNT];
+            }
+            if (newest == NULL || !newest->action_valid ||
+                ((int)newest->action_index != (int)mPlayer_INDEX_STRUGGLE_PITFALL &&
+                 (int)newest->action_index != (int)mPlayer_INDEX_READY_PITFALL)) { /* P1: ready_pitfall sweats too */
+                pc_puppet_sweat_kill((PCRemotePlayerActor*)slot->actor, "culled");
+            }
+        }
+
+        if (!slot->pending_create) {
+            continue;
+        }
+
+        /* Capacity phase 6: the actor pool of the scene (mAc_MAX_ACTORS) is shared with villagers, items and effects: puppets only take what is left above a reserve, so a crowd
+         * can never starve the rest of the game. A puppet that does not fit stays pending (its slot, appearance and snapshots are kept, it is retried every poll) and counted. */
+        if (pc_puppet_actor_headroom((int)play->actor_info.total_num, mAc_MAX_ACTORS, PC_PUPPET_ACTOR_RESERVE) < 1) {
+            s_actor_blocked++;
+            s_actor_blocked_total++;
+            continue;
+        }
+
+        ofs_v = pc_remote_spawn_offset(i);
+        x = local->actor_class.world.position.x + ofs_v.x;
+        y = local->actor_class.world.position.y;
+        z = local->actor_class.world.position.z + ofs_v.z;
+
+        actor = pc_actor_make_from_profile(&play->actor_info, gamePT, &s_remote_player_profile,
+                                           &s_remote_player_dlftbl, x, y, z, 0, 0, 0,
+                                           pc_remote_player_actor_name(i), 0);
+        if (actor == NULL) {
+            s_actor_create_failed++;
+            continue; /* still pending; retried again next frame */
+        }
+
+        ((PCRemotePlayerActor*)actor)->peer = (PCNetPlayerId)i;
+        ((PCRemotePlayerActor*)actor)->cosmetic_item_kind = -1;
+
+        /* M9-B: the puppet's own collision pipe (ct_proc is none_proc2, so it is built here, where the actor is
+         * created). ClObjPipe_dt only calls the trivial ClObj_dt/ClObjPipeAttr_dt (both just return 1), so no
+         * destructor is needed. HEAVY: a normal-weight local player takes the entire push (collision_vec) and the
+         * puppet none; an idle (also HEAVY) local player takes half. */
+        ClObjPipe_ct(gamePT, &((PCRemotePlayerActor*)actor)->col_pipe);
+        ClObjPipe_set5(gamePT, &((PCRemotePlayerActor*)actor)->col_pipe, actor, &s_remote_player_pipe_data);
+        /* Passability: remote players must be easy to walk past. OC (CollisionCheck_setOC_HitInfo) gives the
+         * local player a push fraction weight_puppet / (weight_puppet + weight_player); the moving player has
+         * weight 50, so weight 2 = 3.8% of the overlap per frame (an equilibrium overlap of speed/0.038 >> the
+         * 36-unit radius sum, i.e. a normal walk passes straight through; a slow walk gets a soft nudge). An
+         * idle (HEAVY) player takes 0 vs a NORMAL puppet. Never MASSTYPE_HEAVY (full push) and never 0 for both
+         * (comweight==0 fallback). The puppet's own collision_vec is never applied, so its weight is free. */
+        actor->status_data.weight = PC_REMOTE_PLAYER_PUSH_WEIGHT;
+
+        /* Stage 4A: same scale/ofs_y the real player uses (Player_actor_init_value()/
+         * Player_actor_ct(), src/game/m_player.c) -- required for the generic Actor_draw()'s
+         * root-matrix setup (Matrix_softcv3_load/Matrix_scale) to place the shared player
+         * skeleton correctly, since it's the same skeleton at the same model-space scale. No
+         * shadow is set up (shape_info.shadow_proc stays NULL from Actor_init_actor_class()'s
+         * mem_clear) -- out of scope for Stage 4A. */
+        actor->scale.x = actor->scale.y = actor->scale.z = 0.01f;
+        actor->shape_info.ofs_y = 200.0f;
+
+        slot->actor = actor;
+        slot->scene_generation = s_scene_generation;
+        slot->pending_create = 0;
+        printf("[NET][REMOTE] created remote-player actor for player %d at (%.1f, %.1f, %.1f)\n", i, x, y, z);
+    }
+}
+
+void pc_remote_player_get_stats(PCRemotePlayerStats* out) {
+    int i;
+    if (out == NULL) {
+        return;
+    }
+    memset(out, 0, sizeof(*out));
+    out->slots_used = s_pool.used;
+    out->slots_peak = s_pool.peak;
+    out->slot_alloc_failures = s_pool.alloc_failures;
+    for (i = pc_puppet_pool_next(&s_pool, 0); s_pool_ready && i >= 0; i = pc_puppet_pool_next(&s_pool, i + 1)) {
+        const PCRemotePlayerSlot* slot = pc_remote_player_find_slot(i);
+        if (slot->in_use) {
+            out->tracked++;
+            out->actors_live += (slot->actor != NULL) ? 1 : 0;
+            out->pending_create += slot->pending_create ? 1 : 0;
+            out->collide_armed += slot->collide_armed ? 1 : 0;
+        }
+    }
+    out->actors_blocked_now = s_actor_blocked;
+    out->actors_blocked_total = s_actor_blocked_total;
+    out->actor_create_failed = s_actor_create_failed;
+    out->actor_total_peak = s_actor_peak_total;
+    out->actor_max = mAc_MAX_ACTORS;
+    out->collider_peak = s_collide_peak_colliders;
+    out->collider_table = Cl_COLLIDER_NUM;
+    out->failed_setoc = s_collide_failed_setoc;
+}
+
+void pc_remote_player_shutdown(void) {
+    int i;
+    for (i = pc_puppet_pool_next(&s_pool, 0); i >= 0; i = pc_puppet_pool_next(&s_pool, i + 1)) {
+        pc_remote_player_destroy_slot(pc_remote_player_find_slot(i), 0);
+    }
+    pc_puppet_pool_release_all(&s_pool); /* capacity phase 6: no slot, no appearance, no scene survives a shutdown / a host change */
+}

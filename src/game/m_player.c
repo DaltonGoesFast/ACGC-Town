@@ -27,6 +27,18 @@
 #include "ac_set_ovl_gyoei.h"
 #include "m_vibctl.h"
 #include "m_debug.h"
+#ifdef TARGET_PC
+#include "pc_net_game.h" /* Stage 5A: pc_net_game_role()/pc_net_game_request_pickup() -- see
+                           * m_player_main_pickup.c_inc's Setup_main_Pickup seam. */
+#include "pc_arrival_logic.h" /* T5: borderless edge decision helpers (pure, natively tested) */
+#include "pc_host_observer.h" /* --host-observer: pc_host_observer_active() (hidden, collider-less, undrawn avatar; also used by m_player_common.c_inc) */
+#include "pc_wildlife_authority.h" /* T8 audit fix (Bug 3): pcwld_should_suppress_local_wildlife() --
+                                     * see m_player_main_notice_rod.c_inc / m_player_main_notice_net.c_inc's
+                                     * own catch-interception seams. */
+#include "pc_pvp_authority.h" /* player-vs-player tool hits: puppet filter (axe), victim reaction + attacker contact hooks */
+static void Player_actor_pc_pvp_pre(ACTOR* actorx, GAME* game);
+static void Player_actor_pc_pvp_post(ACTOR* actorx, GAME* game);
+#endif
 
 static int l_skip_other_func_set_wade = FALSE;
 static xyz_t l_wade_end_pos = { 0.0f, 0.0f, 0.0f };
@@ -357,8 +369,11 @@ static int Player_actor_request_main_demo_geton_boat_wait_all(GAME* game, int pr
 static int Player_actor_request_main_demo_getoff_boat_all(GAME* game, const xyz_t* pos_p, s16 angle_y, int prio);
 
 /* Tool Models */
+#ifdef PC_LOW_ADDRESS_64
+#include "../src/data/pc_split/m_player_tools_split.h"
+#else
 #include "../src/game/m_player_tools.c_inc"
-
+#endif
 /* Common */
 #include "../src/game/m_player_controller.c_inc"
 #include "../src/game/m_player_vibration.c_inc"
@@ -390,6 +405,9 @@ static int Player_actor_request_main_demo_getoff_boat_all(GAME* game, const xyz_
 #include "../src/game/m_player_main_return_outdoor.c_inc"
 #include "../src/game/m_player_main_return_outdoor2.c_inc"
 #include "../src/game/m_player_main_wait.c_inc"
+#ifdef TARGET_PC
+#include "../src/game/m_player_pc_emote.c_inc" /* EMOTE WHEEL: the emote overlay inside WAIT (pc/include/pc_emote.h) */
+#endif
 #include "../src/game/m_player_main_walk.c_inc"
 #include "../src/game/m_player_main_run.c_inc"
 #include "../src/game/m_player_main_dash.c_inc"
@@ -1316,6 +1334,13 @@ static int Player_actor_change_main_index(ACTOR* actorx, GAME* game) {
         Player_actor_Reset_able_force_speak_label(actorx, idx);     //
         Player_actor_change_main_index_other_func1(actorx, game);   //
         (*proc[idx])(actorx, game);
+#ifdef TARGET_PC
+        /* M9-C (protocol v7): read-only observation of a REAL main-index entry of the local player -- also when the
+         * same index is entered again (repeated swing/dig/pickup), which now_main_index alone cannot show. Only bumps
+         * a 4-bit counter in pc_net_game.c that the MOVE sampler sends along with now_main_index; changes nothing here. */
+        pc_net_game_note_player_main_entry(player->now_main_index);
+        Player_actor_pc_emote_on_main_entry(actorx, game); /* EMOTE WHEEL: a state entry ends the emote overlay */
+#endif
         Player_actor_change_main_index_other_func2(actorx, game); //
         return TRUE;
     }
@@ -1465,6 +1490,8 @@ static void Player_actor_main_Demo_get_golden_axe_wait(ACTOR*, GAME*);
         return slot;
     }
 
+    extern int pc_tool_wheel_take_request(int* slot);
+
     #define IS_CUSTOM_UMBRELLA(item) ((item) >= ITM_MY_ORG_UMBRELLA0 && (item) <= ITM_MY_ORG_UMBRELLA7)
 
     /* next slot the cycle search starts from; after a putaway, the slot holding the put-away tool */
@@ -1551,10 +1578,36 @@ static void Player_actor_main_Demo_get_golden_axe_wait(ACTOR*, GAME*);
         Player_actor_request_main_putin_item(game, 0x25);
     }
 
+    /* radial tool wheel (pc_tool_wheel.c): equip the chosen POCKET slot through the same takeout path as the D-pad cycle */
+    static void TrySelectToolSlot(GAME* game, int slot) {
+        Private_c* priv = Common_Get(now_private);
+        mActor_name_t held_item = priv->equipment;
+        mActor_name_t slot_item;
+
+        if (slot < 0 || slot >= mPr_POCKETS_SLOT_COUNT) {
+            return;
+        }
+        slot_item = priv->inventory.pockets[slot];
+        if (mPr_GET_ITEM_COND(priv->inventory.item_conditions, slot) != mPr_ITEM_COND_NORMAL || !ITEM_IS_TOOL(slot_item)) {
+            return; /* the pockets changed since the wheel was built */
+        }
+        if (held_item != EMPTY_NO && !IS_CUSTOM_UMBRELLA(held_item)) {
+            mPr_SetPossessionItem(priv, slot, held_item, 0);
+        } else {
+            mPr_SetPossessionItem(priv, slot, EMPTY_NO, 0);
+        }
+        priv->equipment = slot_item;
+        last_tool_slot = WrapToolSlot(slot + 1);
+        last_direction = 1;
+        Player_actor_request_main_takeout_item(game, mPlayer_REQUEST_PRIORITY_37);
+    }
+
     static void Player_actor_check_and_switch_tool(GAME* game) {
         GAME_PLAY* play = (GAME_PLAY*)game;
         PLAYER_ACTOR* player;
         int main_index;
+        int wheel_slot = -1;
+        int wheel_req = pc_tool_wheel_take_request(&wheel_slot); /* always taken: a request never outlives the frame it is made in */
 
         /* outdoors only, and not while a submenu is open or opening */
         if (mFI_GET_TYPE(mFI_GetFieldId()) != mFI_FIELDTYPE2_FG ||
@@ -1576,6 +1629,15 @@ static void Player_actor_main_Demo_get_golden_axe_wait(ACTOR*, GAME*);
             return;
         }
         if (Player_actor_Check_is_demo_mode(player->requested_main_index) != 0) {
+            return;
+        }
+
+        if (wheel_req == 1) {
+            TrySelectToolSlot(game, wheel_slot);
+            return;
+        }
+        if (wheel_req == 2) {
+            TryPutawayTool(game);
             return;
         }
 
@@ -1732,6 +1794,9 @@ extern void Player_actor_move(ACTOR* actorx, GAME* game) {
 #ifdef PC_ENHANCEMENTS
     Player_actor_check_and_switch_tool(game);
 #endif
+#ifdef TARGET_PC
+    Player_actor_pc_emote_check(actorx, game); /* EMOTE WHEEL: the wheel's request (m_player_pc_emote.c_inc) */
+#endif
 }
 
 typedef void (*mPlayer_DRAW_PROC)(ACTOR*, GAME*);
@@ -1781,6 +1846,12 @@ extern void Player_actor_draw(ACTOR* actorx, GAME* game) {
     PLAYER_ACTOR* player = (PLAYER_ACTOR*)actorx;
     int main_idx = player->now_main_index;
 
+#ifdef TARGET_PC
+    if (pc_host_observer_active()) {
+        return; /* --host-observer: the hidden server observer is never drawn */
+    }
+#endif
+
     if (mPlayer_MAIN_INDEX_VALID(main_idx) != FALSE) {
         int draw_idx = data[main_idx];
 
@@ -1790,3 +1861,189 @@ extern void Player_actor_draw(ACTOR* actorx, GAME* game) {
         }
     }
 }
+
+#ifdef TARGET_PC
+/* P1 (World Ecology T-dig) real-gameplay verification, TEST-ONLY -- see pc_platform.h's doc comment on
+ * g_pc_force_dig_hole and pc_net_game.c's pcnetgame_run_dig_hole_test_trigger(), which is the only
+ * caller (gated behind --force-dig-hole, off by default, never active in normal single-player or
+ * hosted play).
+ *
+ * This is a thin, additive pass-through to the REAL, completely unmodified
+ * Player_actor_request_main_dig_scoop_all() defined above (via m_player_main_dig_scoop.c_inc, included
+ * into this same translation unit) -- the exact request-boundary entry point
+ * Player_actor_CheckAndRequest_main_scoop_all() calls for genuine mPlayer_INDEX_DIG_SCOOP controller
+ * input (see m_player_common.c_inc). Exposed here (rather than made non-static in place) so a test
+ * trigger living in pc_net_game.c -- a different translation unit, with no access to this file's static
+ * functions -- can call it without touching any of the dig/fill/pitfall gameplay files themselves.
+ *
+ * Bypasses only Player_actor_CheckController_forScoop()'s raw controller polling and
+ * Player_actor_Check_scoop_after()'s target/item resolution from the world (both irrelevant to what is
+ * being verified: whether the REAL downstream chain -- Player_actor_setup_main_Dig_scoop(),
+ * Player_actor_main_Dig_scoop(), Player_actor_Put_Hole_Dig_scoop(), and the P1 network seam it calls --
+ * executes correctly). The caller supplies pos/item directly, matching whatever
+ * Player_actor_Check_scoop_after() would have resolved for the targeted tile. Does not require a shovel
+ * to be equipped: Player_actor_request_main_dig_scoop_all() itself never checks item_kind. Once
+ * accepted, control returns entirely to the player actor's own ordinary per-frame main-index update --
+ * nothing about the dig/fill/commit logic itself is touched or bypassed from this point on. */
+int PC_Test_ForceRequestDigScoop(GAME* game, const xyz_t* pos, mActor_name_t item) {
+    return Player_actor_request_main_dig_scoop_all(game, pos, item, mPlayer_REQUEST_PRIORITY_4);
+}
+
+/* WEEDS real-client verification, TEST-ONLY -- see pc_platform.h's g_pc_force_weed_pull and pc_net_game.c's
+ * pcnetgame_run_weed_pull_test_trigger(), the only caller (--force-weed-pull, default off). A thin pass-through to the REAL, unmodified
+ * Player_actor_request_main_remove_grass(): everything after the request (the pull animation, frame 17's
+ * Player_actor_ChangeFGNumber_Remove_grass() and its network seam) is the ordinary per-frame player update. */
+int PC_Test_ForceRequestRemoveGrass(GAME* game, const xyz_t* target_pos, const xyz_t* grass_pos) {
+    return Player_actor_request_main_remove_grass(game, target_pos, grass_pos);
+}
+
+/* PUPPET ACTION_EXT real-process verification (worker P2), TEST-ONLY: the only caller is pc_net_game.c's pcnetgame_aext_test_hook()
+ * (PC_NET_TEST_HOOKS builds + AC_TEST_HOOKS=1 + AC_TEST_AEXT_SCRIPT). Thin pass-throughs to the REAL, unmodified static request functions of
+ * the states whose clip ACTION_EXT carries; everything after the request is the ordinary per-frame player update.
+ * what: 1 LIE_BED at the current position facing angle 0 (arg 0 = left INBED_L1, 1 = right INBED_R1), 2 ROLL_BED (arg 0/1 = direction 1/2),
+ * 3 STANDUP_BED (direction 1, else 2 when 1 has no free spot), 4 RADIO_EXERCISE command arg at speed 0.5, 7 WAIT, 9 CHANGE_CLOTH try-on of
+ * the worn cloth (the same cloth: no change). */
+int PC_Test_AextRequest(GAME* game, int what, int arg) {
+    PLAYER_ACTOR* player = GET_PLAYER_ACTOR_GAME(game);
+
+    switch (what) {
+        case 1:
+            return Player_actor_request_main_lie_bed(game, mFI_MOVEDIR_DOWN, &player->actor_class.world.position, arg ? 2 : 1, 0,
+                                                     mPlayer_REQUEST_PRIORITY_19);
+        case 2:
+            return Player_actor_request_main_roll_bed(game, arg ? 2 : 1, mPlayer_REQUEST_PRIORITY_22); /* wait_bed.c_inc:87 */
+        case 3:
+            return Player_actor_request_main_standup_bed(game, 1, mPlayer_REQUEST_PRIORITY_22) || /* wait_bed.c_inc:89 */
+                   Player_actor_request_main_standup_bed(game, 2, mPlayer_REQUEST_PRIORITY_22);
+        case 4:
+            return Player_actor_request_main_radio_exercise_all(game, arg, 0.5f, mPlayer_REQUEST_PRIORITY_19);
+        case 7:
+            return Player_actor_request_main_wait_all(game, -5.0f, 0.0f, 0, mPlayer_REQUEST_PRIORITY_31);
+        case 9:
+            return mPlib_request_main_change_cloth_forNPC_type1(game, Now_Private->cloth.item, Now_Private->cloth.idx, TRUE);
+        default:
+            return 0;
+    }
+}
+
+/* Player-vs-player tool hits (pc_pvp_authority.h): REACTIONS ONLY. The victim side runs here, from the local player's own per-frame
+ * move (Player_actor_move_other_func1), never from the network handler: a host-validated PVP_HIT is consumed only while the player is
+ * in an allowlisted state (wait / walk / run / dash / turn dash / ready net / ready-walk net) and no demo runs; anything else (talk,
+ * menus, fishing, doors, beds, chairs, cutscenes) is never interrupted and the hit expires. The REAL vanilla states are requested:
+ * axe: TUMBLE (static Player_actor_request_main_tumble, the dash trip; TUMBLE_GETUP follows on its own) + a slide away from the attacker;
+ * shovel: SHOCK (start time 0: GAAAN1 -> GAAAN2) with the target angle = the victim's OWN facing, so it plays in place without turning;
+ * net: FLINCH = STUNG_MOSQUITO (the short MOSQUITO1 arm slap) with the PC_PVP_FLINCH_LABEL, whose end goes back to WAIT instead of the
+ * vanilla NOTICE_MOSQUITO dialogue (m_player_main_stung_mosquito.c_inc, TARGET_PC); it never turns the player. A held balloon turns a
+ * TUMBLE into a SHOCK (TUMBLE_GETUP would release it). Nothing here touches an item, the pockets, the wallet or the axe wear. */
+static struct {
+    int     reaction; /* 0 = nothing requested this frame */
+    int16_t angle;
+    float   speed;
+} l_pc_pvp_req;
+static struct {
+    int     active;
+    float   elapsed; /* 60 fps frames since the TUMBLE was entered */
+    float   speed;
+    int16_t angle;
+} l_pc_pvp_knock;
+
+static void Player_actor_pc_pvp_pre(ACTOR* actorx, GAME* game) {
+    PLAYER_ACTOR* player = (PLAYER_ACTOR*)actorx;
+    int reaction = 0;
+    int16_t angle = 0, face = 0;
+    float speed = 0.0f;
+    int ok;
+
+    l_pc_pvp_req.reaction = 0;
+    if (pc_host_observer_active() || mEv_IsTitleDemo() ||
+        !pc_net_game_pvp_victim_take(player->now_main_index, mPlayer_ITEM_IS_BALLOON(player->item_kind) ? 1 : 0, &reaction, &angle,
+                                     &speed, &face)) {
+        return;
+    }
+    (void)face; /* the host's "toward the attacker" angle is NOT used: SHOCK / FLINCH play in place, in the victim's own facing */
+    if (reaction == PC_PVP_REACT_TUMBLE) {
+        ok = Player_actor_request_main_tumble(game, mPlayer_REQUEST_PRIORITY_14);
+    } else if (reaction == PC_PVP_REACT_FLINCH) {
+        ok = Player_actor_check_request_main_able(game, mPlayer_INDEX_STUNG_MOSQUITO, mPlayer_REQUEST_PRIORITY_14);
+        if (ok) {
+            player->requested_main_index_data.stung_mosquito.label = PC_PVP_FLINCH_LABEL;
+            Player_actor_request_main_index(game, mPlayer_INDEX_STUNG_MOSQUITO, mPlayer_REQUEST_PRIORITY_14);
+        }
+    } else {
+        ok = Player_actor_request_main_shock_all(game, 0.0f, actorx->shape_info.rotation.y, FALSE, FALSE, mPlayer_REQUEST_PRIORITY_14);
+    }
+    if (!ok) {
+        float pos[3];
+        pos[0] = actorx->world.position.x;
+        pos[1] = actorx->world.position.y;
+        pos[2] = actorx->world.position.z;
+        pc_net_game_pvp_victim_applied(reaction, 0, player->now_main_index, pos, actorx->shape_info.rotation.y);
+        return;
+    }
+    l_pc_pvp_req.reaction = reaction;
+    l_pc_pvp_req.angle = angle;
+    l_pc_pvp_req.speed = speed;
+}
+
+static void Player_actor_pc_pvp_post(ACTOR* actorx, GAME* game) {
+    PLAYER_ACTOR* player = (PLAYER_ACTOR*)actorx;
+    float pos[3];
+
+    (void)game;
+    pos[0] = actorx->world.position.x;
+    pos[1] = actorx->world.position.y;
+    pos[2] = actorx->world.position.z;
+    if (l_pc_pvp_req.reaction != 0) {
+        const int want = (l_pc_pvp_req.reaction == PC_PVP_REACT_TUMBLE) ? mPlayer_INDEX_TUMBLE
+                         : (l_pc_pvp_req.reaction == PC_PVP_REACT_FLINCH ? mPlayer_INDEX_STUNG_MOSQUITO : mPlayer_INDEX_SHOCK);
+        const int entered = player->changed_main_index && player->now_main_index == want;
+        if (entered && l_pc_pvp_req.reaction == PC_PVP_REACT_TUMBLE && l_pc_pvp_req.speed > 0.0f) {
+            /* knockback: the tumble keeps the actor speed (SetupSpeedF) and moves along world.angle.y. Vanilla brakes it by 0.175 per
+             * RENDER frame, so at a high frame rate its slide would be a few units: the speed is instead eased from the start value to 0
+             * over PC_PVP_KNOCK_FRAMES 60 fps frames (frame-rate independent, ~45 units), below. */
+            l_pc_pvp_knock.active = 1;
+            l_pc_pvp_knock.elapsed = 0.0f;
+            l_pc_pvp_knock.speed = l_pc_pvp_req.speed;
+            l_pc_pvp_knock.angle = l_pc_pvp_req.angle;
+            actorx->shape_info.rotation.y = l_pc_pvp_req.angle;
+        }
+        if (entered && l_pc_pvp_req.reaction == PC_PVP_REACT_FLINCH) {
+            /* the sting SE a real mosquito plays (ac_ins_ka.c:238); the PvP flinch has no mosquito, so the victim plays it itself (puppets
+             * play the same SE from their STUNG_MOSQUITO row) */
+            sAdo_OngenTrgStart(NA_SE_6A, &actorx->world.position);
+        }
+        if (entered && l_pc_pvp_req.reaction == PC_PVP_REACT_SHOCK) {
+            /* the shovel's dismay is held longer than vanilla's 44 frames (GAAAN2 keeps looping): ~1.4 s, clearly stronger than the ~1 s net flinch */
+            player->main_data.shock.end_time = PC_PVP_SHOCK_FRAMES;
+        }
+        pc_net_game_pvp_victim_applied(l_pc_pvp_req.reaction, entered, player->now_main_index, pos, actorx->shape_info.rotation.y);
+        l_pc_pvp_req.reaction = 0;
+    }
+    if (l_pc_pvp_knock.active) {
+        if (player->now_main_index != mPlayer_INDEX_TUMBLE || l_pc_pvp_knock.elapsed >= PC_PVP_KNOCK_FRAMES) {
+            l_pc_pvp_knock.active = 0; /* the vanilla braking finishes whatever is left */
+        } else {
+            actorx->speed = l_pc_pvp_knock.speed * (1.0f - l_pc_pvp_knock.elapsed / PC_PVP_KNOCK_FRAMES);
+            actorx->world.angle.y = l_pc_pvp_knock.angle;
+            l_pc_pvp_knock.elapsed += (f32)gamePT->graph->dt_num_60fps_frames;
+        }
+    }
+    {
+        /* safety net for the PvP flinch: never more than ~3 s in STUNG_MOSQUITO (its end request normally returns to WAIT after the clip) */
+        static float s_flinch_frames = 0.0f;
+        if (player->now_main_index == mPlayer_INDEX_STUNG_MOSQUITO && player->main_data.stung_mosquito.label == PC_PVP_FLINCH_LABEL) {
+            s_flinch_frames += (f32)gamePT->graph->dt_num_60fps_frames;
+            if (s_flinch_frames > 180.0f) {
+                Player_actor_request_main_wait_all(game, -5.0f, 0.0f, 0, mPlayer_REQUEST_PRIORITY_26);
+            }
+        } else {
+            s_flinch_frames = 0.0f;
+        }
+    }
+    pc_net_game_pvp_trace(player->now_main_index, actorx->speed, pos, actorx->shape_info.rotation.y);
+    if (!pc_host_observer_active() && !mEv_IsTitleDemo()) {
+        pc_net_game_pvp_attacker_frame(player->now_main_index, player->changed_main_index ? 1 : 0,
+                                       player->keyframe0.frame_control.current_frame, pos, actorx->shape_info.rotation.y);
+    }
+}
+#endif

@@ -2010,6 +2010,12 @@ static void Player_actor_Excute_Corect_forStand(ACTOR* actorx, GAME* game) {
     GAME_PLAY* play = (GAME_PLAY*)game;
     CollisionCheck_c* col_check_p = &play->collision_check;
 
+#ifdef TARGET_PC
+    if (pc_host_observer_active()) {
+        return; /* --host-observer: the hidden server observer registers no collider (villagers / puppets walk through it) */
+    }
+#endif
+
     CollisionCheck_Uty_ActorWorldPosSetPipeC(actorx, col_pipe_p);
     CollisionCheck_setOC(game, col_check_p, col_obj_p);
 }
@@ -2036,6 +2042,12 @@ static void Player_actor_Excute_Corect_forOutdoor(ACTOR* actorx, GAME* game) {
     GAME_PLAY* play = (GAME_PLAY*)game;
     CollisionCheck_c* col_check_p = &play->collision_check;
     xyz_t world_pos;
+
+#ifdef TARGET_PC
+    if (pc_host_observer_active()) {
+        return; /* --host-observer: no collider (see Player_actor_Excute_Corect_forStand) */
+    }
+#endif
 
     cKF_SkeletonInfo_R_AnimationMove_CulcTransToWorld(&world_pos, &actorx->world.position, 0.0f, 1000.0f, 0.0f,
                                                       actorx->shape_info.rotation.y, &actorx->scale, kf0_p,
@@ -2130,6 +2142,11 @@ static void Player_actor_SetPosition_OBJtoLine_forItem(ACTOR* actorx, GAME* game
         ClObj_c* axe_col_obj_p = &axe_tris_p->collision_obj;
         ClObj_c* net_col_obj_p = &net_tris_p->collision_obj;
 
+#ifdef TARGET_PC
+        if (pc_host_observer_active()) {
+            return; /* --host-observer: no axe / net item colliders either */
+        }
+#endif
         CollisionCheck_setOCC(game, col_check_p, axe_col_obj_p);
         CollisionCheck_setOCC(game, col_check_p, net_col_obj_p);
     }
@@ -2580,8 +2597,26 @@ static void Player_actor_BGcheck_common_type1(ACTOR* actorx) {
     Player_actor_CorrectWadeBlockBorder(actorx);
 }
 
+#ifdef TARGET_PC
+/* T5: borderless acres. nonzero when `pos` lies in a valid field block (the vanilla validity test of the scroll transition:
+ * mFI_BlockCheck = in range and not BG_TYPE_292). Negative coordinates are invalid (mFI_Wpos2BlockNum truncates toward zero). */
+static int Player_actor_pc_pos_in_valid_block(const xyz_t* pos) {
+    int bx = pcarr_floor_div(pos->x, mFI_BK_WORLDSIZE_X_F);
+    int bz = pcarr_floor_div(pos->z, mFI_BK_WORLDSIZE_Z_F);
+
+    return mFI_BlockCheck(bx, bz);
+}
+#endif
+
 static void Player_actor_BGcheck_common_type2(ACTOR* actorx) {
     mCoBG_BgCheckControll(NULL, actorx, 18.0f, 0.0f, TRUE, FALSE, 1);
+#ifdef TARGET_PC
+    /* T5: restore the vanilla edge (clamp against the previous, valid, block) only where the new position is in an invalid acre. */
+    if (pcarr_borderless_clamp_needed(Common_Get(field_type) == mFI_FIELDTYPE2_FG,
+                                      Player_actor_pc_pos_in_valid_block(&actorx->world.position))) {
+        mCoBG_UniqueWallCheck(actorx, 18.0f, 0.0f);
+    }
+#endif
 }
 
 static void Player_actor_BGcheck_common_type3(ACTOR* actorx) {
@@ -3177,7 +3212,13 @@ static int Player_actor_Check_axe_after(ACTOR* actorx, xyz_t* target_pos_p, mAct
     *fg_p = EMPTY_NO;
     *reflect_actor_pp = NULL;
 
-    if (Player_actor_Check_OBJtoLine_forItem_axe(actorx)) {
+    if (Player_actor_Check_OBJtoLine_forItem_axe(actorx)
+#ifdef TARGET_PC
+        /* player-vs-player tool hits: another player's puppet never reflects the axe (no recoil, no +3 wear); the swing
+         * goes on to the tree / air check and the hit itself is the host-validated PVP_HIT_REQ (pc_pvp_authority.h) */
+        && !pc_pvp_is_puppet_actor(player->item_axe_tris.collision_obj.collided_actor)
+#endif
+    ) {
         ClObjTris_c* axe_tris_p = &player->item_axe_tris;
         ClObjTrisElem_c* axe_tris_elem_p = axe_tris_p->elements;
         ClObjTrisElemAttr_c* axe_tris_elem_attr_p = &axe_tris_elem_p->attribute;
@@ -3682,7 +3723,13 @@ static int Player_actor_Set_ScrollDemo_forWade(ACTOR* actorx, GAME* game, int np
         int trigger_wade = FALSE;
 
         mFI_Wpos2BlockNum(&bx, &bz, *player_pos_p);
-        if (play->block_table.block_x != bx || play->block_table.block_z != bz) {
+        if ((play->block_table.block_x != bx || play->block_table.block_z != bz)
+#ifdef TARGET_PC
+            /* T5: never start the borderless acre change into an invalid acre (the vanilla scroll check mFI_BlockCheck) */
+            && pcarr_borderless_wade_allowed(Common_Get(field_type) == mFI_FIELDTYPE2_FG,
+                                             Player_actor_pc_pos_in_valid_block(player_pos_p))
+#endif
+        ) {
             if (play->block_table.block_x < bx) {
                 dir = mFI_MOVEDIR_LEFT;
             } else if (play->block_table.block_x > bx) {
@@ -4349,6 +4396,36 @@ static int Player_actor_Search_STONE_TC(ACTOR* actorx, xyz_t* target_pos_p) {
 
     if (fg_p != NULL && IS_ITEM_STONE_TC(*fg_p) != FALSE && Common_Get(clip).bg_item_clip != NULL &&
         Common_Get(clip).bg_item_clip->ten_coin_entry_ex_proc != NULL) {
+#ifdef TARGET_PC
+        /* World Ecology Stage 1, Item 2 (MONEY_ROCK_HIT): gate the WHOLE ten_coin_entry_ex_proc()
+         * entry point for a host-authoritative client -- see pc_net_game_request_money_rock_hit()'s
+         * own doc (pc_net_game.h) for why a partial gate (only some of bIT_actor_ten_coin_entryR()'s
+         * own fg-writing calls) is unsafe. Stage 1 simplification: no local wobble animation plays on
+         * this client for this hit (see that same doc) -- the tile visibly updates moments later via
+         * the ordinary FIELD_UPDATE broadcast instead. */
+        if (pc_net_game_role() == PC_NETGAME_ROLE_CLIENT) {
+            int ut_x, ut_z;
+            if (mFI_Wpos2UtNum(&ut_x, &ut_z, *target_pos_p)) {
+                pc_net_game_request_money_rock_hit(ut_x, ut_z);
+            }
+            return TRUE;
+        } else if (pc_net_game_role() == PC_NETGAME_ROLE_HOST) {
+            /* Bug 1 fix: single ownership -- the HOST's own local money-rock hit must also go through
+             * the host's own bookkeeping (s_host_money_rock, pc_net_game.c), exactly like a remote
+             * client's hit does, rather than running vanilla's ten_coin_entry_ex_proc() directly. Two
+             * independent writers (vanilla's own local mutation AND the host bookkeeping mirroring a
+             * client's hit on the same tile) could otherwise both revert/advance the same window,
+             * corrupting it (double-revert, wrong hit_count, a tile left on MONEY_FLOWER_SEED). Routing
+             * the host's own hit through the identical bookkeeping makes it single-owner: every hit on
+             * every money rock, from every source, updates exactly one place. Single-player
+             * (PC_NETGAME_ROLE_NONE) is NOT affected -- it falls through below, unmodified. */
+            int ut_x, ut_z;
+            if (mFI_Wpos2UtNum(&ut_x, &ut_z, *target_pos_p)) {
+                pc_net_game_host_local_money_rock_hit(ut_x, ut_z);
+            }
+            return TRUE;
+        }
+#endif
         Common_Get(clip).bg_item_clip->ten_coin_entry_ex_proc(target_pos_p, actorx->shape_info.rotation.y);
         return TRUE;
     }
@@ -4383,6 +4460,68 @@ static int Player_actor_CheckAndRequest_main_scoop_all(GAME* game, int priority)
                 return TRUE;
             }
         } else if (scoop_request_index == mPlayer_INDEX_GET_SCOOP) {
+#ifdef TARGET_PC
+            /* World Ecology Stage 1, Item 1 (DIG_BURIED): the audited-safe interception point -- see
+             * pc_net_game_request_dig_buried()'s own doc (pc_net_game.h) for why this must happen
+             * HERE, before mPlayer_INDEX_GET_SCOOP is ever entered, rather than inside that state's
+             * own setup/settle callbacks (m_player_main_get_scoop.c_inc). `item` above is this
+             * client's own local read (via mPlib_Check_scoop_after()) -- used only to decide whether
+             * this looks like a dig worth asking about; the host resolves and grants the real,
+             * authoritative item, never this local value.
+             *
+             * World Ecology T-dig (D / A-2): mFI_GetDigStatus() (m_field_info.c) can also route TWO
+             * other, unrelated interactions through this SAME mPlayer_INDEX_GET_SCOOP branch:
+             *   - digging up a SHINE_SPOT (raw field tile == SHINE_SPOT; `item` has already been
+             *     converted to the actual bell amount by mFI_CheckDigGetItem()'s own
+             *     bg_item_fg_sub_dig2take_conv() call -- this client's own private, already-rolled
+             *     luck, not something the host ever sees) -- this is DIG_SHINE (kind 8), NOT
+             *     DIG_BURIED (kind 1): the underlying tile is not deposit-flagged.
+             *   - the golden-shovel 10% ITM_MONEY_100 bonus (raw field tile == EMPTY_NO, `item` ==
+             *     ITM_MONEY_100): this resolves to an ordinary DIG_HOLE (kind 5) on the wire -- the
+             *     host only ever writes a plain hole; the bonus bells are a private client-side grant
+             *     on top, exactly like DIG_SHINE's own bell roll.
+             * Both must be detected and diverted BEFORE falling into the plain DIG_BURIED call below,
+             * which the host would otherwise (correctly) reject for a non-buried-item tile, silently
+             * losing the interaction. Neither path plays a local animation (matches the established
+             * DIG_BURIED precedent: wait for the RESULT before any visual), and both require a free
+             * pocket slot up front, exactly like DIG_BURIED's own check -- if none is free, the action
+             * is swallowed for this frame with nothing sent, matching vanilla's own "can't dig, no
+             * room" behavior for this case. */
+            if (pc_net_game_role() == PC_NETGAME_ROLE_CLIENT) {
+                int ut_x, ut_z;
+                mActor_name_t* raw_fg_p = mFI_GetUnitFG(target_pos);
+                mActor_name_t raw_fg = raw_fg_p != NULL ? *raw_fg_p : (mActor_name_t)EMPTY_NO;
+                int have_free_slot = mPr_GetPossessionItemIdx(Now_Private, (mActor_name_t)EMPTY_NO) >= 0;
+
+                if (raw_fg == (mActor_name_t)SHINE_SPOT) {
+                    if (have_free_slot && mFI_Wpos2UtNum(&ut_x, &ut_z, target_pos)) {
+                        pc_net_game_request_dig_shine_with_grant(ut_x, ut_z, (int)item);
+                    }
+                    return TRUE;
+                } else if (gold_shovel && raw_fg == (mActor_name_t)EMPTY_NO && item == ITM_MONEY_100) {
+                    /* mCoBG_GetHoleNumber() is safe to read here at input time, for the same reason
+                     * DIG_HOLE's own commit-point read is safe (see Player_actor_Put_Hole_Dig_scoop(),
+                     * m_player_main_dig_scoop.c_inc): nothing between the preceding classification and
+                     * this point writes collision data for this tile. */
+                    int hn = mCoBG_GetHoleNumber(target_pos);
+                    if (have_free_slot && hn >= 0 && mFI_Wpos2UtNum(&ut_x, &ut_z, target_pos)) {
+                        pc_net_game_request_dig_hole_with_grant(ut_x, ut_z, hn, (int)ITM_MONEY_100);
+                    }
+                    return TRUE;
+                } else if (mFI_Wpos2UtNum(&ut_x, &ut_z, target_pos)) {
+                    if (pc_net_game_request_dig_buried(ut_x, ut_z)) {
+                        return TRUE;
+                    }
+                    /* G7: a CLIENT whose link is not READY (still connecting, or the host is gone) sent
+                     * nothing above. Swallow the A press (same shape as the no-free-slot swallows above) so
+                     * the vanilla get_scoop never grants a buried item into the pockets / clears the local
+                     * field -- that grant would be duplicated once READY snapshots the host's field. */
+                    if (pc_net_game_client_link_state() != PC_NETGAME_LINK_READY) {
+                        return TRUE;
+                    }
+                }
+            } else
+#endif
             if (Player_actor_request_main_get_scoop_all(game, &target_pos, item, priority)) {
                 return TRUE;
             }
@@ -4391,6 +4530,50 @@ static int Player_actor_CheckAndRequest_main_scoop_all(GAME* game, int priority)
 
     return FALSE;
 }
+
+#ifdef TARGET_PC
+/* One-shot: the NEXT get_scoop setup is presentation-only (no putin_item). Consumed in
+ * Player_actor_setup_main_Get_scoop() (m_player_main_get_scoop.c_inc). */
+static int s_pc_get_scoop_present_only = FALSE;
+
+/* Client dig-up pocket animation (cosmetic ONLY). pc_net_game.c calls this after a host-APPLIED dig grant whose pocket write was already
+ * applied by the transaction code; it enters the vanilla GET_SCOOP state in presentation-only mode so the item is NOT granted a second time.
+ * Never called on reject/expiry/fault. Silently does nothing if the player is no longer able to take the request (changed state / item). */
+int pc_player_present_dig_pocket(int ut_x, int ut_z, int item) {
+    GAME* game = (GAME*)gamePT;
+    PLAYER_ACTOR* player;
+    xyz_t pos;
+
+    { extern int g_pc_verbose; if (g_pc_verbose) printf("[NET][DIG] present pocket anim called ut(%d,%d) item 0x%04X\n", ut_x, ut_z, (unsigned)item); }
+    if (game == NULL || pc_net_game_role() != PC_NETGAME_ROLE_CLIENT) {
+        return FALSE;
+    }
+    player = GET_PLAYER_ACTOR_GAME(game);
+    if (player == NULL || !mPlayer_ITEM_IS_SHOVEL(player->item_kind)) {
+        return FALSE;
+    }
+    /* The player must still be standing (WAIT) near the dug tile: if they already walked off / started another action / changed scene, the
+     * purely cosmetic animation is skipped (the grant is already in the pocket). */
+    if (player->now_main_index != mPlayer_INDEX_WAIT) {
+        return FALSE;
+    }
+    mFI_UtNum2CenterWpos(&pos, ut_x, ut_z);
+    {
+        const f32 ddx = player->actor_class.world.position.x - pos.x;
+        const f32 ddz = player->actor_class.world.position.z - pos.z;
+        if (ddx * ddx + ddz * ddz > 80.0f * 80.0f) {
+            return FALSE;
+        }
+    }
+    s_pc_get_scoop_present_only = TRUE;
+    if (!Player_actor_request_main_get_scoop_all(game, &pos, (mActor_name_t)item, mPlayer_REQUEST_PRIORITY_4)) {
+        s_pc_get_scoop_present_only = FALSE;
+        return FALSE;
+    }
+    { extern int g_pc_verbose; if (g_pc_verbose) printf("[NET][DIG] present pocket anim started\n"); }
+    return TRUE;
+}
+#endif
 
 static void Player_actor_cancel_request_change_proc_index_by_A_btn(ACTOR* actorx) {
     PLAYER_ACTOR* player = (PLAYER_ACTOR*)actorx;
@@ -6749,7 +6932,31 @@ static int Player_actor_Check_BirthBee_common(ACTOR* actorx, mActor_name_t item,
             if (IS_ITEM_BEE_TREE(item)) {
                 xyz_t item_drop_pos;
 
-                Common_Get(clip).bg_item_clip->item_tree_fruit_drop_proc(item, tree_ut_x, tree_ut_z, &item_drop_pos);
+#ifdef TARGET_PC
+                /* World Ecology T1 (TREE_SHAKE, bee-birth): gate the WHOLE mutating entry point
+                 * (item_tree_fruit_drop_proc -> drop_fruit() -> fruit_set() plus the TREE_BEES-># TREE
+                 * destination-tree conversion write) for a host-authoritative client/host, exactly like
+                 * the SHAKE/CHOP seams' own gates (m_player_main_shake_tree.c_inc,
+                 * m_player_main_swing_axe.c_inc) -- see pc_net_game_request_tree_shake()'s own doc
+                 * (pc_net_game.h). This is called from BOTH the shake bee-timer branch and the axe
+                 * felling branch, so gating it here covers both call sites at once. The visible bee
+                 * actor and its honeycomb-drop ANIMATION still need to play locally on every role, host
+                 * or client (purely cosmetic) -- see pc_tree_birth_bee_visual()'s own doc
+                 * (bg_item_common.c_inc) -- so this always calls that PC-only, visual-only helper
+                 * instead of the real mutating proc when networked, reporting the exact same
+                 * success/failure shape (a valid vs. -1-sentinel *item_drop_pos) so the angle-aim math
+                 * below is unaffected either way. */
+                if (pc_net_game_role() == PC_NETGAME_ROLE_CLIENT) {
+                    pc_net_game_request_tree_shake(tree_ut_x, tree_ut_z);
+                    pc_tree_birth_bee_visual(tree_ut_x, tree_ut_z, &item_drop_pos);
+                } else if (pc_net_game_role() == PC_NETGAME_ROLE_HOST) {
+                    pc_net_game_host_local_tree_shake(tree_ut_x, tree_ut_z);
+                    pc_tree_birth_bee_visual(tree_ut_x, tree_ut_z, &item_drop_pos);
+                } else
+#endif
+                {
+                    Common_Get(clip).bg_item_clip->item_tree_fruit_drop_proc(item, tree_ut_x, tree_ut_z, &item_drop_pos);
+                }
                 if (item_drop_pos.x >= 0.0f && item_drop_pos.z >= 0.0f) {
                     if (angle_y_p != NULL) {
                         f32 dx = item_drop_pos.x - actorx->world.position.x;
@@ -6812,6 +7019,13 @@ static int Player_actor_Check_NecessaryDoorKnock(ACTOR* actorx) {
                         return TRUE;
                     }
                 } else {
+#ifdef TARGET_PC
+                    /* roommates (pc_room_ui.h): a guest walks into the house it shares like the holder does (no knock) */
+                    extern int pc_net_game_room_house_entry(int house);
+                    if (pc_net_game_room_house_entry(arrange_idx) > 0) {
+                        return FALSE;
+                    }
+#endif
                     return TRUE;
                 }
             }
@@ -7499,6 +7713,17 @@ static void Player_actor_Request_main_refuse_pickup_all(GAME* game, int refuse_p
 static int Player_actor_CheckAndRequest_main_pickup_all(GAME* game) {
     int field_type = Common_Get(field_type);
 
+#ifdef TARGET_PC
+    /* Client inside its OWN house with the house link down / not reconciled: no pickup at all (state untouched, no animation).
+     * Deliberately not the refuse demo (it says 'pockets full'). */
+    if (field_type == mFI_FIELDTYPE2_PLAYER_ROOM && pc_net_game_client_room_edit_locked()) {
+        if (Player_actor_CheckController_forPickup(game)) {
+            pc_net_game_room_edit_denied();
+        }
+        return FALSE;
+    }
+#endif
+
     if ((field_type == mFI_FIELDTYPE2_FG || field_type == mFI_FIELDTYPE2_PLAYER_ROOM) &&
         Player_actor_CheckController_forPickup(game) &&
         Player_actor_check_request_main_priority(game, mPlayer_REQUEST_PRIORITY_8) > 0 &&
@@ -7593,6 +7818,15 @@ static int Player_actor_CheckAndRequest_main_pickup_all(GAME* game) {
                             return TRUE;
                         }
                     } else {
+#ifdef TARGET_PC
+                        /* Full-pocket pickup: a network client never gets the vanilla swap menu for a shared field item (the pickup seam
+                         * forces exchange_flag off) and the host is never asked when nothing could receive the item, so a pickup animation
+                         * here would only pretend. Play the vanilla 'pockets full' refusal instead: no animation, the item stays. */
+                        if (pc_net_game_role() == PC_NETGAME_ROLE_CLIENT && !pc_net_game_client_own_room_local() &&
+                            pc_net_game_client_pickup_no_room(changed_item)) {
+                            Player_actor_Request_main_refuse_pickup_all(game, FALSE);
+                        } else
+#endif
                         if (slot_idx >= 0 || can_exchange) {
                             if (Player_actor_request_main_pickup(game, changed_item, &target_pos, &item_pos, slot_idx,
                                                                  item_is_signboard)) {

@@ -30,15 +30,28 @@ static void aINS_set_player_info(ACTOR* actorx, PLAYER_ACTOR* player) {
     if (player != NULL) {
         f32 distXZ;
         f32 distY;
+        xyz_t nearest = player->actor_class.world.position;
 
-        distXZ = search_position_distanceXZ(&actorx->world.position, &player->actor_class.world.position);
+#ifdef TARGET_PC
+        if (pcwld_sim_is_host()) { /* the host simulates for every connected player: the AI reacts to the NEAREST one */
+            float rx, ry, rz;
+            if (pcwld_nearest_remote_player(actorx->world.position.x, actorx->world.position.z, &rx, &ry, &rz) &&
+                SQ(rx - actorx->world.position.x) + SQ(rz - actorx->world.position.z) <
+                    SQ(nearest.x - actorx->world.position.x) + SQ(nearest.z - actorx->world.position.z)) {
+                nearest.x = rx;
+                nearest.y = ry;
+                nearest.z = rz;
+            }
+        }
+#endif
+        distXZ = search_position_distanceXZ(&actorx->world.position, &nearest);
         actorx->player_distance_xz = distXZ;
 
-        distY = player->actor_class.world.position.y - actorx->world.position.y;
+        distY = nearest.y - actorx->world.position.y;
         actorx->player_distance_y = distY;
 
         actorx->player_distance = SQ(distXZ) + SQ(distY);
-        actorx->player_angle_y = search_position_angleY(&actorx->world.position, &player->actor_class.world.position);
+        actorx->player_angle_y = search_position_angleY(&actorx->world.position, &nearest);
     } else {
         actorx->player_distance_xz = 0.0f;
         actorx->player_distance_y = 0.0f;
@@ -232,6 +245,9 @@ static void aINS_calc_alpha_time(aINS_INSECT_ACTOR* insect, GAME* game) {
                 insect->alpha0 = 0;
                 insect->alpha1 = 0;
                 insect->insect_flags.destruct = TRUE;
+#ifdef TARGET_PC
+                pcwld_insect_diag(1, insect);
+#endif
             }
 
             insect->alpha2 = alpha;
@@ -244,6 +260,9 @@ static void aINS_calc_alpha_time(aINS_INSECT_ACTOR* insect, GAME* game) {
             if (alpha <= 0) {
                 alpha = 0;
                 insect->insect_flags.destruct = TRUE;
+#ifdef TARGET_PC
+                pcwld_insect_diag(1, insect);
+#endif
             }
 
             insect->alpha0 = alpha;
@@ -259,12 +278,19 @@ static void aINS_cull_check(ACTOR* actorx, GAME* game) {
                              &actorx->camera_w);
 
     if (insect->insect_flags.destruct && (ACTOR*)mPlib_Get_item_net_catch_label() != actorx) {
+#ifdef TARGET_PC
+        pcwld_insect_diag(2, insect);
+        pcwld_insect_ended_naturally(insect);
+#endif
         aINS_destruct(actorx, game);
     }
 
     if (Actor_draw_actor_no_culling_check(actorx) == FALSE) {
         if (actorx->actor_specific == 1) {
             if ((ACTOR*)mPlib_Get_item_net_catch_label() != actorx) {
+#ifdef TARGET_PC
+                pcwld_insect_diag(3, insect);
+#endif
                 aINS_destruct(actorx, game);
             }
         } else {
@@ -276,7 +302,13 @@ static void aINS_cull_check(ACTOR* actorx, GAME* game) {
             /* Despawn if player is more than 15 units away and in another acre and has not caught it */
             if (actorx->player_distance_xz > 600.0f &&
                 (actorx->block_x != play->block_table.block_x || actorx->block_z != play->block_table.block_z) &&
+#ifdef TARGET_PC
+                !(pcwld_sim_is_host() && pcwld_remote_player_in_block(actorx->block_x, actorx->block_z)) &&
+#endif
                 (ACTOR*)mPlib_Get_item_net_catch_label() != actorx) {
+#ifdef TARGET_PC
+                pcwld_insect_diag(4, insect);
+#endif
                 aINS_destruct(actorx, game);
             }
         }
@@ -368,6 +400,19 @@ static void aINS_actor_move(ACTOR* actorx, GAME* game) {
     aINS_INSECT_ACTOR* insect = ctrl_actor->insect_actor;
     int i;
 
+#ifdef TARGET_PC
+    if (aINS_CLIP->pl_action == aINS_PL_ACT_NONE) {
+        /* multiplayer latent bugs: the HOST feeds one queued REMOTE tool use per tick into the same pl_action slot the local player's tool code
+         * fills, so the unmodified species programs reveal a bug another player dug up / shook down / knocked out (pc_wildlife_authority.c) */
+        int pact, put_x, put_z;
+        if (pcwld_host_take_pl_action(&pact, &put_x, &put_z)) {
+            aINS_CLIP->pl_action = pact;
+            aINS_CLIP->pl_action_ut_x = put_x;
+            aINS_CLIP->pl_action_ut_z = put_z;
+        }
+    }
+#endif
+
     for (i = 0; i < aINS_ACTOR_NUM; i++) {
         ACTOR* actorx = (ACTOR*)insect;
 
@@ -385,6 +430,9 @@ static void aINS_actor_move(ACTOR* actorx, GAME* game) {
                 aINS_calc_life_time(insect, game);
                 aINS_calc_alpha_time(insect, game);
                 (*actorx->mv_proc)(actorx, game);
+#ifdef TARGET_PC
+                pcwld_drive_insect(insect); /* a CLIENT shows the host's position / heading of a creature the host simulates */
+#endif
                 Actor_world_to_eye(actorx, 0.0f);
                 aINS_set_catch_range(actorx);
             }
