@@ -1,5 +1,6 @@
 package com.acgc.town;
 
+import android.content.pm.ActivityInfo;
 import android.os.Bundle;
 import android.util.Log;
 
@@ -57,6 +58,20 @@ public class TownActivity extends SDLActivity {
             LaunchTrace.note(this, "loadLibrary failed\n" + Log.getStackTraceString(e));
             throw e;
         }
+    }
+
+    /** SDL asks for an orientation every time the surface comes back. If we are already free
+     * to rotate, asking again pauses the activity and the game thread blocks for seconds. */
+    @Override
+    public void setOrientationBis(int w, int h, boolean resizable, String hint) {
+        int cur = getRequestedOrientation();
+        if (cur == ActivityInfo.SCREEN_ORIENTATION_FULL_USER
+                || cur == ActivityInfo.SCREEN_ORIENTATION_FULL_SENSOR
+                || cur == ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED) {
+            Log.i("ACGC", "skip orientation request, already " + cur);
+            return;
+        }
+        super.setOrientationBis(w, h, resizable, hint);
     }
 
     @Override

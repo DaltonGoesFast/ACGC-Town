@@ -252,6 +252,7 @@ static char s_dvd[64] = "-";
 static char s_gx[48] = "-";
 static char s_view[48] = "-";
 static char s_pad[180] = "-";
+static unsigned s_btn_or = 0;
 static void* s_scene = NULL;
 static int s_doing = -1;
 static unsigned s_frames = 0;
@@ -307,6 +308,7 @@ static void* pc_hb_thread(void* arg) {
         memcpy(gx, s_gx, sizeof(gx));
         memcpy(view, s_view, sizeof(view));
         memcpy(pad, s_pad, sizeof(pad));
+        s_btn_or = 0;
         scene = s_scene;
         doing = s_doing;
         frames = s_frames;
@@ -378,8 +380,10 @@ void pc_hb_note_view(int x, int y, int w, int h) {
 
 void pc_hb_note_input(unsigned buttons, int stick_x, int stick_y, int fingers, int hud, const char* hud_state) {
     pthread_mutex_lock(&s_hb_mu);
+    /* OR across the second so a 3-frame tap is still visible on the 1 Hz line. */
+    s_btn_or |= buttons;
     snprintf(s_pad, sizeof(s_pad), "btn=%04x stick=%d,%d touch=%d hud=%d %s",
-             buttons & 0xffffu, stick_x, stick_y, fingers, hud, hud_state != NULL ? hud_state : "-");
+             s_btn_or & 0xffffu, stick_x, stick_y, fingers, hud, hud_state != NULL ? hud_state : "-");
     pthread_mutex_unlock(&s_hb_mu);
 }
 

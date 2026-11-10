@@ -753,9 +753,13 @@ int pc_platform_poll_events(void) {
                 g_pc_running = 0;
                 return 0;
             case SDL_APP_WILLENTERBACKGROUND:
-                /* Keep the GL context. Android may drop the surface; we rebind it on resume instead of creating a new one. */
+                /* Keep the GL context. Android may drop the surface; we rebind it on resume instead of creating a new one.
+                 * SDL_HINT_ANDROID_BLOCK_ON_PAUSE waits inside SDL until the surface is back, which is the multi-second
+                 * idle gap when the activity pauses (a redundant orientation request used to cause that). */
+                pc_diag_milestone("app background");
                 break;
             case SDL_APP_DIDENTERFOREGROUND:
+                pc_diag_milestone("app foreground");
                 if (g_pc_window != NULL && g_pc_gl_context != NULL) {
                     SDL_GL_MakeCurrent(g_pc_window, g_pc_gl_context);
                 }
