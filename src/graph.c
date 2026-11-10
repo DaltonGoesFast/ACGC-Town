@@ -404,10 +404,13 @@ static void pc_trace_frame(GAME* game) {
             last_scene = (int)play->scene_id;
         }
         msg = mMsg_Get_base_window_p();
-        if (msg != NULL && msg->msg_no != last_msg) {
-            snprintf(line, sizeof(line), "talk -> %d", msg->msg_no);
-            pc_diag_milestone(line);
-            last_msg = msg->msg_no;
+        if (msg != NULL) {
+            int num = mMsg_Get_msg_num(msg);
+            if (num != last_msg) {
+                snprintf(line, sizeof(line), "talk -> %d", num);
+                pc_diag_milestone(line);
+                last_msg = num;
+            }
         }
         demo = mDemo_CheckDemoType();
         if (demo != last_demo) {

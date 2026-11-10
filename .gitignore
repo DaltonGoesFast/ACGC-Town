@@ -18,10 +18,12 @@ orig/*/*
 *.map
 *.MAP
 
-# Disc images and local verification artifacts
+# Disc images and local verification artifacts. Never commit a GAFE01 image or anything extracted from it.
 *.ciso
 *.gcm
 *.iso
+GAFE01.ciso
+pc/build64/bin/rom/
 artifacts/
 
 # Build files
