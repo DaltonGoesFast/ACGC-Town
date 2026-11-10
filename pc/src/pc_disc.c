@@ -4,6 +4,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <errno.h>
 #include <ctype.h>
 #include <dirent.h>
 #include "types.h"
@@ -287,10 +288,21 @@ static int str_ends_ci(const char* s, const char* suffix) {
 }
 
 static char s_forced_image[512];
+static char s_disc_error[640];
+
+const char* pc_disc_last_error(void) { return s_disc_error; }
 
 void pc_disc_set_image_path(const char* path) {
+    s_disc_error[0] = '\0';
     if (path == NULL || path[0] == '\0') {
         s_forced_image[0] = '\0';
+        return;
+    }
+    if (strncmp(path, "content:", 8) == 0) {
+        s_forced_image[0] = '\0';
+        snprintf(s_disc_error, sizeof(s_disc_error),
+                 "The disc path is a content:// URI. The launcher has to copy that file into app storage before the game can open it.\n%s",
+                 path);
         return;
     }
     snprintf(s_forced_image, sizeof(s_forced_image), "%s", path);
@@ -298,7 +310,15 @@ void pc_disc_set_image_path(const char* path) {
 
 static int find_disc_image(char* out_path, int out_sz) {
     static const char* dirs[] = { ".", "orig", "rom", NULL };
+    if (s_disc_error[0] != '\0') return 0;
     if (s_forced_image[0] != '\0') {
+        FILE* probe = fopen(s_forced_image, "rb");
+        if (probe == NULL) {
+            snprintf(s_disc_error, sizeof(s_disc_error), "Could not open the disc file %s (%s).",
+                     s_forced_image, strerror(errno));
+            return 0;
+        }
+        fclose(probe);
         snprintf(out_path, out_sz, "%s", s_forced_image);
         return 1;
     }

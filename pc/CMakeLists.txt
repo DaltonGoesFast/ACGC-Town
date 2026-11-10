@@ -97,6 +97,8 @@ include_directories(
 # Find SDL2
 # =============================================================================
 if(ANDROID)
+    # 16 KB pages (some Android 15 devices) refuse a .so whose ELF segments are only 4 KB aligned.
+    set(CMAKE_SHARED_LINKER_FLAGS "${CMAKE_SHARED_LINKER_FLAGS} -Wl,-z,max-page-size=16384")
     add_compile_definitions(PC_GLES)
     include(FetchContent)
     FetchContent_Declare(
@@ -318,6 +320,7 @@ set(PC_SOURCES
     ${CMAKE_CURRENT_SOURCE_DIR}/src/pc_gx_texture.c
     ${CMAKE_CURRENT_SOURCE_DIR}/src/pc_gbi_runtime.c
     ${CMAKE_CURRENT_SOURCE_DIR}/src/pc_lowaddr.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/pc_crash.c
     ${CMAKE_CURRENT_SOURCE_DIR}/src/pc_lowaddr_selftest.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/src/pc_rng_domains_selftest.c
     ${CMAKE_CURRENT_SOURCE_DIR}/src/pc_os.c
@@ -635,7 +638,8 @@ if(ANDROID)
     if(CMAKE_SIZEOF_VOID_P EQUAL 8)
         target_sources(ac_pc PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src/pc_lowheap.c)
         target_link_options(ac_pc PRIVATE
-            -Wl,--wrap=malloc,--wrap=calloc,--wrap=realloc,--wrap=free)
+            -Wl,--wrap=malloc,--wrap=calloc,--wrap=realloc,--wrap=free
+            -Wl,-z,max-page-size=16384)
     endif()
 elseif(WIN32)
     target_link_libraries(ac_pc opengl32 winmm imm32 version setupapi ws2_32)

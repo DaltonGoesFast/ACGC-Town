@@ -13,6 +13,7 @@ extern "C" {
  * Returns 1 on success, 0 if no disc image found. */
 /* Use this file instead of searching the working directory. Empty clears the override. */
 void pc_disc_set_image_path(const char* path);
+const char* pc_disc_last_error(void);
 
 int pc_disc_init(void);
 

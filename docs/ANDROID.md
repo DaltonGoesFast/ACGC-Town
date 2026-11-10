@@ -50,6 +50,14 @@ The numbers that matched on this machine (linux i386 `-malign-double` and armeab
 | `sizeof(mHm_hs_c)` | 9904 |
 | `sizeof(PCChatSendMsg)`, `PCChatMsg`, `PCRoomMsg` | 68, 80, 300 |
 
+## Crash log
+
+A fatal signal (`SIGSEGV`, `SIGBUS`, `SIGABRT`, `SIGILL`) writes `acgc-crash.log` in the app's external files directory:
+
+`/storage/emulated/0/Android/data/com.acgc.town/files/acgc-crash.log`
+
+The same directory has `acgc-session.log` (startup milestones and the SDL/game log). If external storage is unavailable, both files are under the app's internal files directory instead. The next launch shows the crash log with a Share log button before the game starts. Share sends the text with the Android share sheet.
+
 ## What is still open
 
 The APK has not been installed on a Galaxy Z Fold 6. There is no disc image on the build machine, so a picked GAFE01, a fold, the cutout insets, and a joined town were not watched. A pointer the decomp still stores as a raw `u32` outside the below-4GB heap or the display-list token table will be wrong; startup logs that if the low-address check sees it.

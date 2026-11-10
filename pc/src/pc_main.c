@@ -7,6 +7,7 @@
 #include <unistd.h>
 #include <pthread.h>
 #include "pc_lowheap.h"
+#include "pc_crash.h"
 struct pc_android_boot {
     int argc;
     char** argv;
@@ -28,6 +29,7 @@ static void* pc_android_low_stack_main(void* arg) {
 #include "pc_settings.h"
 #include "pc_keybindings.h"
 #include "pc_assets.h"
+#include "pc_crash.h"
 #include "pc_disc.h"
 #include "pc_typing.h"
 #include "pc_chat.h" /* chat (worker CH): the chat line owns the keyboard while it is open */
@@ -338,24 +340,29 @@ void pc_platform_init(void) {
         );
     }
     if (!g_pc_window) {
-        fprintf(stderr, "SDL_CreateWindow failed: %s\n", SDL_GetError());
+        char msg[256];
+        snprintf(msg, sizeof(msg), "SDL_CreateWindow failed: %s", SDL_GetError());
+        pc_diag_fail_box("ACGC Town", msg);
         SDL_Quit();
         exit(1);
     }
 
     g_pc_gl_context = SDL_GL_CreateContext(g_pc_window);
     if (!g_pc_gl_context) {
-        fprintf(stderr, "SDL_GL_CreateContext failed: %s\n", SDL_GetError());
+        char msg[320];
+        snprintf(msg, sizeof(msg), "OpenGL ES context failed: %s", SDL_GetError());
+        pc_diag_fail_box("ACGC Town", msg);
         SDL_DestroyWindow(g_pc_window);
         SDL_Quit();
         exit(1);
     }
+    pc_diag_milestone("GL context ok");
 
 #ifdef PC_GLES
     g_pc_gl_live = 1; /* GLES 3 entry points come from libGLESv3, not glad */
 #else
     if (!gladLoadGL((GLADloadfunc)SDL_GL_GetProcAddress)) {
-        fprintf(stderr, "gladLoadGL failed\n");
+        pc_diag_fail_box("ACGC Town", "gladLoadGL failed");
         SDL_GL_DeleteContext(g_pc_gl_context);
         SDL_DestroyWindow(g_pc_window);
         SDL_Quit();
@@ -498,6 +505,11 @@ static void pc_test_frame_dump(void) {
 #endif
 
 void pc_platform_swap_buffers(void) {
+    static int s_first_frame = 0;
+    if (!s_first_frame) {
+        s_first_frame = 1;
+        pc_diag_milestone("first frame");
+    }
     pc_gx_draw_pending();
 #ifdef PC_NET_TEST_HOOKS
     pc_test_frame_dump();
@@ -1758,27 +1770,45 @@ int main(int argc, char* argv[]) {
 #ifdef __ANDROID__
     /* The decomp stores some stack addresses in u32. Run the game on a stack taken from the below-4GB heap. */
     static int s_on_low_stack;
+    pc_diag_init();
     if (!s_on_low_stack) {
         struct pc_android_boot boot;
         pthread_t thread;
         pthread_attr_t attr;
-        void* raw = pc_lowheap_reserve(8u * 1024u * 1024u + 4096u);
-        uintptr_t aligned = ((uintptr_t)raw + 4095u) & ~(uintptr_t)4095u;
+        long page = sysconf(_SC_PAGESIZE);
+        size_t stack_bytes = 8u * 1024u * 1024u;
+        void* raw;
+        uintptr_t aligned;
+        if (page < 4096) page = 4096;
+        if (!pc_lowheap_ok()) {
+            pc_diag_fail_box("ACGC Town", pc_lowheap_error());
+            return 1;
+        }
+        raw = pc_lowheap_reserve(stack_bytes + (size_t)page);
+        if (raw == NULL) {
+            pc_diag_fail_box("ACGC Town", "The low heap is reserved, but an 8MB thread stack would not fit in it.");
+            return 1;
+        }
+        aligned = ((uintptr_t)raw + (uintptr_t)page - 1u) & ~((uintptr_t)page - 1u);
+        if (aligned + stack_bytes > (uintptr_t)raw + stack_bytes + (size_t)page) {
+            pc_diag_fail_box("ACGC Town", "The thread stack could not be aligned to the device page size.");
+            return 1;
+        }
         s_on_low_stack = 1;
         boot.argc = argc;
         boot.argv = argv;
         boot.rc = 1;
         pthread_attr_init(&attr);
-        pthread_attr_setstack(&attr, (void*)aligned, 8u * 1024u * 1024u);
-        if (pthread_create(&thread, &attr, pc_android_low_stack_main, &boot) != 0) {
+        if (pthread_attr_setstack(&attr, (void*)aligned, stack_bytes) != 0 ||
+            pthread_create(&thread, &attr, pc_android_low_stack_main, &boot) != 0) {
             s_on_low_stack = 0;
             pthread_attr_destroy(&attr);
-            fprintf(stderr, "[PC] arm64: could not start the low stack; staying on the system stack\n");
-        } else {
-            pthread_attr_destroy(&attr);
-            pthread_join(thread, NULL);
-            return boot.rc;
+            pc_diag_fail_box("ACGC Town", "Could not start the game thread on the low stack.");
+            return 1;
         }
+        pthread_attr_destroy(&attr);
+        pthread_join(thread, NULL);
+        return boot.rc;
     }
     /* SDLActivity calls this as SDL_main. The disc picker stored the image in internal storage; shaders are copied there too. */
     {
@@ -2988,20 +3018,18 @@ int main(int argc, char* argv[]) {
     }
     pc_disc_init();
     if (!pc_assets_init()) {
-        const char* msg =
+        const char* disc_err = pc_disc_last_error();
+        const char* msg = (disc_err != NULL && disc_err[0] != '\0') ? disc_err :
             "No game data found.\n\n"
             "Animal Crossing needs the original GameCube ROM to run.\n"
             "Place a disc image (.iso, .gcm, or .ciso) to the \"rom\" subfolder.";
         fprintf(stderr, "[PC] %s\n", msg);
+        pc_diag_fail_box("Animal Crossing - Missing ROM", msg);
         pc_lowaddr_report();
-        /* A headless dedicated server has no window. The dialog would wait forever. */
-        if (g_pc_window != NULL) {
-            SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_ERROR,
-                                     "Animal Crossing - Missing ROM", msg, g_pc_window);
-        }
         pc_platform_shutdown();
         return 1;
     }
+    pc_diag_milestone("rom opened");
 
     pc_lowaddr_report();
     ac_entry();                         /* sets HotStartEntry = &entry */
