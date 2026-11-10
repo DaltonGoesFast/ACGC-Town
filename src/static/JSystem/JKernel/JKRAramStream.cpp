@@ -199,7 +199,7 @@ void JKRAramStream::setTransBuffer(u8* buffer, u32 bufferSize, JKRHeap* heap) {
     transHeap = nullptr;
 
     if (buffer) {
-        transBuffer = (u8*)ALIGN_NEXT((u32)(uintptr_t)buffer, 0x20);
+        transBuffer = (u8*)ALIGN_NEXT((uintptr_t)buffer, 0x20);
     }
 
     if (bufferSize) {

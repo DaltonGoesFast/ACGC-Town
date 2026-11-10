@@ -77,7 +77,7 @@ JKRADCommand* JKRDvdAramRipper::callCommand_Async(JKRADCommand* command) {
         fileSize = ALIGN_NEXT(fileSize, 0x20);
         if (command->mExpandSwitch == EXPAND_SWITCH_DECOMPRESS) {
             u8 buffer[0x40];
-            u8* bufPtr = (u8*)ALIGN_NEXT((u32)(uintptr_t)buffer, 0x20);
+            u8* bufPtr = (u8*)ALIGN_NEXT((uintptr_t)buffer, 0x20);
             while (true) {
                 if (DVDReadPrio(dvdFile->getFileInfo(), bufPtr, 0x20, 0, 2) >= 0) {
                     break;

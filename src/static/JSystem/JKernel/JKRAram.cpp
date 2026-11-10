@@ -193,7 +193,7 @@ u8* JKRAram::aramToMainRam(u32 address, u8* buf, u32 srcSize, JKRExpandSwitch ex
     u32 expandSize;
     if (expandSwitch == EXPAND_SWITCH_DECOMPRESS) {
         u8 buffer[64];
-        u8* bufPtr = (u8*)ALIGN_NEXT((u32)(uintptr_t)buffer, 32);
+        u8* bufPtr = (u8*)ALIGN_NEXT((uintptr_t)buffer, 32);
         JKRAramPcs(1, address, (u32)(uintptr_t)bufPtr, sizeof(buffer) / 2,
                    nullptr); // probably change sizeof(buffer) / 2 to 32
         compression = JKRCheckCompressed(bufPtr);

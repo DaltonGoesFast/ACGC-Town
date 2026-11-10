@@ -266,8 +266,9 @@ void Nas_HeapInit(ALHeap* heap, u8* p2, s32 p3) {
         heap->current = NULL;
         heap->last = NULL;
     } else {
-        length = p3 - ((u32)(uintptr_t)p2 & 0x1F);
-        heap->base = (u8*)ALIGN_NEXT((u32)(uintptr_t)p2, 32);
+        /* Keep the high half. audiomemory lives in the .so, above 4 GB, and a u32 base is not mapped. */
+        length = p3 - (int)((uintptr_t)p2 & 0x1F);
+        heap->base = (u8*)ALIGN_NEXT((uintptr_t)p2, 32);
         heap->current = heap->base;
         heap->length = length;
         heap->last = NULL;

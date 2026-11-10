@@ -406,7 +406,7 @@ static u32 texture_cache_get_heap_size(texture_cache_t* cache) {
 
 static void* texture_cache_alloc(texture_cache_t* cache, u32 size) {
     cache->last_alloc_start = cache->buffer_current;
-    cache->last_alloc_end = (u8*)ALIGN_NEXT((u32)(uintptr_t)cache->buffer_current + size, 32);
+    cache->last_alloc_end = (u8*)ALIGN_NEXT((uintptr_t)cache->buffer_current + size, 32);
 
     if (cache->buffer_pos < cache->last_alloc_end - cache->buffer_start) {
         cache->buffer_pos = cache->last_alloc_end - cache->buffer_start;
@@ -3380,7 +3380,7 @@ void emu64::dirty_check(int tile, int n_tiles, int do_texture_matrix) {
                         this->Printf0("テクスチャ(%08x)のアライメントが３２バイトになっていません\n", img_addr);
                         /* GC hardware DMA requires 32-byte alignment; truncate.
                          * On PC we decode in software so the raw address is correct. */
-                        img_addr = (void*)((u32)(uintptr_t)img_addr & ~0x1F);
+                        img_addr = (void*)((uintptr_t)img_addr & ~(uintptr_t)0x1F);
 #endif
                     }
 
