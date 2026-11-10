@@ -817,7 +817,8 @@ int main(int argc, const char** argv) {
     Matrix_push();
     Matrix_pull();
     boot_stage("boot: matrix push ok");
-    return 0;
+    pc_hb_boot_test_arm();
+    boot_stage("boot: running 30s past HotStartEntry");
   }
 #endif
 #endif

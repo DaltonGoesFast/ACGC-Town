@@ -28,6 +28,7 @@
 #ifdef TARGET_PC
 #include "pc_model_viewer.h"
 #include "pc_diag.h"
+#include "pc_crash.h"
 #include "pc_platform.h"
 #include "pc_pause_menu.h"
 #include "pc_tool_wheel.h"
@@ -389,10 +390,13 @@ static void graph_main(GRAPH* this, GAME* game) {
 #ifdef TARGET_PC
     {
         Uint64 pc_prof_t;
+        pc_hb_set_scene((void*)game->exec, (int)this->doing_point);
+        pc_hb_set_step("graph_main game");
         pc_profiler_begin_frame();
         pc_prof_t = pc_profiler_begin_timer();
         game_main(game);
         pc_profiler_add_time(PC_PROF_TIMER_GAME_LOGIC, pc_prof_t);
+        pc_hb_set_step("graph_main draw");
     }
 #else
     game_main(game);
@@ -458,6 +462,9 @@ static void graph_main(GRAPH* this, GAME* game) {
 
 extern void graph_proc(void* arg) {
     GRAPH* __graph = &graph_class;
+#ifdef TARGET_PC
+    pc_hb_set_step("graph_proc");
+#endif
     DLFTBL_GAME* dlftbl = &game_dlftbls[0];
 #ifdef TARGET_PC
     if (g_pc_model_viewer) {

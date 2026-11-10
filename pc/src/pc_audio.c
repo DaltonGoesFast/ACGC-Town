@@ -76,6 +76,10 @@ static int pc_audio_producer_func(void* data) {
     return 0;
 }
 
+int pc_audio_is_on(void) {
+    return g_pc_settings.audio;
+}
+
 void pc_audio_start_producer_thread(void) {
     if (!g_pc_settings.audio) {
         printf("[AUDIO] audio=0, producer thread not started\n");

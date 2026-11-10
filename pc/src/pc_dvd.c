@@ -2,6 +2,7 @@
 #include "pc_platform.h"
 #include "pc_disc.h"
 #include "dolphin/dvd.h" /* the real DVDFileInfo / DVDCommandBlock / DVDDiskID layouts (see dvd_fi_* below) */
+#include "pc_crash.h"
 
 static DVDDiskID disk_id = {
     {'G', 'A', 'F', 'E'},
@@ -171,6 +172,7 @@ BOOL DVDClose(DVDFileInfo* fileInfo) {
 s32 DVDReadPrio(DVDFileInfo* fileInfo, void* buf, s32 length, s32 offset, s32 prio) {
     FILE* fp = *dvd_fi_fp(fileInfo);
     (void)prio;
+    pc_hb_note_dvd((unsigned)offset, (unsigned)length);
 
     if (fp == DISC_SENTINEL) {
         /* disc image read */

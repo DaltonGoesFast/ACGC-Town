@@ -9,8 +9,10 @@
 #include <dlfcn.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <pthread.h>
 #include <signal.h>
 #include <stdlib.h>
+#include <time.h>
 #include <unistd.h>
 #include <unwind.h>
 
@@ -242,6 +244,169 @@ static void pc_diag_sdl_log(void* userdata, int category, SDL_LogPriority pri, c
     }
 }
 
+static pthread_t s_game_thread;
+static int s_game_thread_set = 0;
+static pthread_mutex_t s_hb_mu = PTHREAD_MUTEX_INITIALIZER;
+static char s_step[160] = "startup";
+static char s_dvd[64] = "-";
+static char s_gx[48] = "-";
+static void* s_scene = NULL;
+static int s_doing = -1;
+static unsigned s_frames = 0;
+static unsigned s_retrace = 0;
+static uint64_t s_last_frame_ms = 0;
+static int s_boot_test = 0;
+static uint64_t s_boot_test_t0 = 0;
+static int s_boot_stop = 0;
+
+static uint64_t mono_ms(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000ull + (uint64_t)ts.tv_nsec / 1000000ull;
+}
+
+static void pc_diag_on_stall(int sig, siginfo_t* info, void* uctx) {
+    int fd;
+    (void)sig;
+    (void)info;
+    (void)uctx;
+    __android_log_print(ANDROID_LOG_ERROR, "ACGC", "watchdog: game thread stalled, unwinding");
+    if (s_crash_path[0] == '\0') pc_diag_paths_from_logdir();
+    fd = open(s_crash_path, O_WRONLY | O_CREAT | O_APPEND, 0644);
+    if (fd >= 0) {
+        wr_fd(fd, "\nSTALL game thread did not finish a frame for 5s\n");
+    }
+    pc_diag_write_crash(fd, 0, NULL);
+    if (fd >= 0) {
+        fsync(fd);
+        close(fd);
+    }
+    if (s_session_fd >= 0) {
+        wr_fd(s_session_fd, "\nSTALL game thread did not finish a frame for 5s\n");
+        fsync(s_session_fd);
+    }
+}
+
+static void* pc_hb_thread(void* arg) {
+    unsigned seen = 0;
+    int dumped = 0;
+    (void)arg;
+    for (;;) {
+        char step[160], dvd[64], gx[48], line[420], sym[80];
+        void* scene;
+        int doing;
+        unsigned frames, retrace;
+        uint64_t last;
+        Dl_info inf;
+        sleep(1);
+        pthread_mutex_lock(&s_hb_mu);
+        memcpy(step, s_step, sizeof(step));
+        memcpy(dvd, s_dvd, sizeof(dvd));
+        memcpy(gx, s_gx, sizeof(gx));
+        scene = s_scene;
+        doing = s_doing;
+        frames = s_frames;
+        retrace = s_retrace;
+        last = s_last_frame_ms;
+        pthread_mutex_unlock(&s_hb_mu);
+        sym[0] = '?';
+        sym[1] = '\0';
+        memset(&inf, 0, sizeof(inf));
+        if (scene != NULL && dladdr(scene, &inf) && inf.dli_sname != NULL) {
+            snprintf(sym, sizeof(sym), "%s", inf.dli_sname);
+        }
+        snprintf(line, sizeof(line),
+                 "hb frame=%u scene=%s doing=%d step=%s retrace=%u dvd=%s gx=%s idle=%llums",
+                 frames, sym, doing, step, retrace, dvd, gx,
+                 (unsigned long long)(last == 0 ? 0 : mono_ms() - last));
+        pc_diag_milestone(line);
+        if (s_game_thread_set && last != 0 && mono_ms() - last >= 5000ull && frames == seen && !dumped) {
+            pthread_t target;
+            int live;
+            pthread_mutex_lock(&s_hb_mu);
+            live = s_game_thread_set;
+            target = s_game_thread;
+            pthread_mutex_unlock(&s_hb_mu);
+            if (live) {
+                dumped = 1;
+                if (pthread_kill(target, SIGUSR1) != 0) dumped = 0;
+            }
+        }
+        if (frames != seen) {
+            dumped = 0;
+            seen = frames;
+        }
+    }
+    return NULL;
+}
+
+void pc_hb_set_step(const char* step) {
+    if (step == NULL) return;
+    pthread_mutex_lock(&s_hb_mu);
+    snprintf(s_step, sizeof(s_step), "%s", step);
+    pthread_mutex_unlock(&s_hb_mu);
+}
+
+void pc_hb_set_scene(void* exec, int doing) {
+    pthread_mutex_lock(&s_hb_mu);
+    s_scene = exec;
+    s_doing = doing;
+    pthread_mutex_unlock(&s_hb_mu);
+}
+
+void pc_hb_note_dvd(unsigned off, unsigned len) {
+    pthread_mutex_lock(&s_hb_mu);
+    snprintf(s_dvd, sizeof(s_dvd), "off=%u len=%u", off, len);
+    pthread_mutex_unlock(&s_hb_mu);
+}
+
+void pc_hb_note_gx(int w, int h) {
+    pthread_mutex_lock(&s_hb_mu);
+    snprintf(s_gx, sizeof(s_gx), "%dx%d", w, h);
+    pthread_mutex_unlock(&s_hb_mu);
+}
+
+void pc_hb_frame_done(unsigned frame, unsigned retrace) {
+    uint64_t now = mono_ms();
+    pthread_mutex_lock(&s_hb_mu);
+    s_frames = frame;
+    s_retrace = retrace;
+    s_last_frame_ms = now;
+    if (s_boot_test && s_boot_test_t0 == 0) s_boot_test_t0 = now;
+    if (s_boot_test && s_boot_test_t0 != 0 && now - s_boot_test_t0 >= 30000ull) s_boot_stop = 1;
+    pthread_mutex_unlock(&s_hb_mu);
+}
+
+void pc_hb_boot_test_arm(void) {
+    pthread_mutex_lock(&s_hb_mu);
+    s_boot_test = 1;
+    s_boot_test_t0 = 0;
+    s_boot_stop = 0;
+    pthread_mutex_unlock(&s_hb_mu);
+}
+
+int pc_hb_boot_should_stop(void) {
+    int stop;
+    pthread_mutex_lock(&s_hb_mu);
+    stop = s_boot_stop;
+    pthread_mutex_unlock(&s_hb_mu);
+    return stop;
+}
+
+void pc_hb_shutdown(void) {
+    pthread_mutex_lock(&s_hb_mu);
+    s_game_thread_set = 0;
+    pthread_mutex_unlock(&s_hb_mu);
+}
+
+static void pc_hb_start(void) {
+    pthread_t thr;
+    s_game_thread = pthread_self();
+    s_game_thread_set = 1;
+    s_last_frame_ms = mono_ms();
+    if (pthread_create(&thr, NULL, pc_hb_thread, NULL) == 0) pthread_detach(thr);
+}
+
 static void pc_diag_install_signals(void) {
     struct sigaction sa;
     if (s_signals_ready) return;
@@ -252,6 +417,10 @@ static void pc_diag_install_signals(void) {
     sigaction(SIGBUS, &sa, NULL);
     sigaction(SIGABRT, &sa, NULL);
     sigaction(SIGILL, &sa, NULL);
+    memset(&sa, 0, sizeof(sa));
+    sa.sa_sigaction = pc_diag_on_stall;
+    sa.sa_flags = SA_SIGINFO | SA_RESTART;
+    sigaction(SIGUSR1, &sa, NULL);
     s_signals_ready = 1;
 }
 
@@ -273,11 +442,13 @@ void pc_diag_init(void) {
     pc_diag_install_signals();
     pc_diag_open_logs();
     SDL_LogSetOutputFunction(pc_diag_sdl_log, NULL);
+    pc_hb_start();
     pc_diag_milestone("diag init");
 }
 
 void pc_diag_milestone(const char* msg) {
     if (msg == NULL) return;
+    if (strncmp(msg, "hb ", 3) != 0) pc_hb_set_step(msg);
     pc_diag_remember(msg);
     __android_log_print(ANDROID_LOG_INFO, "ACGC", "%s", msg);
     fprintf(stderr, "[PC] %s\n", msg);
@@ -302,6 +473,14 @@ void pc_diag_fail_box(const char* title, const char* msg) {
 
 void pc_diag_init(void) {}
 void pc_diag_milestone(const char* msg) { (void)msg; }
+void pc_hb_set_step(const char* step) { (void)step; }
+void pc_hb_set_scene(void* exec, int doing) { (void)exec; (void)doing; }
+void pc_hb_note_dvd(unsigned off, unsigned len) { (void)off; (void)len; }
+void pc_hb_note_gx(int w, int h) { (void)w; (void)h; }
+void pc_hb_frame_done(unsigned frame, unsigned retrace) { (void)frame; (void)retrace; }
+void pc_hb_boot_test_arm(void) {}
+int pc_hb_boot_should_stop(void) { return 0; }
+void pc_hb_shutdown(void) {}
 void pc_diag_fail_box(const char* title, const char* msg) {
     (void)title;
     if (msg != NULL) fprintf(stderr, "[PC] %s\n", msg);

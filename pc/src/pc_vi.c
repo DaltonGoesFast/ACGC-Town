@@ -1,5 +1,6 @@
 /* pc_vi.c - video interface → SDL window swap + frame pacing */
 #include "pc_platform.h"
+#include "pc_crash.h"
 #include "pc_profiler.h"
 #include "pc_net_game.h"
 #include "pc_remote_player.h"
@@ -318,6 +319,8 @@ void VIWaitForRetrace(void) {
 
     retrace_count++;
     pc_frame_counter++;
+    pc_hb_frame_done(pc_frame_counter, retrace_count);
+    if (pc_hb_boot_should_stop()) g_pc_running = 0;
 }
 
 u32 VIGetRetraceCount(void) { return retrace_count; }

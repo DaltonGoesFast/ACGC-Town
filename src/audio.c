@@ -44,7 +44,15 @@ extern void sAdo_Calc_MicPosition_forLevel(f32* fcalc, u16* scalc, const xyz_t* 
 
 extern void sAdo_GameFrame() {
     Na_GameFrame();
-    /* pc_audio_process_frame() now runs on dedicated audio producer thread */
+#ifdef TARGET_PC
+    /* audio=0 never starts the producer, so the spec-change message that
+     * second_game waits on is never posted and the title stays black. */
+    {
+        extern int pc_audio_is_on(void);
+        extern void pc_audio_process_frame(void);
+        if (!pc_audio_is_on()) pc_audio_process_frame();
+    }
+#endif
 }
 
 extern void sAdo_BgmStart(u8 id) {

@@ -419,6 +419,7 @@ void pc_platform_init(void) {
 extern void PADCleanup(void);
 
 void pc_platform_shutdown(void) {
+    pc_hb_shutdown();
     pc_audio_shutdown();
     pc_audio_mq_shutdown();
     PADCleanup();
@@ -527,9 +528,20 @@ static void pc_test_frame_dump(void) {
 
 void pc_platform_swap_buffers(void) {
     static int s_first_frame = 0;
+    static int s_draw_w = -1;
+    static int s_draw_h = -1;
     if (!s_first_frame) {
         s_first_frame = 1;
         pc_diag_milestone("first frame");
+    }
+    pc_platform_update_window_size();
+    if (g_pc_window_w != s_draw_w || g_pc_window_h != s_draw_h) {
+        s_draw_w = g_pc_window_w;
+        s_draw_h = g_pc_window_h;
+#ifdef PC_GLES
+        glViewport(0, 0, g_pc_window_w, g_pc_window_h);
+#endif
+        pc_hb_note_gx(g_pc_window_w, g_pc_window_h);
     }
     pc_gx_draw_pending();
 #ifdef PC_NET_TEST_HOOKS
@@ -2969,13 +2981,16 @@ int main(int argc, char* argv[]) {
 #ifdef __ANDROID__
     if (s_boot_test) {
         extern int boot_main(int argc, const char** argv);
+        extern void ac_entry(void);
         extern void pc_install_stub_font(void);
         int rc;
         pc_install_stub_font();
         pc_disc_init();
         pc_diag_milestone(pc_disc_is_open() ? "boot test: disc open" : "boot test: disc closed");
+        ac_entry();
         pc_diag_milestone("boot test: boot_main");
         rc = boot_main(argc, (const char**)argv);
+        pc_hb_shutdown();
         pc_diag_milestone("boot test: boot_main returned");
         if (pc_lowaddr_game_violation_count() != 0) {
             pc_diag_fail_box("ACGC Town", "A game pointer is still above 4 GB. See the lowaddr AUDIT log.");
