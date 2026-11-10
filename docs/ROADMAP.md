@@ -45,7 +45,7 @@ These come from the original game and from the multiplayer branch. They are limi
 Build the same `pc/` sources three ways:
 
 - Linux/Windows native (what this branch builds), UDP to the server.
-- Android, GLES 3, touch overlay. Prior art: [zwaetschge/ACGC-Android-Port](https://github.com/zwaetschge/ACGC-Android-Port) (same CC0 decomp + MIT PC-port licence as upstream). Study its EGL/GLES context and touch overlay. Do not copy files in blindly; keep this repo's MIT header on new code and do not take assets.
+- Android, GLES 3, touch overlay. Prior art: [zwaetschge/ACGC-Android-Port](https://github.com/zwaetschge/ACGC-Android-Port) (same CC0 decomp + MIT PC-port licence as upstream). Study its EGL/GLES context and touch overlay. Do not copy files in blindly; keep this repo's MIT header on new code and do not take assets. The first project is `pc/android/` (SDL2 activity, armeabi-v7a, GLES 3 shell). The game itself is not linked into that APK yet. See `docs/ANDROID.md`.
 - Browser, Emscripten + WebGL 2, WebSocket to `ws_port`. Prior art: [turtlekiosk/slider](https://github.com/turtlekiosk/slider) `wasm` branch (Emscripten, WebGL 2, touch joystick). Slider's own web/Android modifications are MIT (Copyright 2026 turtlekiosk). It also vendors nipplejs (MIT) and the Work Sans font (SIL OFL). Those are not imported here. The WebSocket server in this branch speaks raw RFC 6455 so a later Emscripten client can use the browser `WebSocket` API without a UDP shim.
 
 [Dia2809/ACGC-PC-Port](https://github.com/Dia2809/ACGC-PC-Port) is a Linux fork of the single-player port (CC0 + MIT, same shape as flyngmt). Useful for Linux build notes. It has no dedicated server and no WebSocket layer; this branch does not vendor it.

@@ -28,6 +28,13 @@ artifacts/
 build/
 build32/
 build64/
+pc/build-mingw/
+pc/build-mingw32/
+pc/android/.gradle/
+pc/android/build/
+pc/android/app/build/
+pc/android/app/.cxx/
+pc/android/.cxx/
 .ninja_*
 build.ninja
 

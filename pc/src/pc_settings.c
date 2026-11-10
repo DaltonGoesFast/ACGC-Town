@@ -20,7 +20,15 @@ PCSettings g_pc_settings = {
     .borderless_acres = 1,
     .fast_text = 1,
     .show_acre = 1,
+#ifdef __ANDROID__
+    .touch_controls = 1,
+#else
     .touch_controls = -1,
+#endif
+    .touch_run = 1,
+    .touch_camera = 1,
+    .touch_menus = 1,
+    .touch_keyboard = 1,
     .nes_aspect = 1,
     .master_volume = 100,
     .stick_deadzone = 12,
@@ -101,8 +109,19 @@ static const char* DEFAULT_SETTINGS =
     "# Outdoor acre label under the clock (A1 Grass, and so on): 0 = off, 1 = on (local HUD only)\n"
     "show_acre = 1\n"
     "\n"
+#ifdef __ANDROID__
+    "# Touch overlay: on for Android. auto / on / off. auto is on only when a touchscreen is present\n"
+    "touch_controls = on\n"
+#else
     "# Touch overlay (tap or click to walk, on-screen A / B / Tool / Emote): auto, on, or off. auto is on only when a touchscreen is present\n"
     "touch_controls = auto\n"
+#endif
+    "\n"
+    "# While touch_controls is on: 1 = a long drag runs, two fingers move the camera, a short tap confirms menus and text, Chat opens the keyboard\n"
+    "touch_run = 1\n"
+    "touch_camera = 1\n"
+    "touch_menus = 1\n"
+    "touch_keyboard = 1\n"
     "\n"
     "# NES emulator aspect ratio: 0 = stretch to fullscreen, 1 = 4:3 pillarbox\n"
     "nes_aspect = 1\n"
@@ -229,6 +248,14 @@ static void apply_setting(const char* key, const char* value) {
         if (strcmp(value, "on") == 0 || strcmp(value, "1") == 0) g_pc_settings.touch_controls = 1;
         else if (strcmp(value, "off") == 0 || strcmp(value, "0") == 0) g_pc_settings.touch_controls = 0;
         else if (strcmp(value, "auto") == 0 || strcmp(value, "-1") == 0) g_pc_settings.touch_controls = -1;
+    } else if (strcmp(key, "touch_run") == 0) {
+        if (val == 0 || val == 1) g_pc_settings.touch_run = val;
+    } else if (strcmp(key, "touch_camera") == 0) {
+        if (val == 0 || val == 1) g_pc_settings.touch_camera = val;
+    } else if (strcmp(key, "touch_menus") == 0) {
+        if (val == 0 || val == 1) g_pc_settings.touch_menus = val;
+    } else if (strcmp(key, "touch_keyboard") == 0) {
+        if (val == 0 || val == 1) g_pc_settings.touch_keyboard = val;
     } else if (strcmp(key, "emotes") == 0) {
         if (val == 0 || val == 1) g_pc_settings.emotes = val;
     } else if (strcmp(key, "handover_anim") == 0) {
@@ -379,6 +406,12 @@ void pc_settings_save(void) {
     fprintf(f, "\n");
     fprintf(f, "# Touch overlay (tap or click to walk, on-screen A / B / Tool / Emote): auto, on, or off. auto is on only when a touchscreen is present\n");
     fprintf(f, "touch_controls = %s\n", g_pc_settings.touch_controls < 0 ? "auto" : g_pc_settings.touch_controls ? "on" : "off");
+    fprintf(f, "\n");
+    fprintf(f, "# While touch_controls is on: 1 = a long drag runs, two fingers move the camera, a short tap confirms menus and text, Chat opens the keyboard\n");
+    fprintf(f, "touch_run = %d\n", g_pc_settings.touch_run);
+    fprintf(f, "touch_camera = %d\n", g_pc_settings.touch_camera);
+    fprintf(f, "touch_menus = %d\n", g_pc_settings.touch_menus);
+    fprintf(f, "touch_keyboard = %d\n", g_pc_settings.touch_keyboard);
     fprintf(f, "\n");
     fprintf(f, "# NES emulator aspect ratio: 0 = stretch to fullscreen, 1 = 4:3 pillarbox\n");
     fprintf(f, "nes_aspect = %d\n", g_pc_settings.nes_aspect);

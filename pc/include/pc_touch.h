@@ -17,8 +17,10 @@ struct game_s;
 int pc_touch_enabled(void);
 
 /* Merge touch and mouse into the pad sample. pointer_x/y are the mouse position in window pixels;
- * a finger that is holding Tool or Emote replaces them so the existing wheel aims from that finger. */
+ * a finger that is holding Tool or Emote replaces them so the existing wheel aims from that finger.
+ * cstick is the two-finger camera drag. All of it is local; nothing is sent as a new packet. */
 void pc_touch_apply(unsigned short* buttons, signed char* stick_x, signed char* stick_y,
+                    signed char* cstick_x, signed char* cstick_y,
                     int* wheel_hold, int* emote_hold, int* pointer_x, int* pointer_y);
 
 void pc_touch_draw(struct game_s* game);

@@ -130,7 +130,7 @@ Or without the script:
 - Console: `help`, `status`, `players`, `kick`, `promote`, `save`, `stop`. Ctrl+C asks the game loop to stop. Under systemd, stdin is already closed. The same commands go to `servers/default/console.fifo` (mode 0600), for example `echo stop > servers/default/console.fifo`.
 - Without a disc image the process creates the server directory, binds UDP and WebSocket, prints that the ROM is missing, and exits 1. It does not invent a town.
 
-The plan for Android, the browser client, and touch controls is [docs/ROADMAP.md](docs/ROADMAP.md).
+The plan for Android, the browser client, and touch controls is [docs/ROADMAP.md](docs/ROADMAP.md). The Android Gradle project is [pc/android](pc/android) (`docs/ANDROID.md`): armeabi-v7a, SDL2, a GLES 3 shell, and a disc picker. The game itself is not linked into that APK yet. Desktop touch is `touch_controls` in `settings.ini` (`auto` / `on` / `off`).
 
 ## Controls
 
