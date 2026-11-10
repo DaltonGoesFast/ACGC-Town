@@ -24402,11 +24402,20 @@ static int pcnetgame_txn_apply_dresser(const PCNetGameClientTxn* T, const PCNetG
 
 /* ===== RESTOCK HOST BEGIN: the restock timer, its restart-resume file (save/mp/shop_restock.ini) and the catalog regeneration ===== */
 static uint64_t pcnetgame_restock_wall_ms(void) {
+#if defined(_WIN32)
+    /* MinGW's msvcrt declares timespec_get and does not provide it. The restock file only needs a wall clock. */
+    time_t now = time(NULL);
+    return now == (time_t)-1 ? 0 : (uint64_t)now * 1000u;
+#else
     struct timespec ts;
+#ifndef TIME_UTC
+#define TIME_UTC 1
+#endif
     if (timespec_get(&ts, TIME_UTC) == 0) {
         return 0;
     }
     return (uint64_t)ts.tv_sec * 1000u + (uint64_t)(ts.tv_nsec / 1000000L);
+#endif
 }
 
 static int pcnetgame_restock_path(char* out, size_t cap) {
