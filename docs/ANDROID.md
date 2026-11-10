@@ -2,7 +2,7 @@
 
 The phone build is `pc/android/`. It is a Gradle project whose activity is SDL2's `SDLActivity` (zlib, SDL 2.30.10, vendored under `pc/android/app/src/main/java/org/libsdl/app/`). The native libraries are CMake and OpenGL ES 3. This APK is **arm64-v8a** (versionCode 12), which is the only ABI a Galaxy Z Fold 6 can load. minSdk is 24, targetSdk is 34, and the debug APK is signed with the standard Android debug key (`androiddebugkey` / `android`).
 
-[zwaetschge/ACGC-Android-Port](https://github.com/zwaetschge/ACGC-Android-Port) was read for the shape of the problem: an SDL2 Android activity, a GLES 3 context instead of desktop GL, a Storage Access Framework picker so the disc is not in the APK, and NDK CMake. Its licence is the same MIT text as the PC port. None of its Java, Python, texture tools, or game patches were copied. The Java activity here is SDL's own, not that port's launcher.
+[zwaetschge/ACGC-Android-Port](https://github.com/zwaetschge/ACGC-Android-Port) was read for the shape of the problem: an SDL2 Android activity, a GLES 3 context instead of desktop GL, a Storage Access Framework picker so the disc is not in the APK, and NDK CMake. Its licence is CC0 for the decomp and MIT for the PC-port layer (Copyright 2026 FlyingMeta), plus MIT for FixNES. None of its Java, Python, texture tools, or game patches were copied. The comparison is `docs/ANDROID_ARM64_AUDIT.md`. The Java activity here is SDL's own, not that port's launcher.
 
 No ROM and no game assets are in this tree or in the APK. The first screen asks for a USA GAFE01 image and copies it into the app's private files. Uninstalling the app deletes that copy.
 
@@ -36,7 +36,7 @@ Pointers that still live outside `libmain` (a texture the driver allocated, for 
 
 ## Layout check
 
-`pc/tools/check_abi_layout.sh` compiles `pc/tools/abi_layout.c` twice and compares the `.abi_nums` section. Gradle runs it before the APK is built. A mismatch prints both rows and exits 1.
+`pc/tools/check_abi_layout.sh` compiles `pc/tools/abi_layout.c` twice and compares the `.abi_nums` section. Gradle runs it before the APK is built. A mismatch prints both rows and exits 1. The script needs Linux `gcc -m32` (the i386 server ABI, with `-malign-double`) and the Linux NDK clang `armv7a-linux-androideabi26-clang` (it looks at `ANDROID_NDK_HOME`, or `/tmp/android-sdk/ndk/26.1.10909125` if that is unset). It does not compile the arm64 game.
 
 The numbers that matched on this machine (linux i386 `-malign-double` and armeabi-v7a):
 

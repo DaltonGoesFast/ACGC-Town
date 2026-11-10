@@ -1,5 +1,5 @@
-/* SDL entry. Both ABIs ship this shell so a 64-bit-only phone can install and open the app.
- * The decomp is not linked here: an arm64 Save_t is not the server's 32-bit layout. */
+/* UNUSED shell. Gradle does not compile this file. The APK links the decomp
+ * through pc/CMakeLists.txt. Kept so the old standalone CMake still configures. */
 #include <SDL.h>
 #include <GLES3/gl3.h>
 #include <stdio.h>

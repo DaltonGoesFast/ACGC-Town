@@ -1,3 +1,5 @@
+# UNUSED. Gradle builds pc/CMakeLists.txt, which links the decomp into libmain.so.
+# This file is the early GLES shell and is not part of the APK.
 cmake_minimum_required(VERSION 3.22)
 project(acgc_town_android C)
 
@@ -17,9 +19,6 @@ FetchContent_MakeAvailable(SDL2)
 add_library(abi SHARED abi.c)
 target_link_libraries(abi log)
 
+# android_main.c is the unused shell. The APK's libmain.so comes from pc/CMakeLists.txt.
 add_library(main SHARED android_main.c)
 target_link_libraries(main SDL2 GLESv3 log)
-
-# Both ABIs. arm64-v8a is required for 64-bit-only phones (Galaxy Z Fold 6).
-# The decomp is not linked: an arm64 Save_t does not match the 32-bit server yet.
-# See docs/ANDROID.md.
