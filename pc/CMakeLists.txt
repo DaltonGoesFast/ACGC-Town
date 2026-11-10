@@ -635,6 +635,8 @@ if(ANDROID)
     # SDLActivity loads libmain.so. The later OUTPUT_NAME must not rename it.
     add_library(abi SHARED ${CMAKE_CURRENT_SOURCE_DIR}/android/app/src/main/cpp/abi.c)
     target_link_libraries(abi log)
+    add_library(lowload SHARED ${CMAKE_CURRENT_SOURCE_DIR}/android/app/src/main/cpp/lowload.c)
+    target_link_libraries(lowload dl log)
     if(CMAKE_SIZEOF_VOID_P EQUAL 8)
         target_sources(ac_pc PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src/pc_lowheap.c)
         target_link_options(ac_pc PRIVATE

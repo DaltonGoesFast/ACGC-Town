@@ -7,6 +7,7 @@
 #include <unistd.h>
 #include "pc_lowheap.h"
 #include "pc_crash.h"
+#include "pc_lowaddr.h"
 static int pc_game_main(int argc, char** argv);
 #endif
 #include "pc_guest_admit.h" /* --max-guests range */
@@ -1809,6 +1810,24 @@ static int pc_game_main(int argc, char* argv[]) {
     {
         const char* storage = SDL_AndroidGetInternalStoragePath();
         if (storage != NULL && storage[0] != '\0') chdir(storage);
+    }
+    if (access("/data/user/0/com.acgc.town/files/audio_init_test", F_OK) == 0 ||
+        access("/data/data/com.acgc.town/files/audio_init_test", F_OK) == 0) {
+        extern void sound_initial(void);
+        pc_diag_milestone("audio init test: sound_initial");
+        if (SDL_Init(SDL_INIT_TIMER | SDL_INIT_AUDIO) != 0) {
+            pc_diag_milestone(SDL_GetError());
+            return 2;
+        }
+        pc_lowaddr_init();
+        sound_initial();
+        pc_diag_milestone("audio init test: sound_initial returned");
+        if (pc_lowaddr_game_violation_count() != 0) {
+            pc_diag_fail_box("ACGC Town", "A game pointer is still above 4 GB. See the lowaddr AUDIT log.");
+            return 2;
+        }
+        pc_diag_milestone("audio init test: lowaddr clean");
+        return 0;
     }
 #else
 int main(int argc, char* argv[]) {

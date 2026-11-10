@@ -36,10 +36,20 @@ public class TownActivity extends SDLActivity {
     @Override
     public void loadLibraries() {
         LaunchTrace.mark(this);
-        Log.i("ACGC", "loading native libraries");
+        String main = new File(getApplicationInfo().nativeLibraryDir, "libmain.so").getAbsolutePath();
+        Log.i("ACGC", "placing " + main + " below 4GB");
         try {
-            super.loadLibraries();
-            Log.i("ACGC", "native libraries loaded");
+            String err = LowLoad.place(main);
+            if (err != null) {
+                LaunchTrace.note(this, err);
+                throw new UnsatisfiedLinkError(err);
+            }
+            /* place() already mapped these. System.loadLibrary is what registers
+             * JNI_OnLoad with this class loader. The linker returns the existing
+             * mapping, so libmain stays at the low address. */
+            System.loadLibrary("SDL2");
+            System.loadLibrary("main");
+            Log.i("ACGC", "native libraries loaded below 4GB");
         } catch (UnsatisfiedLinkError e) {
             LaunchTrace.note(this, "UnsatisfiedLinkError\n" + Log.getStackTraceString(e));
             throw e;

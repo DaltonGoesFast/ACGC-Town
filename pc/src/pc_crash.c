@@ -221,9 +221,17 @@ static void pc_diag_install_signals(void) {
 }
 
 __attribute__((constructor(50))) static void pc_diag_ctor(void) {
+    Dl_info inf;
     pc_diag_paths_from_logdir();
     pc_diag_install_signals();
-    __android_log_print(ANDROID_LOG_INFO, "ACGC", "diag ctor crash=%s", s_crash_path[0] ? s_crash_path : "(no path yet)");
+    memset(&inf, 0, sizeof(inf));
+    if (dladdr((void*)pc_diag_ctor, &inf) && inf.dli_fbase != NULL &&
+        (uintptr_t)inf.dli_fbase >= 0x100000000ull) {
+        __android_log_print(ANDROID_LOG_ERROR, "ACGC", "libmain loaded above 4GB at %p", inf.dli_fbase);
+        abort();
+    }
+    __android_log_print(ANDROID_LOG_INFO, "ACGC", "diag ctor base=%p crash=%s",
+                        inf.dli_fbase, s_crash_path[0] ? s_crash_path : "(no path yet)");
 }
 
 void pc_diag_init(void) {

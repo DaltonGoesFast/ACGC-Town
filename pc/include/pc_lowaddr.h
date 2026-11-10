@@ -42,6 +42,8 @@ int pc_lowaddr_selftest(void);
  * lands inside it). */
 int pc_lowaddr_report(void);
 int pc_lowaddr_violation_count(void);
+/* Violations other than the ART/OS thread stack, which cannot be moved below 4 GB. */
+int pc_lowaddr_game_violation_count(void);
 /* Register a fixed [lo, hi) address range that is reserved for a non-pointer sentinel purpose (e.g. a
  * synthetic token) and must never overlap a real tracked allocation. Checked by pc_lowaddr_report(). */
 void pc_lowaddr_reserve_range(const char* name, uint64_t lo, uint64_t hi);
