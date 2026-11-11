@@ -1,4 +1,5 @@
 /* pc_gx.c - GX API → OpenGL 3.3: state management, vertex submission, draw dispatch */
+#include "pc_crash.h"
 #include "pc_gx_internal.h"
 #include "pc_profiler.h"
 #include <stddef.h>
@@ -77,13 +78,25 @@ static float g_aspect_offset = 0.0f;
 static int   g_aspect_active = 0;
 
 static void pc_gx_update_aspect(void) {
-    /* The picture is letterboxed in the viewport (pc_layout_box). Squeezing the
-     * projection as well would pillarbox a second time. */
-    (void)g_pc_window_w;
-    (void)g_pc_window_h;
-    g_aspect_factor = 1.0f;
-    g_aspect_offset = 0.0f;
-    g_aspect_active = 0;
+    if (g_pc_content_w > 0 && g_pc_content_h > 0) {
+        float cur = (float)g_pc_content_w / (float)g_pc_content_h;
+        float base = 4.0f / 3.0f;
+        if (cur < base - 0.01f) {
+            /* Portrait: Vert+ scaling. Keeps horizontal FOV intact, expands vertical view */
+            g_aspect_factor = (3.0f / 4.0f) * cur;
+            g_aspect_active = 2; /* 2 = portrait Vert+ */
+        } else if (cur > base + 0.01f) {
+            /* Widescreen Hor+ */
+            g_aspect_factor = base / cur;
+            g_aspect_active = 1; /* 1 = widescreen Hor+ */
+        } else {
+            g_aspect_factor = 1.0f;
+            g_aspect_active = 0;
+        }
+    } else {
+        g_aspect_factor = 1.0f;
+        g_aspect_active = 0;
+    }
 }
 
 /* EFB capture: keep full-res GL textures from GXCopyTex instead of downsampling to 640x480 */
@@ -383,7 +396,9 @@ void pc_gx_init(void) {
 
     glBindVertexArray(0);
 
+    pc_diag_milestone("pc_gx_init: before tev");
     pc_gx_tev_init();
+    pc_diag_milestone("pc_gx_init: before texture");
     pc_gx_texture_init();
     pc_gx_texture_bind_cache_invalidate();
 
@@ -1303,11 +1318,19 @@ void GXSetProjection(const void* mtx, u32 type) {
     }
 
 #ifdef PC_ENHANCEMENTS
-    /* Widescreen: 0=hor+ (both), 1=stretch (none), 2=UI (ortho only) */
-    if (g_pc_widescreen_stretch == 0 ||
-        (g_pc_widescreen_stretch == 2 && type == GX_ORTHOGRAPHIC)) {
-        if (g_aspect_active) {
+    if (type == GX_PERSPECTIVE) {
+        if (g_aspect_active == 2) {
+            /* Portrait Vert+: scale row 1 col 1 so vertical FOV expands and 3D aspect is 1:1 */
+            g_gx.projection_mtx[1][1] *= g_aspect_factor;
+        } else if (g_aspect_active == 1) {
+            /* Widescreen Hor+: scale row 0 col 0 */
             g_gx.projection_mtx[0][0] *= g_aspect_factor;
+        }
+    } else if (type == GX_ORTHOGRAPHIC) {
+        if (g_aspect_active == 2 && g_pc_widescreen_stretch != 1) {
+            /* Portrait 4:3 aspect correction for 2D UI (menus, dialogue, keyboard, inventory, etc.) */
+            g_gx.projection_mtx[1][1] *= g_aspect_factor;
+            g_gx.projection_mtx[1][3] *= g_aspect_factor;
         }
     }
 #endif

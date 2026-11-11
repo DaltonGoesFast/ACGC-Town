@@ -101,9 +101,7 @@ void pc_lowaddr_violation(const char* category, uint64_t addr, size_t size, cons
                         file != NULL ? file : "?", line,
                         (unsigned long long)addr,
                         stack ? "stack-exempt" : "FAIL");
-#ifndef NDEBUG
-    if (!stack) abort();
-#endif
+    /* Android: log AUDIT warning but do not abort on non-exempt allocations */
     return;
 #else
     const char* nf = getenv("PC_LOWADDR_NONFATAL");

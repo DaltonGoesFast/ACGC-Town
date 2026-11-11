@@ -1,4 +1,7 @@
 #include "ef_effect_control.h"
+#ifdef TARGET_PC
+#include "pc_platform.h"
+#endif
 
 #include "m_common_data.h"
 #include "m_rcp.h"
@@ -126,7 +129,14 @@ static void eSuisou_Awa_dw(eEC_Effect_c* effect, GAME* game) {
     s16 scale_angle = effect->effect_specific[2];
 
     Game_play_Projection_Trans(play, &effect->position, &screen_pos);
+#ifdef PC_ENHANCEMENTS
+    f32 x_edge = 1.0f, y_edge = 1.0f;
+    pc_cull_get_edges(&x_edge, &y_edge);
+    if ((160.0f - 160.0f * x_edge) < screen_pos.x && screen_pos.x < (160.0f + 160.0f * x_edge) &&
+        (120.0f - 120.0f * y_edge) < screen_pos.y && screen_pos.y < (120.0f + 120.0f * y_edge)) {
+#else
     if (0.0f < screen_pos.x && screen_pos.x < SCREEN_WIDTH && 0.0f < screen_pos.y && screen_pos.y < SCREEN_HEIGHT) {
+#endif
         OPEN_DISP(game->graph);
 
         pos = effect->position;

@@ -131,6 +131,9 @@ int pc_guest_profile_validate(const PCGuestProfile* p, const char** bad_key, con
     if (p->land_id == 0u || p->land_id == 0xFFFFu) {
         PROFILE_BAD("land_id", "must be in 1..0xFFFE");
     }
+    if (p->shirt != 0u && (p->shirt < 0x2400u || p->shirt > 0x240Fu)) {
+        PROFILE_BAD("shirt", "must be 0 or a starter shirt in 0x2400..0x240F");
+    }
 #undef PROFILE_BAD
     return 1;
 }
@@ -181,8 +184,8 @@ static int parse_uint(const char* s, unsigned long* out) {
     return 1;
 }
 
-enum { K_NAME, K_GENDER, K_FACE, K_HOME, K_PID, K_LID, K_COUNT };
-static const char* const k_keys[K_COUNT] = { "name", "gender", "face", "home_town", "player_id", "land_id" };
+enum { K_NAME, K_GENDER, K_FACE, K_HOME, K_PID, K_LID, K_SHIRT, K_COUNT };
+static const char* const k_keys[K_COUNT] = { "name", "gender", "face", "home_town", "player_id", "land_id", "shirt" };
 
 int pc_guest_profile_parse(const char* text, size_t len, PCGuestProfile* out, char* err, size_t errcap) {
     char buf[PC_GUEST_PROFILE_MAX_FILE + 1];
@@ -285,11 +288,18 @@ int pc_guest_profile_parse(const char* text, size_t len, PCGuestProfile* out, ch
                     p.land_id = (uint16_t)u;
                 }
                 break;
+            case K_SHIRT:
+                if (!parse_uint(val, &u) || (u != 0ul && (u < 0x2400ul || u > 0x240Ful))) {
+                    set_err(err, errcap, "%s: must be 0 or a starter shirt in 0x2400..0x240F%s", key, "");
+                    return 0;
+                }
+                p.shirt = (uint16_t)u;
+                break;
             default:
                 break;
         }
     }
-    for (i = 0; i < K_COUNT; i++) {
+    for (i = 0; i < K_SHIRT; i++) {
         if (!(seen & (1u << i))) {
             set_err(err, errcap, "%s: missing (every key is required: name, gender, face, home_town, player_id, land_id)%s", k_keys[i], "");
             return 0;
@@ -306,20 +316,28 @@ int pc_guest_profile_parse(const char* text, size_t len, PCGuestProfile* out, ch
 /* ---------------- format / default ---------------- */
 
 size_t pc_guest_profile_format(const PCGuestProfile* p, char* out, size_t cap) {
-    int n = snprintf(out, cap,
-                     "# Animal Crossing PC - multiplayer GUEST profile (used by --guest).\n"
-                     "# Edit name / gender / face / home_town BEFORE your first join of a host.\n"
-                     "# player_id and land_id were drawn once at random and are PERMANENT: together with name and home_town\n"
-                     "# they are your guest identity. Changing any of those four after joining makes a NEW guest (the old\n"
-                     "# character stays on the host). gender / face only matter for a brand-new guest.\n"
-                     "# name / home_town: 1..8 characters of A-Z a-z 0-9 blank . ' -   (name must not be SERVER)\n"
-                     "name = %s\n"
-                     "gender = %d\n"
-                     "face = %d\n"
-                     "home_town = %s\n"
-                     "player_id = %u\n"
-                     "land_id = %u\n",
-                     p->name, p->gender, p->face, p->home_town, (unsigned)p->player_id, (unsigned)p->land_id);
+    char sh[32];
+    int n;
+    if (p->shirt >= 0x2400u && p->shirt <= 0x240Fu) {
+        snprintf(sh, sizeof(sh), "shirt = 0x%04X\n", (unsigned)p->shirt);
+    } else {
+        sh[0] = '\0';
+    }
+    n = snprintf(out, cap,
+                 "# Animal Crossing PC - multiplayer GUEST profile (used by --guest).\n"
+                 "# Edit name / gender / face / home_town BEFORE your first join of a host.\n"
+                 "# player_id and land_id were drawn once at random and are PERMANENT: together with name and home_town\n"
+                 "# they are your guest identity. Changing any of those four after joining makes a NEW guest (the old\n"
+                 "# character stays on the host). gender / face only matter for a brand-new guest.\n"
+                 "# name / home_town: 1..8 characters of A-Z a-z 0-9 blank . ' -   (name must not be SERVER)\n"
+                 "name = %s\n"
+                 "gender = %d\n"
+                 "face = %d\n"
+                 "home_town = %s\n"
+                 "player_id = %u\n"
+                 "land_id = %u\n"
+                 "%s",
+                 p->name, p->gender, p->face, p->home_town, (unsigned)p->player_id, (unsigned)p->land_id, sh);
     return (n > 0 && (size_t)n < cap) ? (size_t)n : 0;
 }
 

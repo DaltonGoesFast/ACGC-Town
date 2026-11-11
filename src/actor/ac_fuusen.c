@@ -1,4 +1,7 @@
 #include "ac_fuusen.h"
+#ifdef TARGET_PC
+#include "pc_platform.h"
+#endif
 
 #include "m_actor_shadow.h"
 #include "m_common_data.h"
@@ -118,7 +121,15 @@ static void aFSN_moving(ACTOR* actorx, GAME* game) {
 
   Game_play_Projection_Trans(play, &actorx->world.position, &screen_pos);
 
-  if (-40.0f > screen_pos.x || screen_pos.x > 360.0f || -40.0f > screen_pos.y || screen_pos.y > 280.0f) {
+#ifdef PC_ENHANCEMENTS
+  f32 x_edge = 1.0f, y_edge = 1.0f;
+  pc_cull_get_edges(&x_edge, &y_edge);
+  if ((160.0f - 200.0f * x_edge) > screen_pos.x || screen_pos.x > (160.0f + 200.0f * x_edge) ||
+      (120.0f - 160.0f * y_edge) > screen_pos.y || screen_pos.y > (120.0f + 160.0f * y_edge))
+#else
+  if (-40.0f > screen_pos.x || screen_pos.x > 360.0f || -40.0f > screen_pos.y || screen_pos.y > 280.0f)
+#endif
+  {
     return;
   }
 

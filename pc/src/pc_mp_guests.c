@@ -890,11 +890,12 @@ int pc_mp_guest_record_fresh_check(const uint8_t* r, size_t len, unsigned* detai
     }
     /* economy */
     for (i = 0; i < 15; i++) {
-        if (fr_be16(r, 0x68 + i * 2) != 0u) {
+        const uint16_t p = fr_be16(r, 0x68 + i * 2);
+        if (i == 0 ? (p != 0u && p != 0x2E01u && p != 0x2200u && p != 0x2202u && p != 0x2203u) : (p != 0u)) {
             FRESH_FAIL(PC_MP_FRESH_BAD_POCKET, 0x68 + i * 2);
         }
     }
-    if (fr_be32(r, 0x88) != 0u) {
+    if (fr_be32(r, 0x88) != (fr_be16(r, 0x68) == 0x2E01u ? 1u : 0u)) {
         FRESH_FAIL(PC_MP_FRESH_BAD_POCKET, 0x88);
     }
     if (fr_be32(r, 0x8C) != 0u) {
@@ -909,8 +910,11 @@ int pc_mp_guest_record_fresh_check(const uint8_t* r, size_t len, unsigned* detai
     if (r[0x86] != 0u || r[0x87] != 0u) {
         FRESH_FAIL(PC_MP_FRESH_BAD_LOTTO, 0x86);
     }
-    if (fr_be16(r, 0x4A4) != 0u) {
-        FRESH_FAIL(PC_MP_FRESH_BAD_EQUIPMENT, 0x4A4);
+    {
+        const uint16_t eq = fr_be16(r, 0x4A4);
+        if (eq != 0u && eq != 0x2200u && eq != 0x2202u && eq != 0x2203u) {
+            FRESH_FAIL(PC_MP_FRESH_BAD_EQUIPMENT, 0x4A4);
+        }
     }
     for (i = 0; i < 10; i++) { /* Mail_c: 0x12A bytes, `present` at +0x2C */
         const uint16_t pr = fr_be16(r, 0x4E0 + i * 0x12A + 0x2C);

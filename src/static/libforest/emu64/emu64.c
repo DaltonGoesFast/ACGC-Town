@@ -5253,16 +5253,29 @@ void emu64::dl_G_CULLDL() {
 
         /* Assign culling flags to vertex */
 #ifdef PC_ENHANCEMENTS
-        /* Widescreen hor+ widens the rendered frustum but culling uses the
-         * original 4:3 projection matrix.  Extend X cull bounds to match. */
+        /* Widescreen hor+ and portrait vert+ widen the rendered frustum but culling uses the
+         * original 4:3 projection matrix. Extend X and Y cull bounds to match. */
         {
-            float cull_x = (float)g_pc_window_w / (float)g_pc_window_h
-                         / ((float)PC_GC_WIDTH / (float)PC_GC_HEIGHT);
-            if (cull_x < 1.0f) cull_x = 1.0f;
+            float cull_x = 1.0f;
+            float cull_y = 1.0f;
+            pc_cull_get_edges(&cull_x, &cull_y);
+
             if (ox < -cull_x) {
                 vtx->flag |= G_CULL_X_LESSTHAN;
             } else if (ox > cull_x) {
                 vtx->flag |= G_CULL_X_GREATERTHAN;
+            }
+
+            if (oy < -cull_y) {
+                vtx->flag |= G_CULL_Y_LESSTHAN;
+            } else if (oy > cull_y) {
+                vtx->flag |= G_CULL_Y_GREATERTHAN;
+            }
+
+            if (oz > 0.0f) {
+                vtx->flag |= G_CULL_Z_LESSTHAN;
+            } else if (oz < -2.5f) {
+                vtx->flag |= G_CULL_Z_GREATERTHAN;
             }
         }
 #else
@@ -5271,7 +5284,6 @@ void emu64::dl_G_CULLDL() {
         } else if (ox > 1.0f) {
             vtx->flag |= G_CULL_X_GREATERTHAN;
         }
-#endif
 
         if (oy < -1.0f) {
             vtx->flag |= G_CULL_Y_LESSTHAN;
@@ -5284,6 +5296,7 @@ void emu64::dl_G_CULLDL() {
         } else if (oz < -1.0f) {
             vtx->flag |= G_CULL_Z_GREATERTHAN;
         }
+#endif
 
         EMU64_LOGF("%2d %04x %1d%1d%1d%1d%1d%1d %1d %6.3f %6.3f %6.3f  %8.2f %8.2f %8.2f \n", vstart, vtx->flag,
                    vtx->cull_z_greater, vtx->cull_z_lesser, vtx->cull_y_greater, vtx->cull_y_lesser,

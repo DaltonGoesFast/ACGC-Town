@@ -250,6 +250,7 @@ static void to_profile(const PCCharacter* c, PCGuestProfile* p) {
     memcpy(p->home_town, c->home_town, sizeof(p->home_town));
     p->gender = c->gender;
     p->face = c->face;
+    p->shirt = c->shirt;
     p->player_id = c->player_id;
     p->land_id = c->land_id;
 }
@@ -264,16 +265,21 @@ void pc_character_home_pid_be(const PCCharacter* c, uint8_t out[20]) {
 }
 
 size_t pc_character_format(const PCCharacter* c, char* out, size_t cap) {
-    char nb[17], hb[17];
+    char nb[17], hb[17], sh[32];
     int n;
     hex_encode(c->name_bytes, 8, nb);
     hex_encode(c->home_town_bytes, 8, hb);
+    if (c->shirt >= 0x2400u && c->shirt <= 0x240Fu) {
+        snprintf(sh, sizeof(sh), "shirt = 0x%04X\n", (unsigned)c->shirt);
+    } else {
+        sh[0] = '\0';
+    }
     n = snprintf(out, cap,
                  "# ACGC PC multiplayer character (player-owned identity; see docs/multiplayer-guest-roadmap.md). uuid is local only.\n"
                  "uuid = %s\nname = %s\nname_bytes = %s\nhome_town = %s\nhome_town_bytes = %s\nplayer_id = 0x%04X\nland_id = 0x%04X\ngender = %d\nface = %d\n"
-                 "created = %lu\n%s%s%s",
+                 "created = %lu\n%s%s%s%s",
                  c->uuid, c->name, nb, c->home_town, hb, (unsigned)c->player_id, (unsigned)c->land_id, c->gender, c->face, (unsigned long)c->created,
-                 c->has_legacy ? "legacy_profile = " : "", c->has_legacy ? c->legacy_profile : "", c->has_legacy ? "\n" : "");
+                 c->has_legacy ? "legacy_profile = " : "", c->has_legacy ? c->legacy_profile : "", c->has_legacy ? "\n" : "", sh);
     return (n > 0 && (size_t)n < cap) ? (size_t)n : 0;
 }
 
@@ -291,8 +297,8 @@ static int parse_num(const char* s, unsigned long* out) {
     return 1;
 }
 
-enum { C_UUID, C_NAME, C_NAMEB, C_HOME, C_HOMEB, C_PID, C_LID, C_GENDER, C_FACE, C_CREATED, C_LEGACY, C_COUNT };
-static const char* const k_ckeys[C_COUNT] = { "uuid", "name", "name_bytes", "home_town", "home_town_bytes", "player_id", "land_id", "gender", "face", "created", "legacy_profile" };
+enum { C_UUID, C_NAME, C_NAMEB, C_HOME, C_HOMEB, C_PID, C_LID, C_GENDER, C_FACE, C_CREATED, C_LEGACY, C_SHIRT, C_COUNT };
+static const char* const k_ckeys[C_COUNT] = { "uuid", "name", "name_bytes", "home_town", "home_town_bytes", "player_id", "land_id", "gender", "face", "created", "legacy_profile", "shirt" };
 
 int pc_character_parse(const char* text, size_t len, PCCharacter* out, char* err, size_t errcap) {
     char buf[PC_GUEST_PROFILE_MAX_FILE + 1];
@@ -385,6 +391,10 @@ int pc_character_parse(const char* text, size_t len, PCCharacter* out, char* err
                     ok = val[0] == '\0' || (pc_guest_profile_name_check(val, NULL, 0) && strlen(val) <= PC_GUEST_PROFILE_ARG_MAX);
                     if (ok) pc_guest_profile_fold(val, c.legacy_profile);
                     break;
+                case C_SHIRT:
+                    ok = parse_num(val, &v) && (v == 0 || (v >= 0x2400ul && v <= 0x240Ful));
+                    c.shirt = (uint16_t)v;
+                    break;
                 default: break;
             }
             if (!ok) {
@@ -394,7 +404,7 @@ int pc_character_parse(const char* text, size_t len, PCCharacter* out, char* err
         }
     }
     for (k = 0; k < C_COUNT; k++) {
-        if (k != C_LEGACY && !(seen & (1u << k))) {
+        if (k != C_LEGACY && k != C_SHIRT && !(seen & (1u << k))) {
             seterr(err, errcap, "%s: required key missing", k_ckeys[k], NULL);
             return 0;
         }
@@ -748,6 +758,7 @@ static void from_profile(const PCGuestProfile* p, PCCharacter* c) {
     pc_guest_profile_home_bytes(p, c->home_town_bytes);
     c->gender = p->gender;
     c->face = p->face;
+    c->shirt = p->shirt;
     c->player_id = p->player_id;
     c->land_id = p->land_id;
 }

@@ -2070,10 +2070,72 @@ static int s_pc_guest_title_label_done = 0;
  * the arming until the finish succeeded (it is also what pc_net_game.c's handshake gate and the Rover actor ask through pc_guest_creation_active()). */
 static int s_pc_guest_create_armed = 0;
 static PCGuestProfile s_pc_guest_create_profile;
+static u16 s_pc_creator_chosen_shirt = 0;
+
+void pc_creator_set_chosen_shirt(u16 shirt) {
+    s_pc_creator_chosen_shirt = shirt;
+}
+
+u16 pc_creator_get_chosen_shirt(void) {
+    return s_pc_creator_chosen_shirt;
+}
+
+void pc_guest_seed_starter_onboarding(Private_c* rec) {
+    static const char k_hdr[] = "Welcome, !";
+    static const char k_body[] =
+        "Welcome to town!\n"
+        "Open your Starter Gift\n"
+        "in your pockets to pick\n"
+        "your first tool: a Rod,\n"
+        "Bug Net, or Shovel!";
+    static const char k_ftr[] = "Town Welcome Committee";
+    Mail_c* mail;
+
+    if (rec == NULL) {
+        return;
+    }
+    /* Phase 1: Starter Gift Box in pockets[0] + Welcome Letter in mail[0] */
+    mPr_SetPossessionItem(rec, 0, ITM_HUKUBUKURO_PRESENT, mPr_ITEM_COND_PRESENT);
+    mail = &rec->mail[0];
+    mMl_clear_mail(mail);
+    mail->content.font = mMl_FONT_RECV;
+    mail->content.mail_type = mMl_TYPE_MAIL;
+    mail->content.paper_type = 0;
+    mail->content.header_back_start = 9; /* after "Welcome, " */
+    memcpy(mail->content.header, k_hdr, sizeof(k_hdr) - 1);
+    memcpy(mail->content.body, k_body, sizeof(k_body) - 1);
+    memcpy(mail->content.footer, k_ftr, sizeof(k_ftr) - 1);
+    mPr_CopyPersonalID(&mail->header.recipient.personalID, &rec->player_ID);
+    mail->header.recipient.type = mMl_NAME_TYPE_PLAYER;
+    mPr_ClearPersonalID(&mail->header.sender.personalID);
+    memcpy(mail->header.sender.personalID.player_name, "TownHall", 8);
+    mail->header.sender.type = mMl_NAME_TYPE_MUSEUM;
+    mail->present = EMPTY_NO;
+}
+
+static void pc_guest_apply_saved_shirt(Private_c* pass, int create) {
+    if (create || pass == NULL) {
+        return;
+    }
+    if (pc_session()->storage == PC_CHARACTER_STORAGE_STORE) {
+        const uint16_t sh = pc_session()->character.shirt;
+        if (sh >= ITM_CLOTH000 && sh <= ITM_CLOTH015) {
+            mPlib_change_player_cloth_info_lv2(pass, (mActor_name_t)sh);
+        }
+    } else {
+        PCGuestProfile gp;
+        char perr[128];
+        if (pc_guest_profile_read_selected(&gp, perr, sizeof(perr)) == PC_GUEST_PROFILE_LOADED &&
+            gp.shirt >= ITM_CLOTH000 && gp.shirt <= ITM_CLOTH015) {
+            mPlib_change_player_cloth_info_lv2(pass, (mActor_name_t)gp.shirt);
+        }
+    }
+}
 
 void pc_guest_creation_arm(const PCGuestProfile* p) {
     s_pc_guest_create_profile = *p;
     s_pc_guest_create_armed = 1;
+    s_pc_creator_chosen_shirt = 0;
 }
 
 int pc_guest_creation_active(void) {
@@ -2238,6 +2300,7 @@ static int pc_guest_arrive(const char* tag, const char* spec, char* err, size_t 
     memset(&l_mcd_foreigner_file, 0, sizeof(l_mcd_foreigner_file));
     pass = &l_mcd_foreigner_file.file.priv;
     pc_guest_build_fresh_record(pass, &home, opt_gender, opt_face);
+    pc_guest_apply_saved_shirt(pass, create);
     l_mcd_foreigner_file.file.copy_protect = (u16)Common_Get(copy_protect);
     OSReport("[PC] %s: FRESH guest record (not a copy of any resident): gender=%d face=%d shirt=0x%04X (%s), empty pockets / wallet / letters\n", tag,
              (int)pass->gender, (int)pass->face, (unsigned)pass->cloth.item,
@@ -2342,6 +2405,11 @@ void pc_guest_creation_finish(GAME_PLAY* play) {
     memcpy(p.name, nm, sizeof(nm));
     p.gender = (int)rec->gender;
     p.face = (int)rec->face;
+    if (s_pc_creator_chosen_shirt >= ITM_CLOTH000 && s_pc_creator_chosen_shirt <= ITM_CLOTH015 &&
+        s_pc_creator_chosen_shirt != pc_guest_starter_shirt(&rec->player_ID, p.gender)) {
+        p.shirt = s_pc_creator_chosen_shirt;
+        pc_session()->character.shirt = s_pc_creator_chosen_shirt;
+    }
     err[0] = '\0';
     if (pc_session()->storage == PC_CHARACTER_STORAGE_STORE) {
         /* M2: the session character is a STORE character: the creation result becomes characters/<uuid>/character.ini (create-only); no guest_<name>.ini */
@@ -2362,7 +2430,9 @@ void pc_guest_creation_finish(GAME_PLAY* play) {
     printf("[PC] guest creation: profile %s CREATED: name '%s', gender %d, face %d\n", pc_guest_profile_selected_path(), p.name, p.gender, p.face);
     fflush(stdout);
 
-    mPlib_change_player_cloth_info_lv2(rec, (mActor_name_t)pc_guest_starter_shirt(&rec->player_ID, p.gender));
+    mPlib_change_player_cloth_info_lv2(rec, (mActor_name_t)(p.shirt != 0 ? p.shirt : pc_guest_starter_shirt(&rec->player_ID, p.gender)));
+    pc_guest_seed_starter_onboarding(rec);
+    s_pc_creator_chosen_shirt = 0;
 
     pc_guest_station_door(&door_data);
     Common_Set(demo_profiles[0], mAc_PROFILE_RIDE_OFF_DEMO);
@@ -2372,6 +2442,75 @@ void pc_guest_creation_finish(GAME_PLAY* play) {
         pc_guest_creation_die("the profile was saved, but the scene change to the station failed; start the game again (the profile now exists)");
     }
     OSReport("[PC] guest creation: guest '%s' leaves the Rover scene for the station (SCENE_FG, RIDE_OFF_DEMO)\n", p.name);
+}
+
+void pc_offline_creator_finish(GAME_PLAY* play) {
+    Private_c* rec = Common_Get(now_private);
+    Door_data_c door_data;
+    int pno = Common_Get(player_no);
+
+    if (rec == NULL) {
+        return;
+    }
+    if (mFRm_CheckSaveData() == FALSE) {
+        static const u8 k_default_town[LAND_NAME_SIZE] = { 'O', 'a', 'k', 'w', 'o', 'o', 'd', ' ' };
+        if (mLd_NullCheckLandName(Save_Get(land_info).name) == TRUE) {
+            memcpy(Save_Get(land_info).name, k_default_town, LAND_NAME_SIZE);
+        }
+        Save_Set(land_info.exists, TRUE);
+        mNpc_SetAnimalThisLand(Save_Get(animals), ANIMAL_NUM_MAX);
+        Save_Set(all_grow_renew_time, mTM_rtcTime_clear_code);
+        memcpy(&Save_Get(island).landinfo, Save_GetPointer(land_info), sizeof(mLd_land_info_c));
+        mNpc_DecideIslandNpc(&Save_Get(island).animal);
+        lbRTC_TimeCopy(Save_GetPointer(last_grow_time), Common_GetPointer(time.rtc_time));
+        mTM_set_renew_time(Save_GetPointer(renew_time), Common_GetPointer(time.rtc_time));
+        mTM_set_season();
+        mPO_post_office_init();
+        Save_Set(insect_term, Common_Get(time.rtc_time.month));
+        Save_Set(insect_term_transition_offset, (u8)(rand() % 6));
+        Save_Set(gyoei_term, (u8)(Common_Get(time.rtc_time.month) * 2 + (Common_Get(time.rtc_time.day) > 15 ? 1 : 0)));
+        Save_Set(gyoei_term_transition_offset, (u8)(rand() % 6));
+        mSP_ShopGameStartCt(NULL);
+        mNtc_SetInitData();
+        mCD_calendar_clear(-1);
+        mCD_calendar_wellcome_on();
+        mNpc_SetParentNameAllAnimal();
+        mFRm_SetSaveCheckData(Save_GetPointer(save_check));
+    }
+    mLd_CopyLandName(rec->player_ID.land_name, Save_Get(land_info).name);
+    rec->player_ID.land_id = Save_Get(land_info).id;
+    rec->exists = TRUE;
+    if (pno >= 0 && pno < PLAYER_NUM) {
+        int h;
+        for (h = 0; h < mHS_HOUSE_NUM; h++) {
+            if (mPr_NullCheckPersonalID(&Save_Get(homes[h]).ownerID) == TRUE) {
+                mHS_set_use(pno, h);
+                break;
+            }
+        }
+        mHm_SetNowHome();
+        mEv_ClearPersonalEventFlag(pno);
+        rec->inventory.loan = mPlayer_DEBT0;
+        rec->inventory.wallet = 1000;
+    }
+    if (s_pc_creator_chosen_shirt >= ITM_CLOTH000 && s_pc_creator_chosen_shirt <= ITM_CLOTH015) {
+        mPlib_change_player_cloth_info_lv2(rec, (mActor_name_t)s_pc_creator_chosen_shirt);
+    } else {
+        mPr_SetNowPrivateCloth();
+    }
+    s_pc_creator_chosen_shirt = 0;
+    pc_guest_seed_starter_onboarding(rec);
+    Common_Set(submenu_disabled, FALSE);
+    if (pc_net_game_role() != PC_NETGAME_ROLE_CLIENT) {
+        pc_save_ready = 1;
+        if (pc_save_write_authoritative()) {
+            pc_save_loaded = 1;
+        }
+    }
+    pc_guest_station_door(&door_data);
+    Common_Set(demo_profiles[0], mAc_PROFILE_RIDE_OFF_DEMO);
+    Common_Get(transition).wipe_type = WIPE_TYPE_CIRCLE_LEFT;
+    (void)goto_other_scene(play, &door_data, TRUE);
 }
 
 /* TEST-ONLY hook (--guest-creation-test NAME,GENDER,FACE, needs --guest-profile): once the Rover scene has been running for a while it types NAME / GENDER /

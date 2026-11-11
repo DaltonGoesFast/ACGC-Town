@@ -1,3 +1,4 @@
+#include "pc_crash.h"
 #include "pc_gx_internal.h"
 #include "pc_shader_seed.h"
 
@@ -31,17 +32,23 @@ static char* load_text_file(const char* path) {
 /* GLES 3 has no "#version 330 core". The same source is used; only the header changes. */
 static void pc_gles_shader_header(char** src) {
 #ifdef PC_GLES
-    const char* old = "#version 330 core\n";
+    const char* prefix = "#version 330 core";
     const char* neu = "#version 300 es\nprecision highp float;\nprecision highp int;\n";
     char* s = *src;
-    size_t ol = strlen(old), nl = strlen(neu), rest;
+    char* end_line;
+    size_t nl, rest;
     char* out;
-    if (s == NULL || strncmp(s, old, ol) != 0) return;
-    rest = strlen(s + ol);
+    if (s == NULL) return;
+    if (strncmp(s, prefix, strlen(prefix)) != 0) return;
+    end_line = strchr(s, '\n');
+    if (end_line == NULL) return;
+    end_line++; /* skip '\n' */
+    nl = strlen(neu);
+    rest = strlen(end_line);
     out = (char*)malloc(nl + rest + 1);
     if (out == NULL) return;
     memcpy(out, neu, nl);
-    memcpy(out + nl, s + ol, rest + 1);
+    memcpy(out + nl, end_line, rest + 1);
     free(s);
     *src = out;
 #else
@@ -79,6 +86,9 @@ static GLuint compile_shader(GLenum type, const char* source) {
         char log[512];
         glGetShaderInfoLog(shader, sizeof(log), NULL, log);
         fprintf(stderr, "WARNING: Shader compile error: %s\n", log);
+        pc_diag_milestone("Shader compile error");
+        pc_diag_milestone(log);
+        pc_diag_fail_box("Shader compile error", log);
         glDeleteShader(shader);
         return 0;
     }
@@ -109,6 +119,9 @@ static GLuint link_program(GLuint vert, GLuint frag) {
         char log[512];
         glGetProgramInfoLog(prog, sizeof(log), NULL, log);
         fprintf(stderr, "WARNING: Program link error: %s\n", log);
+        pc_diag_milestone("Program link error");
+        pc_diag_milestone(log);
+        pc_diag_fail_box("Program link error", log);
         glDeleteProgram(prog);
         prog = 0;
     }

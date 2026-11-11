@@ -1,6 +1,10 @@
 static int aNPS_setup_game_start(GAME_PLAY* play) {
     static Door_data_c door_data = {
+#ifdef TARGET_PC
+        SCENE_START_DEMO2, mSc_DIRECT_NORTH, 0, 0, { 120, 0, 340 }, EMPTY_NO, 3, { 0, 0, 0 }
+#else
         SCENE_START_DEMO, mSc_DIRECT_NORTH, 0, 0, { 120, 0, 340 }, EMPTY_NO, 3, { 0, 0, 0 }
+#endif
     };
     s32 chan;
     int res = FALSE;
@@ -79,7 +83,12 @@ static void aNPS_schedule_init_proc(NPC_ACTOR* nactorx, GAME_PLAY* play) {
     nactorx->draw.anim_speed_type = aNPC_ANIM_SPEED_TYPE_FREE;
     nactorx->think.think_proc = &aNPS_think_proc;
     nactorx->talk_info.default_animation = aNPC_ANIM_4HAKU_E1;
+#ifdef TARGET_PC
+    p_sel->talk_end_flag = TRUE;
+    p_sel->strum_timer = 0.0f;
+#else
     p_sel->strum_timer = 440.0f;
+#endif
     p_sel->bgm_stop_timer = -1.0f;
 
     CLIP(npc_clip)->think_proc(nactorx, play, aNPC_THINK_IN_BLOCK, 0);

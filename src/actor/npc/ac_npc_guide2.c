@@ -11,6 +11,14 @@
 #include "libultra/libultra.h"
 #include "m_bgm.h"
 #include "m_soncho.h"
+#ifdef TARGET_PC
+#include "m_item_name.h"
+#include "m_name_table.h"
+#include "m_rcp.h"
+#include "pc_menu_util.h"
+#include "pc_player_preview.h"
+#include "pc_text_draw.h"
+#endif
 
 enum {
     aNG2_ACTION_ENTER,
@@ -78,6 +86,10 @@ static void aNG2_actor_move(ACTOR* actorx, GAME* game);
 static void aNG2_actor_draw(ACTOR* actorx, GAME* game);
 
 static void aNG2_setupAction(NPC_GUIDE2_ACTOR* guide2, GAME_PLAY* play, int action);
+#ifdef TARGET_PC
+static void aNG2_pc_creator_ct(NPC_GUIDE2_ACTOR* guide2, GAME_PLAY* play);
+static void aNG2_pc_creator_draw(NPC_GUIDE2_ACTOR* guide2, GAME_PLAY* play);
+#endif
 
 static void aNG2_actor_ct(ACTOR* actorx, GAME* game) {
     static aNPC_ct_data_c ct_data = { &aNG2_actor_move, &aNG2_actor_draw, 0, NULL, NULL, NULL, 0 };
@@ -105,11 +117,24 @@ static void aNG2_actor_ct(ACTOR* actorx, GAME* game) {
     mPlib_request_main_demo_wait_type1(game, 0, NULL);
     player = GET_PLAYER_ACTOR(play);
     if (player != NULL) {
+#ifdef TARGET_PC
+        /* Phase 1 3D Character Creator: keep the player actor visible on the train and position them in view */
+        player->actor_class.state_bitfield &= ~ACTOR_STATE_INVISIBLE;
+        player->actor_class.world.position.x = 122.0f;
+        player->actor_class.world.position.y = 0.0f;
+        player->actor_class.world.position.z = 328.0f;
+        player->actor_class.shape_info.rotation.y = 0;
+        player->actor_class.world.angle.y = 0;
+#else
         /* Make the player invisible during the intro train ride */
         player->actor_class.state_bitfield |= ACTOR_STATE_INVISIBLE;
+#endif
     }
 
     aNG2_setupAction(guide2, play, aNG2_ACTION_ENTER);
+#ifdef TARGET_PC
+    aNG2_pc_creator_ct(guide2, play);
+#endif
 
     /* Play train noises sfx repeatedly */
     sAdo_SysLevStart(NA_SE_TRAIN_RIDE);
@@ -120,6 +145,9 @@ static void aNG2_actor_save(ACTOR* actorx, GAME* game) {
 }
 
 static void aNG2_actor_dt(ACTOR* actorx, GAME* game) {
+#ifdef TARGET_PC
+    pc_player_preview_reset();
+#endif
     Common_Get(clip).npc_clip->dt_proc(actorx, game);
 
     /* Stop train noise sfx */
@@ -132,6 +160,9 @@ static void aNG2_actor_init(ACTOR* actorx, GAME* game) {
 
 static void aNG2_actor_draw(ACTOR* actorx, GAME* game) {
     Common_Get(clip).npc_clip->draw_proc(actorx, game);
+#ifdef TARGET_PC
+    aNG2_pc_creator_draw((NPC_GUIDE2_ACTOR*)actorx, (GAME_PLAY*)game);
+#endif
 }
 
 #include "../src/actor/npc/ac_npc_guide2_animation.c_inc"

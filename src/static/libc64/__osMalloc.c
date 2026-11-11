@@ -9,11 +9,11 @@
 
 #define OS_MALLOC_MAGIC (s16)'ss' // magic number for an OSMemBlock
 #define OS_MALLOC_BLOCK_OK(block) ((block) != NULL && (block)->magic == OS_MALLOC_MAGIC) // check if OSMemBlock structure is OK
-#define OS_MALLOC_DATA2BLOCK(data) ((OSMemBlock*)((u32)(data) - sizeof(OSMemBlock))) // get memblock data pointer from OSMemBlock
+#define OS_MALLOC_DATA2BLOCK(data) ((OSMemBlock*)((uintptr_t)(data) - sizeof(OSMemBlock))) // get memblock data pointer from OSMemBlock
 #define OS_MALLOC_BLOCK2DATA(block) ((u8*)(block) + sizeof(OSMemBlock)) // get OSMemBlock pointer from data
 
 // Gets the pointer to the next OSMemBlock immediately following this block in RAM, may or may not be a valid OSMemBlock
-#define OS_MALLOC_NEXTMEMBLOCK(block) ((OSMemBlock*)((u32)(block) + sizeof(OSMemBlock) + (block)->size))
+#define OS_MALLOC_NEXTMEMBLOCK(block) ((OSMemBlock*)((uintptr_t)(block) + sizeof(OSMemBlock) + (block)->size))
 
 int __osMalloc_FreeBlockTest_Enable = FALSE;
 
@@ -95,8 +95,8 @@ extern void __osMallocAddBlock(OSArena* arena, u8* base, s32 size) {
 #ifdef TARGET_PC
         PC_LOWADDR_CHECK("game heap (__osMalloc arena)", base, size);
 #endif
-        block = (OSMemBlock*)ALIGN_NEXT((u32)base, 32);
-        align_size = ALIGN_PREV(size - ((u32)block - (u32)base), 32);
+        block = (OSMemBlock*)ALIGN_NEXT((uintptr_t)base, 32);
+        align_size = ALIGN_PREV(size - ((uintptr_t)block - (uintptr_t)base), 32);
 
         if (align_size > (int)sizeof(OSMemBlock)) {
             memset(block, 0xAB, align_size);

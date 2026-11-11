@@ -27,6 +27,7 @@ pc/build64/bin/rom/
 artifacts/
 
 # Build files
+*.apk
 build/
 build32/
 build64/

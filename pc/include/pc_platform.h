@@ -461,6 +461,7 @@ extern int g_pc_content_x, g_pc_content_y, g_pc_content_w, g_pc_content_h;
 extern int g_pc_layout_portrait;
 void pc_layout_refresh(void);
 void pc_layout_box(int stretch, int* x, int* y, int* w, int* h);
+void pc_cull_get_edges(float* x_edge, float* y_edge);
 void pc_gx_external_gl_done(void);
 void pc_pad_device_added(int which);
 void pc_pad_device_removed(int which);

@@ -2,6 +2,7 @@
 #ifdef TARGET_PC
 #include "pc_museum_net.h" /* worker B: guest donor names */
 #include "m_museum_display.h"
+#include "pc_platform.h"
 #endif
 
 // extern data
@@ -1118,7 +1119,14 @@ void Museum_Fish_Actor_draw(ACTOR* actorx, GAME* game) {
 BOOL mfish_cull_check(GAME* game, xyz_t* worldPos, f32 x, f32 y, f32 _y) {
     xyz_t screenPos;
     Game_play_Projection_Trans((GAME_PLAY*)game, worldPos, &screenPos);
+#ifdef PC_ENHANCEMENTS
+    f32 x_edge = 1.0f, y_edge = 1.0f;
+    pc_cull_get_edges(&x_edge, &y_edge);
+    if (((160.0f - (160.0f + x) * x_edge) < screenPos.x) && (screenPos.x < (160.0f + (160.0f + x) * x_edge)) &&
+        ((120.0f - (120.0f + y) * y_edge) < screenPos.y) && (screenPos.y < (120.0f + (120.0f + _y) * y_edge))) {
+#else
     if ((-x < screenPos.x) && (screenPos.x < x + 320) && (-y < screenPos.y) && (screenPos.y < _y + 240)) {
+#endif
         return TRUE;
     }
     return FALSE;

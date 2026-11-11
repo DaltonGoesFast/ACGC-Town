@@ -39,6 +39,7 @@ typedef struct PCCharacter {
     uint8_t  home_town_bytes[8];
     int      gender;
     int      face;
+    uint16_t shirt;                         /* 0 = derive from identity hash, or 0x2400..0x240F (starter shirt) */
     uint16_t player_id;
     uint16_t land_id;
     uint32_t created;                       /* unix time */

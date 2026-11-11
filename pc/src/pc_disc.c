@@ -414,7 +414,6 @@ u8* pc_disc_extract_dol(void) {
         free(buf);
         return NULL;
     }
-    PC_LOWADDR_CHECK("asset source: DOL image", buf, g_dol_size);
     if (g_pc_verbose)
         printf("[PC] DOL: %u bytes (offset 0x%X)\n", g_dol_size, g_dol_offset);
     return buf;

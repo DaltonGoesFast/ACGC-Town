@@ -48,6 +48,7 @@ typedef struct PCGuestProfile {
     char     home_town[PC_GUEST_PROFILE_NAME_LEN + 1]; /* trimmed ASCII, NUL terminated, 1..8 chars */
     int      gender;                                   /* 0 | 1 */
     int      face;                                     /* 0..7 */
+    uint16_t shirt;                                    /* 0 = derive from identity hash, or 0x2400..0x240F (starter shirt) */
     uint16_t player_id;                                /* 1..0xFFFE, permanent */
     uint16_t land_id;                                  /* 1..0xFFFE, permanent */
 } PCGuestProfile;

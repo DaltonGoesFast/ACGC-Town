@@ -20,13 +20,15 @@ static u8 footer[MAIL_FOOTER2_LEN];
 static u8 header[MAIL_HEADER2_LEN];
 
 extern int mMl_strlen(u8* str, int size, u8 end_char) {
-    u32 end_p = size + (u32)str;
-    int i;
+    u8* end_p;
 
-    end_p--;
-    for (size; size != 0; size--) {
+    if (str == NULL || size <= 0) {
+        return 0;
+    }
 
-        if (*(u8*)end_p != end_char) {
+    end_p = str + size - 1;
+    for (; size != 0; size--) {
+        if (*end_p != end_char) {
             return size;
         }
 

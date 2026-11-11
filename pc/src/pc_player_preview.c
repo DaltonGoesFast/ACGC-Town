@@ -88,7 +88,8 @@ int pc_player_preview_set_character(int slot, const struct PCCharacter* c) {
     pid.land_id = c->land_id;
     gender = c->gender == mPr_SEX_MALE ? mPr_SEX_MALE : mPr_SEX_FEMALE;
     face = c->face;
-    return pc_player_preview_set(slot, gender, face, (int)pc_guest_starter_shirt(&pid, gender));
+    return pc_player_preview_set(slot, gender, face,
+                                 (c->shirt >= ITM_CLOTH000 && c->shirt <= ITM_CLOTH015) ? (int)c->shirt : (int)pc_guest_starter_shirt(&pid, gender));
 }
 
 void pc_player_preview_tick(void) {

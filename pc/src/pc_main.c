@@ -407,7 +407,9 @@ void pc_platform_init(void) {
 #endif
 
     pc_gx_init();
+    pc_diag_milestone("pc_gx_init ok");
     pc_texture_pack_init();
+    pc_diag_milestone("pc_texture_pack_init ok");
 #ifdef PC_ENHANCEMENTS
     if (g_pc_settings.preload_textures && !g_pc_dedicated) { /* --dedicated: nothing is drawn, no GL texture preload */
         pc_texture_pack_preload_all();
@@ -464,21 +466,26 @@ void pc_layout_refresh(void) {
     if (it + ib > H / 2) { it = 0; ib = 0; }
     aw = W - il - ir;
     ah = H - it - ib;
-    /* Cover screen is a tall strip. The unfolded inner screen is near square, so the
-     * HUD floats on the edges instead of claiming a band under the picture. */
+    /* Portrait (phone or tablet like Tab S8 Ultra): fill the full screen width and height (Vert+) */
     g_pc_layout_portrait = (H > (W * 5) / 4);
-    if ((float)aw / (float)ah > aspect) {
+    if (g_pc_layout_portrait) {
+        cw = aw;
+        ch = ah;
+        cx = il;
+        cy = it;
+    } else if ((float)aw / (float)ah > aspect) {
         ch = ah;
         cw = (int)((float)ch * aspect);
+        cx = il + (aw - cw) / 2;
+        cy = it + (ah - ch) / 2;
     } else {
         cw = aw;
         ch = (int)((float)cw / aspect);
+        cx = il + (aw - cw) / 2;
+        cy = it + (ah - ch) / 2;
     }
     if (cw < 2) cw = 2;
     if (ch < 2) ch = 2;
-    cx = il + (aw - cw) / 2;
-    if (g_pc_layout_portrait) cy = it;
-    else cy = it + (ah - ch) / 2;
     if (cx < 0) cx = 0;
     if (cy < 0) cy = 0;
     g_pc_content_x = cx;
@@ -492,6 +499,33 @@ void pc_layout_box(int stretch, int* x, int* y, int* w, int* h) {
     int W, H, il, it, ir, ib, aw, ah, cw, ch;
     float aspect;
     if (g_pc_content_w < 2 || g_pc_content_h < 2) pc_layout_refresh();
+    if (stretch == 2) {
+        /* Centered 4:3 box (pillarbox in widescreen, letterbox in portrait) */
+        W = g_pc_window_w;
+        H = g_pc_window_h;
+        pc_layout_insets(&il, &it, &ir, &ib);
+        if (il + ir > W / 2) { il = 0; ir = 0; }
+        if (it + ib > H / 2) { it = 0; ib = 0; }
+        aw = W - il - ir;
+        ah = H - it - ib;
+        aspect = 4.0f / 3.0f;
+        if ((float)aw / (float)ah > aspect) {
+            ch = ah;
+            cw = (int)((float)ch * aspect);
+        } else {
+            cw = aw;
+            ch = (int)((float)cw / aspect);
+        }
+        if (cw < 2) cw = 2;
+        if (ch < 2) ch = 2;
+        *w = cw;
+        *h = ch;
+        *x = il + (aw - cw) / 2;
+        *y = it + (ah - ch) / 2;
+        if (*x < 0) *x = 0;
+        if (*y < 0) *y = 0;
+        return;
+    }
     if (stretch != 1) {
         *x = g_pc_content_x;
         *y = g_pc_content_y;
@@ -523,6 +557,29 @@ void pc_layout_box(int stretch, int* x, int* y, int* w, int* h) {
     *y = g_pc_layout_portrait ? it : it + (ah - ch) / 2;
     if (*x < 0) *x = 0;
     if (*y < 0) *y = 0;
+}
+
+void pc_cull_get_edges(float* out_x_edge, float* out_y_edge) {
+    float x_edge = 1.0f;
+    float y_edge = 1.0f;
+    float cur_w = (g_pc_content_w > 0) ? (float)g_pc_content_w : (float)g_pc_window_w;
+    float cur_h = (g_pc_content_h > 0) ? (float)g_pc_content_h : (float)g_pc_window_h;
+    float base = 4.0f / 3.0f;
+
+    if (cur_h > 0.0f) {
+        float cur = cur_w / cur_h;
+        if (cur < base - 0.01f) {
+            /* Portrait Vert+: vertical FOV expands */
+            y_edge = base / cur;
+        } else if (cur > base + 0.01f) {
+            /* Widescreen Hor+: horizontal FOV expands */
+            x_edge = cur / base;
+        }
+    }
+
+    /* Generous safety margin (~20%) to prevent objects from popping at the viewport edges */
+    if (out_x_edge) *out_x_edge = x_edge * 1.20f;
+    if (out_y_edge) *out_y_edge = y_edge * 1.20f;
 }
 
 void pc_platform_update_window_size(void) {
@@ -3192,7 +3249,9 @@ int main(int argc, char* argv[]) {
         pc_main_resolve_membership(); /* M-C: resident / guest / new, from characters/<uuid>/towns/<townkey>/membership.ini */
         pc_net_game_start_client(g_pc_net_host_ip, g_pc_net_port);
     }
+    pc_diag_milestone("pc_disc_init start");
     pc_disc_init();
+    pc_diag_milestone(pc_disc_is_open() ? "disc open" : "disc not open");
     if (!pc_assets_init()) {
         const char* disc_err = pc_disc_last_error();
         const char* msg = (disc_err != NULL && disc_err[0] != '\0') ? disc_err :

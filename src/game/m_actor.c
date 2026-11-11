@@ -332,22 +332,24 @@ extern int Actor_draw_actor_no_culling_check(ACTOR* actor) {
 extern int Actor_draw_actor_no_culling_check2(ACTOR* actor, xyz_t* camera_pos, f32 camera_w) {
     int res = FALSE;
 
-    if (-actor->cull_radius < camera_pos->z && camera_pos->z < actor->cull_distance + actor->cull_radius) {
-        f32 m = camera_w < 1.0f ? 1.0f : 1.0f / camera_w;
 #ifdef PC_ENHANCEMENTS
-        /* Widescreen hor+ widens the rendered frustum.  The projection matrix
-         * used to compute camera_pos is the original 4:3 one, so the NDC X
-         * edge (1.0) is too narrow.  Extend by the aspect ratio correction. */
-        f32 x_edge = (f32)g_pc_window_w / (f32)g_pc_window_h
-                   / ((f32)PC_GC_WIDTH / (f32)PC_GC_HEIGHT);
-        if (x_edge < 1.0f) x_edge = 1.0f;
+    f32 x_edge = 1.0f;
+    f32 y_edge = 1.0f;
+    pc_cull_get_edges(&x_edge, &y_edge);
+    f32 dist_scale = (y_edge > x_edge) ? y_edge : x_edge;
+    f32 max_dist = (actor->cull_distance * dist_scale) + actor->cull_radius;
 #else
-        f32 x_edge = 1.0f;
+    f32 x_edge = 1.0f;
+    f32 y_edge = 1.0f;
+    f32 max_dist = actor->cull_distance + actor->cull_radius;
 #endif
+
+    if (-actor->cull_radius < camera_pos->z && camera_pos->z < max_dist) {
+        f32 m = camera_w < 1.0f ? 1.0f : 1.0f / camera_w;
         int width_OK = (m * (fabsf(camera_pos->x) - actor->cull_width)) < x_edge;
 
         if (width_OK &&
-            (m * (camera_pos->y + actor->cull_height)) > -1.0f && (m * (camera_pos->y - actor->cull_radius) < 1.0f)) {
+            (m * (camera_pos->y + actor->cull_height)) > -y_edge && (m * (camera_pos->y - actor->cull_radius) < y_edge)) {
             res = TRUE;
         }
     }

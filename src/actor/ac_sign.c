@@ -1,4 +1,7 @@
 #include "ac_sign.h"
+#ifdef TARGET_PC
+#include "pc_platform.h"
+#endif
 
 #include "m_common_data.h"
 #include "m_debug.h"
@@ -94,7 +97,14 @@ static int aSIGN_no_cull_check(GAME_PLAY* play, int bz, int bx, int ut_z, int ut
     if (clip_pos.z > -max_dist) {
         f32 inv_w = (w < 1.0f) ? 1.0f : (1.0f / w);
 
+#ifdef PC_ENHANCEMENTS
+        f32 x_edge = 1.0f;
+        f32 y_edge = 1.0f;
+        pc_cull_get_edges(&x_edge, &y_edge);
+        if (inv_w * (fabsf(clip_pos.x) - max_dist) < x_edge && inv_w * (fabsf(clip_pos.y) - max_dist) < y_edge) {
+#else
         if (inv_w * (fabsf(clip_pos.x) - max_dist) < 1.0f && inv_w * (fabsf(clip_pos.y) - max_dist) < 1.0f) {
+#endif
             return TRUE;
         }
     }

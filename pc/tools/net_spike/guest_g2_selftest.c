@@ -164,6 +164,13 @@ static void a_calendar(uint8_t* r) { size_t i; for (i = 0x234C; i < 0x23B4; i++)
 static void a_designs(uint8_t* r) { memset(r + 0x1240, 0x77, 0x2340 - 0x1240); }
 static void a_cat3(uint8_t* r) { m_cat3(r); }
 static void a_birthday(uint8_t* r) { r[0x10A4] = 0; r[0x10A5] = 0x7D; r[0x10A6] = 6; r[0x10A7] = 9; }
+static void a_starter_gift_box(uint8_t* r) { be16(r, 0x68, 0x2E01); be32(r, 0x88, 1); }
+static void a_starter_net(uint8_t* r) { be16(r, 0x68, 0x2200); }
+static void a_starter_shovel(uint8_t* r) { be16(r, 0x68, 0x2202); }
+static void a_starter_rod(uint8_t* r) { be16(r, 0x68, 0x2203); }
+static void a_equip_rod(uint8_t* r) { be16(r, 0x4A4, 0x2203); }
+static void m_gift_box_nocond(uint8_t* r) { be16(r, 0x68, 0x2E01); }
+static void m_rod_pocket1(uint8_t* r) { be16(r, 0x68 + 2, 0x2203); }
 
 static void predicate_tests(const char* fx) {
     int i;
@@ -201,6 +208,13 @@ static void predicate_tests(const char* fx) {
     expect("fresh record + a different (non-empty) birthday marker", a_birthday, 0, 0);
     expect("fresh record + a used letter WITHOUT a gift", m_letter_nogift, 0, 0);
     expect("fresh record + a used letter with the RSV_NO 'no gift' marker", m_letter_rsvgift, 0, 0);
+    expect("fresh record + Starter Gift Box (0x2E01) in pocket 0 with present cond", a_starter_gift_box, 0, 0);
+    expect("fresh record + unwrapped starter Bug Net (0x2200) in pocket 0", a_starter_net, 0, 0);
+    expect("fresh record + unwrapped starter Shovel (0x2202) in pocket 0", a_starter_shovel, 0, 0);
+    expect("fresh record + unwrapped starter Fishing Rod (0x2203) in pocket 0", a_starter_rod, 0, 0);
+    expect("fresh record + equipped starter Fishing Rod (0x2203)", a_equip_rod, 0, 0);
+    expect("Starter Gift Box in pocket 0 without present cond", m_gift_box_nocond, PC_MP_FRESH_BAD_POCKET, 0x88);
+    expect("starter Fishing Rod in pocket 1 (only pocket 0 allowed)", m_rod_pocket1, PC_MP_FRESH_BAD_POCKET, 0x6A);
     expect("pocket slot 0 holds an item", m_pocket0, PC_MP_FRESH_BAD_POCKET, 0x68);
     expect("pocket slot 14 holds an item", m_pocket14, PC_MP_FRESH_BAD_POCKET, 0x68 + 28);
     expect("an item condition bit is set", m_cond, PC_MP_FRESH_BAD_POCKET, 0x88);
@@ -404,8 +418,19 @@ static void profile_tests(void) {
             check("parse: 'Server' (not exactly SERVER) is a legal name, '010' is decimal 10 (no octal)", pc_guest_profile_parse(t3, strlen(t3), &p, err, sizeof(err)) && p.player_id == 10);
         }
         check("parse: the canonical valid body parses", pc_guest_profile_parse(k_valid_body, strlen(k_valid_body), &p, err, sizeof(err)));
+        {
+            PCGuestProfile ps, ps_rt;
+            char sbuf[1024];
+            size_t sn;
+            const char* ts = "name = Bella\ngender = 1\nface = 4\nshirt = 0x2407\nhome_town = Hometown\nplayer_id = 4097\nland_id = 23297\n";
+            check("parse: optional starter shirt (0x2400..0x240F) is accepted and round-trips",
+                  pc_guest_profile_parse(ts, strlen(ts), &ps, err, sizeof(err)) && ps.shirt == 0x2407
+                  && (sn = pc_guest_profile_format(&ps, sbuf, sizeof(sbuf))) > 0
+                  && pc_guest_profile_parse(sbuf, sn, &ps_rt, err, sizeof(err)) && ps_rt.shirt == 0x2407);
+        }
     }
     /* --- every bad input names its key --- */
+    parse_case("shirt outside 0x2400..0x240F", "name = A\ngender = 0\nface = 1\nshirt = 0x2500\nhome_town = H\nplayer_id = 1\nland_id = 2\n", "shirt");
     parse_case("empty text (every key missing)", "", "name");
     parse_case("missing gender", "name = A\nface = 1\nhome_town = H\nplayer_id = 1\nland_id = 2\n", "gender");
     parse_case("missing land_id", "name = A\ngender = 0\nface = 1\nhome_town = H\nplayer_id = 1\n", "land_id");

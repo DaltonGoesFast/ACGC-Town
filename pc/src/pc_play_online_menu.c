@@ -628,8 +628,10 @@ int pc_play_online_menu_confirm(void) {
         case PG_CHARS:
             if (s_sel < s_nchr) {
                 char_connect(s_sel);
-            } else if (s_sel == s_nchr) { /* New character: ask for a name here, instead of starting as Guest / NewChar */
-                text_begin(T_CHAR_NAME, "");
+            } else if (s_sel == s_nchr) { /* New character: the name is entered ONCE in the 3D Character Creator on the train */
+                if (s_cur >= 0 && s_cur < s_nsrv) {
+                    do_connect(&s_srv[s_cur], PC_RELAUNCH_NEW_CHARACTER, NULL, NULL);
+                }
             } else if (s_sel == s_nchr + 1) { /* Import characters */
                 goto_page(PG_IMPORT, 0);
             } else if (s_sel == s_nchr + 2) { /* Manage characters (never connects) */

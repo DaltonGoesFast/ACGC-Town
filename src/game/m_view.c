@@ -36,7 +36,11 @@ extern void initView(View* view, GRAPH* graph) {
     view->near = 20.0f;
   }
 
+#ifdef PC_ENHANCEMENTS
+  view->far = 3000.0f;
+#else
   view->far = 1600.0f;
+#endif
 
   view->scale = 1.0f;
   

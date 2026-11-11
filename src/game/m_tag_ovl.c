@@ -289,6 +289,21 @@ static mTG_tag_word_c mTG_tag_word_pc_place = { /* outdoor furniture C1: place t
     "Place           ",
     &mTG_pc_ofurn_place_proc,
 };
+static void mTG_pc_starter_rod_proc(Submenu* submenu, mSM_MenuInfo_c* menu_info);
+static void mTG_pc_starter_net_proc(Submenu* submenu, mSM_MenuInfo_c* menu_info);
+static void mTG_pc_starter_shovel_proc(Submenu* submenu, mSM_MenuInfo_c* menu_info);
+static mTG_tag_word_c mTG_tag_word_pc_starter_rod = {
+    "Fishing Rod     ",
+    &mTG_pc_starter_rod_proc,
+};
+static mTG_tag_word_c mTG_tag_word_pc_starter_net = {
+    "Bug Net         ",
+    &mTG_pc_starter_net_proc,
+};
+static mTG_tag_word_c mTG_tag_word_pc_starter_shovel = {
+    "Shovel          ",
+    &mTG_pc_starter_shovel_proc,
+};
 #endif
 
 static mTG_tag_word_c mTG_tag_word_dump_item = {
@@ -1157,6 +1172,16 @@ static mTG_tag_word_c* mTG_tag_password_item[] = {
     &mTG_tag_word_yameru,
 };
 
+#ifdef TARGET_PC
+static mTG_tag_word_c* mTG_pc_starter_gift[] = {
+    &mTG_tag_word_pc_starter_rod,
+    &mTG_tag_word_pc_starter_net,
+    &mTG_tag_word_pc_starter_shovel,
+    &mTG_tag_word_yameru,
+};
+#define mTG_TYPE_PC_STARTER_GIFT mTG_TYPE_NUM
+#endif
+
 static mTG_tag_data_c mTG_label_table[] = {
     { NULL, 0 },                                                             /* mTG_TYPE_NONE */
     { mTG_field_default, ARRAY_COUNT(mTG_field_default) },                   /* mTG_TYPE_FIELD_DEFAULT */
@@ -1240,6 +1265,9 @@ static mTG_tag_data_c mTG_label_table[] = {
     { NULL, 0 },                                                             /* mTG_TYPE_76 */
 #endif
     { mTG_tag_password_item, ARRAY_COUNT(mTG_tag_password_item) },           /* mTG_TYPE_TAG_PASSWORD_ITEM */
+#ifdef TARGET_PC
+    { mTG_pc_starter_gift, ARRAY_COUNT(mTG_pc_starter_gift) },               /* mTG_TYPE_PC_STARTER_GIFT */
+#endif
 };
 
 static void mTG_init_tag_data_item_win(Submenu*);
@@ -2059,6 +2087,12 @@ static void mTG_init_tag_data_item_win_sub_mail_item(Submenu* submenu, mTG_tag_c
 
     if (tag->str2_type == mTG_QSTR_TYPE_NONE) {
         if (itemCond == mPr_ITEM_COND_PRESENT) {
+#ifdef TARGET_PC
+            if (itemNo == ITM_HUKUBUKURO_PRESENT) {
+                static const u8 starter_gift_str[12] = "Starter Gift";
+                mem_copy(tag->str0, (u8*)starter_gift_str, sizeof(starter_gift_str));
+            } else
+#endif
             mem_copy(tag->str0, present_str, sizeof(present_str));
 #ifdef TARGET_PC
         } else if (itemCond == mPr_ITEM_COND_QUEST && tag->table == mTG_TABLE_ITEM && !(ITEM_NAME_GET_TYPE(itemNo) == NAME_TYPE_ITEM1 && ITEM_NAME_GET_CAT(itemNo) == ITEM1_CAT_MONEY)) {
@@ -3322,10 +3356,49 @@ static void mTG_set_trade_cond(Submenu* submenu, mSM_MenuInfo_c* menu_info, s16 
     submenu->overlay->haniwa_ovl->set_interrupt_message_proc(submenu, tag, mHW_MSG_KASIKO);
 }
 
+#ifdef TARGET_PC
+static void mTG_pc_starter_unwrap(Submenu* submenu, mActor_name_t tool_item) {
+    int table_idx = mTG_get_table_idx(&submenu->overlay->tag_ovl->tags[0]);
+
+    Now_Private->inventory.pockets[table_idx] = tool_item;
+    mTG_return_tag_init(submenu, mTG_TYPE_NONE, mTG_RETURN_CLOSE);
+    sAdo_SysTrgStart(NA_SE_436);
+    mPr_SetItemCollectBit(tool_item);
+    submenu->overlay->inventory_ovl->item_scale_type[table_idx] = 5;
+    submenu->overlay->inventory_ovl->remove_timer = 48;
+}
+
+static void mTG_pc_starter_rod_proc(Submenu* submenu, mSM_MenuInfo_c* menu_info) {
+    (void)menu_info;
+    mTG_pc_starter_unwrap(submenu, ITM_ROD);
+}
+
+static void mTG_pc_starter_net_proc(Submenu* submenu, mSM_MenuInfo_c* menu_info) {
+    (void)menu_info;
+    mTG_pc_starter_unwrap(submenu, ITM_NET);
+}
+
+static void mTG_pc_starter_shovel_proc(Submenu* submenu, mSM_MenuInfo_c* menu_info) {
+    (void)menu_info;
+    mTG_pc_starter_unwrap(submenu, ITM_SHOVEL);
+}
+#endif
+
 static void mTG_present_open_proc(Submenu* submenu, mSM_MenuInfo_c* menu_info) {
     int table_idx;
 
     table_idx = mTG_get_table_idx(&submenu->overlay->tag_ovl->tags[0]);
+#ifdef TARGET_PC
+    if (Now_Private->inventory.pockets[table_idx] == ITM_HUKUBUKURO_PRESENT &&
+        mPr_GET_ITEM_COND(Now_Private->inventory.item_conditions, table_idx) == mPr_ITEM_COND_PRESENT) {
+        mTG_Ovl_c* tag_ovl = submenu->overlay->tag_ovl;
+        mTG_tag_c* tag = &tag_ovl->tags[tag_ovl->sel_tag_idx];
+
+        mTG_chg_tag_func2(submenu, menu_info, tag, mTG_TYPE_PC_STARTER_GIFT);
+        sAdo_SysTrgStart(NA_SE_33);
+        return;
+    }
+#endif
     mTG_return_tag_init(submenu, mTG_TYPE_NONE, mTG_RETURN_KEEP);
     sAdo_SysTrgStart(NA_SE_436);
     mPr_SetItemCollectBit(Now_Private->inventory.pockets[table_idx]);

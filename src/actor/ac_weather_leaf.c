@@ -1,4 +1,7 @@
 #include "ac_weather_leaf.h"
+#ifdef TARGET_PC
+#include "pc_platform.h"
+#endif
 
 #include "main.h"
 #include "m_common_data.h"
@@ -188,8 +191,15 @@ void aWeatherLeaf_draw(aWeather_Priv* priv, GAME* game) {
     pos.y = priv->pos.y;
     Game_play_Projection_Trans(play, &pos, &screen_pos);
 
+#ifdef PC_ENHANCEMENTS
+    f32 x_edge = 1.0f, y_edge = 1.0f;
+    pc_cull_get_edges(&x_edge, &y_edge);
+    if ((screen_pos.x >= 160.0f - 160.0f * x_edge) && (screen_pos.x <= 160.0f + 160.0f * x_edge) &&
+        (screen_pos.y >= 120.0f - 120.0f * y_edge) && (screen_pos.y <= 120.0f + 120.0f * y_edge)) {
+#else
     if ((screen_pos.x >= 0.0f) && (screen_pos.x < SCREEN_WIDTH_F) && (screen_pos.y >= 0.0f) &&
         (screen_pos.y < SCREEN_HEIGHT_F)) {
+#endif
 
         work = GRAPH_ALLOC_TYPE(game->graph, Mtx, 1);
 
