@@ -211,7 +211,11 @@ static int message_open(void) {
 static int submenu_open(void) {
     GAME_PLAY* play = get_game_play();
     if (play == NULL) return 0;
-    return play->submenu.menu_type != 0 && play->submenu.overlay != NULL;
+    return (play->submenu.open_flag ||
+            play->submenu.mode >= mSM_MODE_PRERENDER_DONE ||
+            play->submenu.process_status == mSM_PROCESS_PLAY ||
+            play->submenu.menu_type != 0) &&
+           play->submenu.overlay != NULL;
 }
 
 static int keys_up(void) {
@@ -1539,13 +1543,8 @@ static void vert(float x, float y, float u, float v, float r, float g, float b, 
 
 static float s_fade = 1.0f;
 
-static void disc(float cx, float cy, float rad, float r, float g, float b, float a) {
+static void disc_raw(float cx, float cy, float rad, float r, float g, float b, float a) {
     float W = (float)g_pc_window_w, H = (float)g_pc_window_h;
-    if (submenu_open() && a >= 0.8f) {
-        if (a < 0.92f) a = 0.92f;
-    } else {
-        a *= s_fade;
-    }
     float x0 = (cx - rad) / W * 2.0f - 1.0f;
     float x1 = (cx + rad) / W * 2.0f - 1.0f;
     float y0 = 1.0f - (cy + rad) / H * 2.0f;
@@ -1556,6 +1555,11 @@ static void disc(float cx, float cy, float rad, float r, float g, float b, float
     vert(x0, y0, -1, -1, r, g, b, a);
     vert(x1, y1, 1, 1, r, g, b, a);
     vert(x0, y1, -1, 1, r, g, b, a);
+}
+
+static void disc(float cx, float cy, float rad, float r, float g, float b, float a) {
+    a *= s_fade;
+    disc_raw(cx, cy, rad, r, g, b, a);
 }
 
 static void button(float cx, float cy, float rad, float r, float g, float b) {
@@ -1586,6 +1590,42 @@ static const unsigned char k_glyph[37][7] = {
     {0x06,0x08,0x10,0x1E,0x11,0x11,0x0E}, {0x1F,0x01,0x02,0x04,0x08,0x08,0x08},
     {0x0E,0x11,0x11,0x0E,0x11,0x11,0x0E}, {0x0E,0x11,0x11,0x0F,0x01,0x02,0x0C}
 };
+
+static void glyph_raw(char ch, float cx, float cy, float s, float r, float g, float b, float a) {
+    int idx = -1, row, col;
+    if (ch >= 'a' && ch <= 'z') idx = ch - 'a';
+    else if (ch >= 'A' && ch <= 'Z') idx = ch - 'A';
+    else if (ch == '<') idx = 26;
+    else if (ch >= '0' && ch <= '9') idx = 27 + (ch - '0');
+    if (idx < 0) return;
+    for (row = 0; row < 7; row++) {
+        unsigned bits = k_glyph[idx][row];
+        for (col = 0; col < 5; col++) {
+            if (bits & (1u << (4 - col))) {
+                float px = cx + ((float)col - 2.0f) * s;
+                float py = cy + ((float)row - 3.0f) * s;
+                disc_raw(px, py, s * 0.55f, r, g, b, a);
+            }
+        }
+    }
+}
+
+static void draw_word_raw(const char* s, float cx, float cy, float pix, float r, float g, float b, float a) {
+    int n = 0, i;
+    float w, max_w;
+    if (s == NULL) return;
+    while (s[n] != 0 && n < 12) n++;
+    if (n == 0) return;
+    max_w = (pix / 0.13f) * 1.55f;
+    if (pix > 0.0f && (float)n * 5.0f * pix > max_w) {
+        pix = max_w / ((float)n * 5.0f);
+    }
+    w = (float)n * 5.0f * pix;
+    for (i = 0; i < n; i++) {
+        if (s[i] == ' ') continue;
+        glyph_raw(s[i], cx - w * 0.5f + ((float)i + 0.5f) * 5.0f * pix, cy, pix, r, g, b, a);
+    }
+}
 
 static void glyph(char ch, float cx, float cy, float s) {
     int idx = -1, row, col;
@@ -1745,14 +1785,28 @@ void pc_touch_present(void) {
         disc(h.mx + h.mr * 0.16f, h.my - h.mr * 0.12f, h.mr * 0.22f, 0.36f, 0.52f, 0.40f, 0.95f);
     }
     if (h.show_close) {
-        button(h.close_x, h.close_y, h.close_r, 0.93f, 0.90f, 0.84f);
-        draw_word("Back", h.close_x, h.close_y + h.close_r + 14.0f, h.close_r * 0.16f);
+        if (submenu_open()) {
+            disc_raw(h.close_x + 2.0f, h.close_y + 3.0f, h.close_r, 0.05f, 0.06f, 0.05f, 0.35f);
+            disc_raw(h.close_x, h.close_y, h.close_r, 0.95f, 0.88f, 0.82f, 0.96f);
+            disc_raw(h.close_x, h.close_y - h.close_r * 0.18f, h.close_r * 0.70f, 1.0f, 1.0f, 1.0f, 0.30f);
+            draw_word_raw("B", h.close_x, h.close_y, h.close_r * 0.22f, 0.15f, 0.15f, 0.15f, 1.0f);
+        } else {
+            button(h.close_x, h.close_y, h.close_r, 0.93f, 0.90f, 0.84f);
+            draw_word("Back", h.close_x, h.close_y + h.close_r + 14.0f, h.close_r * 0.16f);
+        }
     }
     if (h.show_context) {
         const char* word = action_word();
-        button(h.ctx_x, h.ctx_y, h.ctx_r, 0.98f, 0.96f, 0.90f);
-        disc(h.ctx_x, h.ctx_y, h.ctx_r * 0.28f, 0.36f, 0.52f, 0.40f, 0.95f);
-        if (word != NULL) draw_word(word, h.ctx_x, h.ctx_y - h.ctx_r - 16.0f, h.ctx_r * 0.16f);
+        if (submenu_open()) {
+            disc_raw(h.ctx_x + 2.0f, h.ctx_y + 3.0f, h.ctx_r, 0.05f, 0.06f, 0.05f, 0.35f);
+            disc_raw(h.ctx_x, h.ctx_y, h.ctx_r, 0.82f, 0.95f, 0.84f, 0.96f);
+            disc_raw(h.ctx_x, h.ctx_y - h.ctx_r * 0.18f, h.ctx_r * 0.70f, 1.0f, 1.0f, 1.0f, 0.30f);
+            if (word != NULL) draw_word_raw(word, h.ctx_x, h.ctx_y, h.ctx_r * 0.18f, 0.12f, 0.25f, 0.14f, 1.0f);
+        } else {
+            button(h.ctx_x, h.ctx_y, h.ctx_r, 0.98f, 0.96f, 0.90f);
+            disc(h.ctx_x, h.ctx_y, h.ctx_r * 0.28f, 0.36f, 0.52f, 0.40f, 0.95f);
+            if (word != NULL) draw_word(word, h.ctx_x, h.ctx_y - h.ctx_r - 16.0f, h.ctx_r * 0.16f);
+        }
     }
     if (h.choice_n > 0) {
         mChoice_c* c = mChoice_Get_base_window_p();
@@ -1779,15 +1833,17 @@ void pc_touch_present(void) {
     if (h.show_sub_tabs) {
         static const char* labels[4] = { "Items", "Letters", "Fish", "Bugs" };
         static const float tab_colors[4][3] = {
-            { 0.95f, 0.92f, 0.82f },
-            { 0.96f, 0.82f, 0.78f },
-            { 0.80f, 0.88f, 0.98f },
-            { 0.82f, 0.94f, 0.84f }
+            { 0.98f, 0.92f, 0.72f },  /* Items: Soft pastel cream/gold */
+            { 0.98f, 0.80f, 0.78f },  /* Letters: Soft pastel pink */
+            { 0.76f, 0.88f, 1.00f },  /* Fish: Sky pastel blue */
+            { 0.78f, 0.96f, 0.82f }   /* Bugs: Soft mint green */
         };
         for (i = 0; i < h.sub_tab_n; i++) {
-            button(h.sub_tab_x[i], h.sub_tab_y[i], h.sub_tab_r,
-                   tab_colors[i][0], tab_colors[i][1], tab_colors[i][2]);
-            draw_word(labels[i], h.sub_tab_x[i], h.sub_tab_y[i], h.sub_tab_r * 0.14f);
+            float cx = h.sub_tab_x[i], cy = h.sub_tab_y[i], rad = h.sub_tab_r;
+            disc_raw(cx + 2.0f, cy + 3.0f, rad, 0.05f, 0.06f, 0.05f, 0.35f);
+            disc_raw(cx, cy, rad, tab_colors[i][0], tab_colors[i][1], tab_colors[i][2], 0.96f);
+            disc_raw(cx, cy - rad * 0.18f, rad * 0.70f, 1.0f, 1.0f, 1.0f, 0.32f);
+            draw_word_raw(labels[i], cx, cy, rad * 0.15f, 0.15f, 0.16f, 0.15f, 1.0f);
         }
     }
     if (!g_pc_settings.touch_virtual_pad && g_pc_layout_portrait && h.choice_n == 0) {
