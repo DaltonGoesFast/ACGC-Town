@@ -28,6 +28,8 @@ extern void pc_creator_menu_pointer(float fx, float fy);
 #include "m_submenu_ovl.h"
 #include "m_tag_ovl.h"
 #include "m_hand_ovl.h"
+#include "m_mail.h"
+#include "m_inventory_ovl.h"
 #include <dolphin/pad.h>
 
 #include <math.h>
@@ -43,7 +45,7 @@ extern void pc_creator_menu_pointer(float fx, float fy);
 #define HUD_DIALOG 3
 #define HUD_KEYS 4
 
-enum { HIT_NONE = 0, HIT_PICTURE, HIT_STICK, HIT_NUB, HIT_ACTION, HIT_BACK, HIT_MENU, HIT_KEY, HIT_BAG, HIT_MAP, HIT_CLOSE, HIT_CONTEXT, HIT_CHOICE };
+enum { HIT_NONE = 0, HIT_PICTURE, HIT_STICK, HIT_NUB, HIT_ACTION, HIT_BACK, HIT_MENU, HIT_KEY, HIT_BAG, HIT_MAP, HIT_CLOSE, HIT_CONTEXT, HIT_CHOICE, HIT_SUB_TAB };
 
 static int s_pointer_was = 0;
 static float s_down_x = 0.0f, s_down_y = 0.0f, s_last_x = 0.0f, s_last_y = 0.0f;
@@ -93,10 +95,13 @@ static Finger s_fin[FINGERS];
 typedef struct {
     int show_stick, show_nub, show_action, show_back, show_menu, show_keys, show_quick;
     int show_close, show_context, choice_n;
+    int show_sub_tabs, sub_tab_n;
     float sx, sy, sr, nx, ny, nr, ax, ay, ar, bx, by, br, mx, my, mr;
     float bag_x, bag_y, map_x, map_y, qr;
     float close_x, close_y, close_r, ctx_x, ctx_y, ctx_r;
     float choice_x, choice_r, choice_y[6];
+    float sub_tab_x[4], sub_tab_y[4], sub_tab_r;
+    int sub_tab_id[4];
     int key_n;
     float kx[40], ky[40], kr;
     char kc[40];
@@ -268,7 +273,7 @@ static void place_keys(Hud* h, float top, float bottom, float left, float right)
 static void hud_build(Hud* h) {
     float W = (float)g_pc_window_w, H = (float)g_pc_window_h;
     float il = 0, it = 0, ir = 0, ib = 0;
-    float rad, gap;
+    float rad;
     int town, menu, dialog;
     FILE* f = fopen("safe_insets.txt", "r");
     memset(h, 0, sizeof(*h));
@@ -374,21 +379,61 @@ static void hud_build(Hud* h) {
         int nchoice = 0;
         if (choice != NULL && mChoice_check_main_normal(choice)) nchoice = choice->data.choice_num;
         if (nchoice > 6) nchoice = 6;
-        if (nchoice > 0 && dialog && !g_pc_layout_portrait) {
-            float band_top = H * 0.52f;
-            float band_bot = H - ib - rad * 2.8f;
-            float step;
+        if (nchoice > 0 && dialog) {
+            float band_top, band_bot, step;
             int i;
-            if (band_bot < band_top + 80.0f) { band_top = H * 0.45f; band_bot = H - ib - 20.0f; }
+            if (g_pc_layout_portrait) {
+                float cw = (float)g_pc_content_w;
+                float ch_43 = cw * 3.0f / 4.0f;
+                float cy_43 = (float)g_pc_content_y + ((float)g_pc_content_h - ch_43) * 0.5f;
+                band_top = cy_43 + ch_43 * 0.70f;
+                band_bot = H - ib - rad * 2.2f;
+                if (band_bot < band_top + 60.0f) { band_top = cy_43 + ch_43 * 0.50f; band_bot = H - ib - 16.0f; }
+            } else {
+                band_top = H * 0.52f;
+                band_bot = H - ib - rad * 2.8f;
+                if (band_bot < band_top + 80.0f) { band_top = H * 0.45f; band_bot = H - ib - 20.0f; }
+            }
             step = (band_bot - band_top) / (float)(nchoice + 1);
             h->choice_n = nchoice;
             h->choice_r = step * 0.38f;
-            if (h->choice_r > rad * 0.8f) h->choice_r = rad * 0.8f;
-            if (h->choice_r < 26.0f) h->choice_r = 26.0f;
+            if (h->choice_r > rad * 0.85f) h->choice_r = rad * 0.85f;
+            if (h->choice_r < 24.0f) h->choice_r = 24.0f;
             h->choice_x = W * 0.5f;
             for (i = 0; i < nchoice; i++) h->choice_y[i] = band_top + step * (float)(i + 1);
         }
     }
+
+    h->show_sub_tabs = 0;
+    if (submenu_open() && !h->show_keys && h->choice_n == 0) {
+        h->show_sub_tabs = 1;
+        h->sub_tab_n = 4;
+        h->sub_tab_id[0] = 0; /* Items */
+        h->sub_tab_id[1] = 1; /* Letters */
+        h->sub_tab_id[2] = 2; /* Fish */
+        h->sub_tab_id[3] = 3; /* Bugs */
+        if (g_pc_layout_portrait) {
+            float band_w = W - il - ir;
+            float tab_y = (float)(g_pc_content_y + g_pc_content_h) + 78.0f;
+            if (tab_y > h->ay - rad * 1.35f) tab_y = h->ay - rad * 1.35f;
+            h->sub_tab_r = rad * 0.70f;
+            if (h->sub_tab_r > 38.0f) h->sub_tab_r = 38.0f;
+            if (h->sub_tab_r < 22.0f) h->sub_tab_r = 22.0f;
+            for (int i = 0; i < 4; i++) {
+                h->sub_tab_x[i] = il + band_w * (0.16f + 0.226f * (float)i);
+                h->sub_tab_y[i] = tab_y;
+            }
+        } else {
+            h->sub_tab_r = rad * 0.65f;
+            if (h->sub_tab_r > 34.0f) h->sub_tab_r = 34.0f;
+            if (h->sub_tab_r < 20.0f) h->sub_tab_r = 20.0f;
+            for (int i = 0; i < 4; i++) {
+                h->sub_tab_x[i] = il + h->sub_tab_r + 20.0f + (float)i * (h->sub_tab_r * 2.3f);
+                h->sub_tab_y[i] = H - ib - h->sub_tab_r - 20.0f;
+            }
+        }
+    }
+
     if (g_pc_settings.touch_left_hand) {
         h->sx = W - h->sx; h->nx = W - h->nx; h->ax = W - h->ax;
         h->bx = W - h->bx; h->mx = W - h->mx;
@@ -396,6 +441,7 @@ static void hud_build(Hud* h) {
         h->close_x = W - h->close_x;
         h->ctx_x = W - h->ctx_x;
         for (int i = 0; i < h->key_n; i++) h->kx[i] = W - h->kx[i];
+        for (int i = 0; i < h->sub_tab_n; i++) h->sub_tab_x[i] = W - h->sub_tab_x[i];
     }
     if (!h->show_stick) { h->sx = -1000.0f; }
 }
@@ -418,6 +464,14 @@ static int classify(float x, float y, Hud* h, int* key) {
     if (h->choice_n > 0) {
         for (i = 0; i < h->choice_n; i++) {
             if (hit_disc(x, y, h->choice_x, h->choice_y[i], h->choice_r)) { *key = i; return HIT_CHOICE; }
+        }
+    }
+    if (h->show_sub_tabs) {
+        for (i = 0; i < h->sub_tab_n; i++) {
+            if (hit_disc(x, y, h->sub_tab_x[i], h->sub_tab_y[i], h->sub_tab_r)) {
+                *key = h->sub_tab_id[i];
+                return HIT_SUB_TAB;
+            }
         }
     }
     if (h->show_close && hit_disc(x, y, h->close_x, h->close_y, h->close_r)) return HIT_CLOSE;
@@ -618,6 +672,12 @@ static void begin_move(float x, float y, int fresh) {
     }
 }
 
+static int submenu_hand_is_empty(Submenu* submenu) {
+    if (submenu == NULL || submenu->overlay == NULL || submenu->overlay->hand_ovl == NULL) return 1;
+    mHD_Ovl_c* hand_ovl = submenu->overlay->hand_ovl;
+    return (hand_ovl->info.item == EMPTY_NO && mMl_check_not_used_mail(&hand_ovl->info.mail));
+}
+
 static void refresh_action_label(void) {
     GAME_PLAY* play;
     PLAYER_ACTOR* player;
@@ -626,7 +686,27 @@ static void refresh_action_label(void) {
     int i;
     snprintf(s_action, sizeof(s_action), "A");
     if (message_open()) { snprintf(s_action, sizeof(s_action), "Next"); return; }
-    if (submenu_open()) { snprintf(s_action, sizeof(s_action), "OK"); return; }
+    if (submenu_open()) {
+        GAME_PLAY* pl = (GAME_PLAY*)gamePT;
+        Submenu* sm = (pl != NULL) ? &pl->submenu : NULL;
+        Submenu_Overlay_c* ov = (sm != NULL) ? sm->overlay : NULL;
+        mTG_Ovl_c* tovl = (ov != NULL) ? ov->tag_ovl : NULL;
+        mTG_tag_c* tag = (tovl != NULL && tovl->sel_tag_idx >= 0 && tovl->sel_tag_idx < mTG_TAG_NUM) ? &tovl->tags[tovl->sel_tag_idx] : NULL;
+        if (sm != NULL && !submenu_hand_is_empty(sm)) {
+            snprintf(s_action, sizeof(s_action), "Drop");
+            return;
+        }
+        if (tag != NULL && tag->type != mTG_TYPE_NONE) {
+            snprintf(s_action, sizeof(s_action), "Select");
+            return;
+        }
+        if (tag != NULL && tag->table == mTG_TABLE_ITEM) {
+            snprintf(s_action, sizeof(s_action), "Open");
+            return;
+        }
+        snprintf(s_action, sizeof(s_action), "OK");
+        return;
+    }
     if (gamePT == NULL) return;
     play = (GAME_PLAY*)gamePT;
     player = get_player_actor_withoutCheck(play);
@@ -724,6 +804,68 @@ static int choice_count_now(void);
 static int choice_is_up(void);
 static void note_tap(const char* kind);
 
+static void handle_sub_tab_tap(int tab_id) {
+    GAME_PLAY* play;
+    Submenu* submenu;
+    Submenu_Overlay_c* ovl;
+    mTG_Ovl_c* tag_ovl;
+    mTG_tag_c* tag;
+
+    if (gamePT == NULL) return;
+    play = (GAME_PLAY*)gamePT;
+    submenu = &play->submenu;
+    ovl = submenu->overlay;
+    if (ovl == NULL || ovl->tag_ovl == NULL) return;
+    tag_ovl = ovl->tag_ovl;
+    if (tag_ovl->sel_tag_idx < 0 || tag_ovl->sel_tag_idx >= mTG_TAG_NUM) return;
+    tag = &tag_ovl->tags[tag_ovl->sel_tag_idx];
+
+    if (tab_id == 0) { /* Items / Pockets */
+        if (submenu->overlay->inventory_ovl != NULL &&
+            submenu->overlay->inventory_ovl->page_order[0] != mIV_PAGE_INVENTORY) {
+            tag->table = mTG_TABLE_WCHANGE;
+            tag->tag_col = 0;
+            tag->tag_row = mIV_PAGE_INVENTORY;
+            s_pulse_a = 1;
+        } else {
+            tag->table = mTG_TABLE_ITEM;
+            tag->tag_col = 0;
+            tag->tag_row = 0;
+            if (tag_ovl->init_tag_data_item_win_proc != NULL) {
+                tag_ovl->init_tag_data_item_win_proc(submenu);
+            }
+        }
+        note_tap("tab_items");
+    } else if (tab_id == 1) { /* Letters / Mail */
+        if (submenu->overlay->inventory_ovl != NULL &&
+            submenu->overlay->inventory_ovl->page_order[0] != mIV_PAGE_INVENTORY) {
+            tag->table = mTG_TABLE_WCHANGE;
+            tag->tag_col = 0;
+            tag->tag_row = mIV_PAGE_INVENTORY;
+            s_pulse_a = 1;
+        }
+        tag->table = mTG_TABLE_MAIL;
+        tag->tag_col = 0;
+        tag->tag_row = 0;
+        if (tag_ovl->init_tag_data_item_win_proc != NULL) {
+            tag_ovl->init_tag_data_item_win_proc(submenu);
+        }
+        note_tap("tab_letters");
+    } else if (tab_id == 2) { /* Fish */
+        tag->table = mTG_TABLE_WCHANGE;
+        tag->tag_col = 0;
+        tag->tag_row = mIV_PAGE_FISH_COLLECTION;
+        s_pulse_a = 1;
+        note_tap("tab_fish");
+    } else if (tab_id == 3) { /* Bugs */
+        tag->table = mTG_TABLE_WCHANGE;
+        tag->tag_col = 0;
+        tag->tag_row = mIV_PAGE_INSECT_COLLECTION;
+        s_pulse_a = 1;
+        note_tap("tab_bugs");
+    }
+}
+
 static void on_submenu_tap(float x, float y) {
     GAME_PLAY* play;
     Submenu* submenu;
@@ -731,7 +873,7 @@ static void on_submenu_tap(float x, float y) {
     mTG_Ovl_c* tag_ovl;
     mTG_tag_c* tag;
     float cw, ch_43, cx, cy_43, center_x, center_y, gx, gy;
-    int col, row;
+    int hand_empty;
 
     if (gamePT == NULL) return;
     play = (GAME_PLAY*)gamePT;
@@ -765,73 +907,218 @@ static void on_submenu_tap(float x, float y) {
      * X in [-160, 160], Y in [-120, 120] (GameCube Y is up) */
     gx = (x - center_x) / (cw * 0.5f) * 160.0f;
     gy = -(y - center_y) / (ch_43 * 0.5f) * 120.0f;
+    hand_empty = submenu_hand_is_empty(submenu);
 
-    /* When an item action popup tag menu is open (e.g. Open/Quit or Starter Gift tool selection),
-     * map taps directly onto the popup's option rows rather than overwriting tag->table with the pocket grid. */
+    /* 1. Item Action Popup Tag Menu (Wear, Drop, Grab, Quit, etc.) */
     if (tag->type != mTG_TYPE_NONE) {
         float fx, fy;
         float pos_y = 120.0f - (tag->base_pos[1] + tag->body_ofs[1] + tag->text_ofs[1]);
+        float pos_x = (tag->base_pos[0] + tag->body_ofs[0] + 160.0f);
         int tapped_row;
         to_font(x, y, &fx, &fy);
-        tapped_row = (int)((fy - (pos_y - 4.0f)) / 14.0f);
-        if (tapped_row >= 0 && tapped_row < 6) {
-            tag->tag_row = tapped_row;
+
+        if (fx >= pos_x - 45.0f && fx <= pos_x + 95.0f) {
+            tapped_row = (int)((fy - (pos_y - 6.0f)) / 15.0f);
+            if (tapped_row >= 0 && tapped_row < 6) {
+                tag->tag_row = tapped_row;
+                s_pulse_a = 1;
+                note_tap("tag_option");
+                pc_touch_buzz();
+                return;
+            }
         }
-        s_pulse_a = 1;
-        note_tap("tag_option");
+        /* Tap outside popup cancels it */
+        s_pulse_b = 1;
+        note_tap("cancel_popup");
+        pc_touch_buzz();
         return;
     }
 
-    /* Player portrait: (-59, 63) */
-    if (gx >= -90.0f && gx <= -30.0f && gy >= 35.0f && gy <= 95.0f) {
-        tag->table = mTG_TABLE_PLAYER;
+    /* 2. Side Tabs on Inventory Rim */
+    /* Right Top: Fish Collection (gx: 85..130, gy: 18..58) */
+    if (gx >= 85.0f && gx <= 130.0f && gy >= 18.0f && gy <= 58.0f) {
+        tag->table = mTG_TABLE_WCHANGE;
+        tag->tag_col = 0;
+        tag->tag_row = mIV_PAGE_FISH_COLLECTION;
+        s_pulse_a = 1;
+        note_tap("tab_fish");
+        pc_touch_buzz();
+        return;
+    }
+    /* Right Mid: Face / Designs Tab (gx: 85..130, gy: -18..18) */
+    if (gx >= 85.0f && gx <= 130.0f && gy > -18.0f && gy < 18.0f) {
+        tag->table = mTG_TABLE_WCHANGE;
+        tag->tag_col = 0;
+        tag->tag_row = 1;
+        s_pulse_a = 1;
+        note_tap("tab_face");
+        pc_touch_buzz();
+        return;
+    }
+    /* Right Bot: Insect Collection (gx: 85..130, gy: -58..-18) */
+    if (gx >= 85.0f && gx <= 130.0f && gy >= -58.0f && gy <= -18.0f) {
+        tag->table = mTG_TABLE_WCHANGE;
+        tag->tag_col = 0;
+        tag->tag_row = mIV_PAGE_INSECT_COLLECTION;
+        s_pulse_a = 1;
+        note_tap("tab_bugs");
+        pc_touch_buzz();
+        return;
+    }
+    /* Left Tab: Original Patterns / Needlework (gx: -130..-85, gy: -25..25) */
+    if (gx >= -130.0f && gx <= -85.0f && gy >= -25.0f && gy <= 25.0f) {
+        tag->table = mTG_TABLE_INVENTORY_WC_ORG;
         tag->tag_col = 0;
         tag->tag_row = 0;
         s_pulse_a = 1;
-        note_tap("player_portrait");
-        pc_diag_milestone("tap player portrait");
+        note_tap("tab_designs");
+        pc_touch_buzz();
         return;
     }
 
-    /* Wallet: (-22, 10) */
-    if (gx >= -45.0f && gx <= 0.0f && gy >= -5.0f && gy <= 25.0f) {
-        tag->table = mTG_TABLE_MONEY;
-        tag->tag_col = 0;
-        tag->tag_row = 0;
-        s_pulse_a = 1;
-        note_tap("wallet");
+    /* 3. Fish & Insect Collection Page Grid (8 cols x 5 rows) */
+    if (submenu->overlay->inventory_ovl != NULL &&
+        submenu->overlay->inventory_ovl->page_order[0] != mIV_PAGE_INVENTORY) {
+        int c = (int)roundf((gx - (-89.0f)) / 24.3f);
+        int r = (int)roundf((42.0f - gy) / 24.0f);
+        if (c >= 0 && c < 8 && r >= 0 && r < 5) {
+            tag->table = mTG_TABLE_COLLECT;
+            tag->tag_col = c;
+            tag->tag_row = r;
+            if (tag_ovl->init_tag_data_item_win_proc != NULL) {
+                tag_ovl->init_tag_data_item_win_proc(submenu);
+            }
+            note_tap("collect_item");
+            pc_touch_buzz();
+            return;
+        }
         return;
     }
 
-    /* Pockets (5 cols x 3 rows):
+    /* 4. Dresser / Gyroid storage (mSM_OVL_HANIWA) */
+    if (submenu->menu_type == mSM_OVL_HANIWA) {
+        if (gy >= 25.0f) {
+            int c = (int)roundf((gx - (-106.0f)) / 22.0f);
+            int r = (int)roundf((82.0f - gy) / 22.0f);
+            if (c >= 0 && c < 9 && r >= 0 && r < 3) {
+                int already = (tag->table == mTG_TABLE_HANIWA && tag->tag_col == c && tag->tag_row == r);
+                tag->table = mTG_TABLE_HANIWA;
+                tag->tag_col = c;
+                tag->tag_row = r;
+                if (!hand_empty || already) {
+                    s_pulse_a = 1;
+                } else if (tag_ovl->init_tag_data_item_win_proc != NULL) {
+                    tag_ovl->init_tag_data_item_win_proc(submenu);
+                }
+                note_tap("dresser_slot");
+                pc_touch_buzz();
+                return;
+            }
+        }
+    }
+
+    /* 5. Player portrait: (-59, 63) */
+    {
+        float dx = gx - (-59.0f), dy = gy - 63.0f;
+        if (dx * dx + dy * dy <= 32.0f * 32.0f) {
+            int already = (tag->table == mTG_TABLE_PLAYER);
+            tag->table = mTG_TABLE_PLAYER;
+            tag->tag_col = 0;
+            tag->tag_row = 0;
+            if (already || !hand_empty) {
+                s_pulse_a = 1;
+            } else if (tag_ovl->init_tag_data_item_win_proc != NULL) {
+                tag_ovl->init_tag_data_item_win_proc(submenu);
+            }
+            note_tap("player_portrait");
+            pc_diag_milestone("tap player portrait");
+            pc_touch_buzz();
+            return;
+        }
+    }
+
+    /* 6. Wallet: (-22, 10) */
+    {
+        float dx = gx - (-22.0f), dy = gy - 10.0f;
+        if (dx * dx + dy * dy <= 28.0f * 28.0f) {
+            int already = (tag->table == mTG_TABLE_MONEY);
+            tag->table = mTG_TABLE_MONEY;
+            tag->tag_col = 0;
+            tag->tag_row = 0;
+            if (already || !hand_empty) {
+                s_pulse_a = 1;
+            } else if (tag_ovl->init_tag_data_item_win_proc != NULL) {
+                tag_ovl->init_tag_data_item_win_proc(submenu);
+            }
+            note_tap("wallet");
+            pc_touch_buzz();
+            return;
+        }
+    }
+
+    /* 7. Pockets (5 cols x 3 rows) with generous distance-based snapping:
      * cols: {-77, -53, -29, -5, 19}, rows: {-10, -34, -58} */
-    col = (int)roundf((gx - (-77.0f)) / 24.0f);
-    row = (int)roundf((-10.0f - gy) / 24.0f);
-    if (col >= 0 && col < 5 && row >= 0 && row < 3) {
-        tag->table = mTG_TABLE_ITEM;
-        tag->tag_col = col;
-        tag->tag_row = row;
-        s_pulse_a = 1;
-        note_tap("pocket_item");
-        pc_diag_milestone("tap pocket item");
-        return;
+    if (gx < 38.0f && gy < 12.0f && gy > -76.0f) {
+        static const float item_cols[5] = { -77.0f, -53.0f, -29.0f, -5.0f, 19.0f };
+        static const float item_rows[3] = { -10.0f, -34.0f, -58.0f };
+        int best_c = 0, best_r = 0, c, r;
+        float best_d2 = 1e9f;
+        for (c = 0; c < 5; c++) {
+            for (r = 0; r < 3; r++) {
+                float d2 = (gx - item_cols[c]) * (gx - item_cols[c]) + (gy - item_rows[r]) * (gy - item_rows[r]);
+                if (d2 < best_d2) { best_d2 = d2; best_c = c; best_r = r; }
+            }
+        }
+        if (best_d2 <= 28.0f * 28.0f) {
+            int already = (tag->table == mTG_TABLE_ITEM && tag->tag_col == best_c && tag->tag_row == best_r);
+            tag->table = mTG_TABLE_ITEM;
+            tag->tag_col = best_c;
+            tag->tag_row = best_r;
+            if (!hand_empty || already) {
+                s_pulse_a = 1;
+                note_tap(already ? "item_activate" : "drop_item");
+            } else {
+                if (tag_ovl->init_tag_data_item_win_proc != NULL) {
+                    tag_ovl->init_tag_data_item_win_proc(submenu);
+                }
+                note_tap("item_inspect");
+            }
+            pc_touch_buzz();
+            return;
+        }
     }
 
-    /* Mail (2 cols x 5 rows):
+    /* 8. Mail (2 cols x 5 rows) with generous distance-based snapping:
      * cols: {55, 79}, rows: {38, 14, -10, -34, -58} */
-    col = (int)roundf((gx - 55.0f) / 24.0f);
-    row = (int)roundf((38.0f - gy) / 24.0f);
-    if (col >= 0 && col < 2 && row >= 0 && row < 5) {
-        tag->table = mTG_TABLE_MAIL;
-        tag->tag_col = col;
-        tag->tag_row = row;
-        s_pulse_a = 1;
-        note_tap("mail");
-        return;
+    if (gx >= 38.0f && gy > -76.0f && gy < 56.0f) {
+        static const float mail_cols[2] = { 55.0f, 79.0f };
+        static const float mail_rows[5] = { 38.0f, 14.0f, -10.0f, -34.0f, -58.0f };
+        int best_c = 0, best_r = 0, c, r;
+        float best_d2 = 1e9f;
+        for (c = 0; c < 2; c++) {
+            for (r = 0; r < 5; r++) {
+                float d2 = (gx - mail_cols[c]) * (gx - mail_cols[c]) + (gy - mail_rows[r]) * (gy - mail_rows[r]);
+                if (d2 < best_d2) { best_d2 = d2; best_c = c; best_r = r; }
+            }
+        }
+        if (best_d2 <= 28.0f * 28.0f) {
+            int already = (tag->table == mTG_TABLE_MAIL && tag->tag_col == best_c && tag->tag_row == best_r);
+            tag->table = mTG_TABLE_MAIL;
+            tag->tag_col = best_c;
+            tag->tag_row = best_r;
+            if (!hand_empty || already) {
+                s_pulse_a = 1;
+                note_tap(already ? "mail_activate" : "drop_mail");
+            } else {
+                if (tag_ovl->init_tag_data_item_win_proc != NULL) {
+                    tag_ovl->init_tag_data_item_win_proc(submenu);
+                }
+                note_tap("mail_inspect");
+            }
+            pc_touch_buzz();
+            return;
+        }
     }
-
-    s_pulse_a = 1;
-    note_tap("submenu_a");
 }
 
 static void on_picture_release(float x, float y) {
@@ -1014,6 +1301,9 @@ void pc_touch_apply(unsigned short* buttons, signed char* stick_x, signed char* 
                 latch_button(PAD_BUTTON_X, "X");
                 pc_touch_buzz();
                 pc_diag_milestone("touch map");
+            } else if (th == HIT_SUB_TAB) {
+                handle_sub_tab_tap(tk);
+                pc_touch_buzz();
             } else if (th == HIT_KEY) {
                 int i;
                 for (i = 0; i < hud.key_n; i++) {
@@ -1045,7 +1335,7 @@ void pc_touch_apply(unsigned short* buttons, signed char* stick_x, signed char* 
     if (!down) {
         if (s_drag_active) {
             float ddx = s_last_x - s_drag_ox, ddy = s_last_y - s_drag_oy;
-            if (!s_drag_moved || (SDL_GetTicks() - s_drag_t0 < 250 && hypotf(ddx, ddy) < 22.0f)) {
+            if (!tap_handled && (!s_drag_moved || (SDL_GetTicks() - s_drag_t0 < 250 && hypotf(ddx, ddy) < 22.0f))) {
                 if (can_steer()) begin_move(s_down_x, s_down_y, 1);
                 else on_picture_release(s_down_x, s_down_y);
             }
@@ -1054,7 +1344,10 @@ void pc_touch_apply(unsigned short* buttons, signed char* stick_x, signed char* 
         }
         if (!tap_handled && s_pointer_was && hypotf(s_last_x - s_down_x, s_last_y - s_down_y) < 36.0f) {
             if (s_down_hit == HIT_PICTURE && !can_steer()) on_picture_release(s_down_x, s_down_y);
-            else if (s_down_hit == HIT_NUB) {
+            else if (s_down_hit == HIT_SUB_TAB) {
+                handle_sub_tab_tap(key);
+                pc_touch_buzz();
+            } else if (s_down_hit == HIT_NUB) {
                 g_pc_settings.touch_stick = !g_pc_settings.touch_stick;
                 pc_settings_save();
                 pc_touch_buzz();
@@ -1083,7 +1376,19 @@ void pc_touch_apply(unsigned short* buttons, signed char* stick_x, signed char* 
             }
             if (which >= 0) type_char(now.kc[which]);
         }
-        if (s_pointer_was && s_hud == HUD_MENU) {
+        if (s_pointer_was && submenu_open()) {
+            float dx = s_last_x - s_down_x, dy = s_last_y - s_down_y;
+            float dist = hypotf(dx, dy);
+            if (dist > 45.0f) {
+                if (fabsf(dx) > fabsf(dy)) {
+                    s_swipe = (dx > 0.0f) ? 1 : -1;
+                } else {
+                    s_swipe = (dy < 0.0f) ? 2 : -2;
+                }
+                pc_touch_buzz();
+                pc_diag_milestone("submenu swipe");
+            }
+        } else if (s_pointer_was && s_hud == HUD_MENU) {
             float dx = s_last_x - s_down_x, dy = s_last_y - s_down_y;
             if (fabsf(dy) > 56.0f && fabsf(dy) > fabsf(dx)) {
                 s_swipe = (dy < 0.0f) ? 70 : -70;
@@ -1104,7 +1409,7 @@ void pc_touch_apply(unsigned short* buttons, signed char* stick_x, signed char* 
         if (rising) {
             s_down_x = x; s_down_y = y; s_down_hit = hit;
             s_tap_logged = 0;
-            if (hit == HIT_PICTURE && (can_steer() || submenu_open())) {
+            if (hit == HIT_PICTURE && can_steer()) {
                 s_drag_active = 1;
                 s_drag_ox = x; s_drag_oy = y;
                 s_drag_cx = x; s_drag_cy = y;
@@ -1114,11 +1419,15 @@ void pc_touch_apply(unsigned short* buttons, signed char* stick_x, signed char* 
                 s_have_target = 0;
                 s_drag_active = 0;
             }
+            if (hit == HIT_SUB_TAB) {
+                handle_sub_tab_tap(key);
+                pc_touch_buzz();
+            }
             if (hit == HIT_BAG) *buttons |= PAD_BUTTON_Y;
             if (hit == HIT_MAP) *buttons |= PAD_BUTTON_X;
             if (hit == HIT_ACTION || hit == HIT_CONTEXT) *buttons |= PAD_BUTTON_A;
             if ((hit == HIT_BACK || hit == HIT_CLOSE) && !g_pc_paused) *buttons |= PAD_BUTTON_B;
-        } else if (s_down_hit == HIT_PICTURE && (can_steer() || submenu_open()) && s_drag_active) {
+        } else if (s_down_hit == HIT_PICTURE && can_steer() && s_drag_active) {
             float dx = x - s_drag_ox;
             float dy = y - s_drag_oy;
             float dist = hypotf(dx, dy);
@@ -1161,8 +1470,12 @@ void pc_touch_apply(unsigned short* buttons, signed char* stick_x, signed char* 
         s_pointer_was = 1;
     }
     latch_consume(buttons);
-    if (s_swipe != 0 && stick_y != NULL && *stick_y == 0) {
-        *stick_y = (signed char)s_swipe;
+    if (s_swipe != 0) {
+        if (s_swipe == 1 && stick_x != NULL && *stick_x == 0) *stick_x = 90;
+        else if (s_swipe == -1 && stick_x != NULL && *stick_x == 0) *stick_x = -90;
+        else if (s_swipe == 2 && stick_y != NULL && *stick_y == 0) *stick_y = 90;
+        else if (s_swipe == -2 && stick_y != NULL && *stick_y == 0) *stick_y = -90;
+        else if (s_swipe > 10 && stick_y != NULL && *stick_y == 0) *stick_y = (signed char)s_swipe;
         s_swipe = 0;
     }
     if (s_have_target && stick_x && stick_y && *stick_x == 0 && *stick_y == 0)
@@ -1325,7 +1638,7 @@ static void info_line(char* buf, size_t n) {
         for (i = 0; i < mPr_POCKETS_SLOT_COUNT && i < 15; i++) {
             if (priv->inventory.pockets[i] != EMPTY_NO) filled++;
         }
-        snprintf(buf, n, "%02d:%02d  %u  pocket %d", tm.tm_hour, tm.tm_min, priv->inventory.wallet, filled);
+        snprintf(buf, n, "%02d:%02d  %u  pocket %d", tm.tm_hour, tm.tm_min, (unsigned int)priv->inventory.wallet, filled);
     } else {
         snprintf(buf, n, "%02d:%02d  solo", tm.tm_hour, tm.tm_min);
     }
@@ -1444,10 +1757,39 @@ void pc_touch_present(void) {
         if (word != NULL) draw_word(word, h.ctx_x, h.ctx_y - h.ctx_r - 16.0f, h.ctx_r * 0.16f);
     }
     if (h.choice_n > 0) {
-        static const char* words[6] = { "One", "Two", "Three", "Four", "Five", "Six" };
+        mChoice_c* c = mChoice_Get_base_window_p();
         for (i = 0; i < h.choice_n; i++) {
+            char txt[16];
+            txt[0] = 0;
+            if (c != NULL && i < c->data.choice_num && c->data.string_lens[i] > 0) {
+                int len = c->data.string_lens[i];
+                int j, out = 0;
+                for (j = 0; j < len && out < 12; j++) {
+                    u8 ch = c->data.strings[i][j];
+                    if (ch >= 0x20 && ch <= 0x7E) txt[out++] = (char)ch;
+                }
+                txt[out] = 0;
+            }
+            if (txt[0] == 0) {
+                static const char* words[6] = { "One", "Two", "Three", "Four", "Five", "Six" };
+                snprintf(txt, sizeof(txt), "%s", words[i]);
+            }
             button(h.choice_x, h.choice_y[i], h.choice_r, 0.98f, 0.96f, 0.90f);
-            draw_word(words[i], h.choice_x, h.choice_y[i], h.choice_r * 0.14f);
+            draw_word(txt, h.choice_x, h.choice_y[i], h.choice_r * 0.14f);
+        }
+    }
+    if (h.show_sub_tabs) {
+        static const char* labels[4] = { "Items", "Letters", "Fish", "Bugs" };
+        static const float tab_colors[4][3] = {
+            { 0.95f, 0.92f, 0.82f },
+            { 0.96f, 0.82f, 0.78f },
+            { 0.80f, 0.88f, 0.98f },
+            { 0.82f, 0.94f, 0.84f }
+        };
+        for (i = 0; i < h.sub_tab_n; i++) {
+            button(h.sub_tab_x[i], h.sub_tab_y[i], h.sub_tab_r,
+                   tab_colors[i][0], tab_colors[i][1], tab_colors[i][2]);
+            draw_word(labels[i], h.sub_tab_x[i], h.sub_tab_y[i], h.sub_tab_r * 0.14f);
         }
     }
     if (!g_pc_settings.touch_virtual_pad && g_pc_layout_portrait && h.choice_n == 0) {
