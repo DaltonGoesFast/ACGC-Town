@@ -37,7 +37,7 @@ extern void initView(View* view, GRAPH* graph) {
   }
 
 #ifdef PC_ENHANCEMENTS
-  view->far = 3000.0f;
+  view->far = 4000.0f;
 #else
   view->far = 1600.0f;
 #endif

@@ -32,8 +32,13 @@ extern "C" {
 #define FONT_SIZE 1792
 #define SHADOW_SIZE 512
 #define LIGHT_SIZE 256
+#ifdef TARGET_PC
+#define NEW0_SIZE 2048
+#define NEW1_SIZE 1024
+#else
 #define NEW0_SIZE 512
 #define NEW1_SIZE 256
+#endif
 
 typedef struct dynamic_s {
     u16 start_magic;

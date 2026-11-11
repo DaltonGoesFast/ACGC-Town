@@ -8,7 +8,11 @@
 extern "C" {
 #endif
 
+#ifdef PC_ENHANCEMENTS
+#define aFD_BLOCK_DRAW_NUM 70 /* Full 7x10 acre grid for widescreen/portrait Vert+ */
+#else
 #define aFD_BLOCK_DRAW_NUM 9
+#endif
 
 typedef struct field_draw_s FIELD_DRAW_ACTOR;
 

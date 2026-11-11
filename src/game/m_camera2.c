@@ -226,7 +226,7 @@ static void Camera2_SetView(GAME_PLAY* play) {
             /* On PC/Android when expanding FOV (Vert+ in portrait or Hor+ in widescreen),
              * the upper frustum reaches significantly further than 4:3. Expand outdoor far plane
              * to avoid clipping distant terrain and trees. */
-            camera->perspective.far = 3000.0f;
+            camera->perspective.far = 4000.0f;
 #else
             camera->perspective.far = 1600.0f;
 #endif

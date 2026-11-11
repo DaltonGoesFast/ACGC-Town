@@ -224,6 +224,51 @@ static void aFD_PrepareFieldDraw(ACTOR* actorx, GAME* game) {
     mFI_Wpos2BlockNum(&bx, &bz, player->actor_class.world.position);
     aFD_SetActorPosition(actorx, play);
 
+#ifdef PC_ENHANCEMENTS
+    int max_x = mFI_GetBlockXMax();
+    int max_z = mFI_GetBlockZMax();
+    int count = 0;
+
+    if (max_x > 1 || max_z > 1) {
+        int z, x;
+        /* Draw from south (max_z - 1) to north (0) to preserve front-to-back early-Z order */
+        for (z = max_z - 1; z >= 0 && count < aFD_BLOCK_DRAW_NUM; z--) {
+            for (x = 0; x < max_x && count < aFD_BLOCK_DRAW_NUM; x++) {
+                block->bx = x;
+                block->bz = z;
+                if (mFI_BlockCheck(x, z)) {
+                    mFI_BkNum2WposXZ(&block->wpos.x, &block->wpos.z, x, z);
+                    block->wpos.y = mFI_BkNum2BaseHeight(x, z);
+                    block->exist = TRUE;
+                } else {
+                    block->exist = FALSE;
+                }
+                block++;
+                count++;
+            }
+        }
+    } else {
+        /* Single indoor room */
+        block->bx = 0;
+        block->bz = 0;
+        if (mFI_BlockCheck(0, 0)) {
+            mFI_BkNum2WposXZ(&block->wpos.x, &block->wpos.z, 0, 0);
+            block->wpos.y = mFI_BkNum2BaseHeight(0, 0);
+            block->exist = TRUE;
+        } else {
+            block->exist = FALSE;
+        }
+        block++;
+        count++;
+    }
+
+    for (; count < aFD_BLOCK_DRAW_NUM; count++) {
+        block->bx = 0;
+        block->bz = 0;
+        block->exist = FALSE;
+        block++;
+    }
+#else
     for (i = 0; i < aFD_BLOCK_DRAW_NUM; i++) {
         block->bx = bx + draw_block_offset_table[i].offset_x;
         block->bz = bz + draw_block_offset_table[i].offset_z;
@@ -232,6 +277,7 @@ static void aFD_PrepareFieldDraw(ACTOR* actorx, GAME* game) {
         block->exist = TRUE;
         block++;
     }
+#endif
 
     aFD_MakeMarinScrollInfo(actorx, game);
 }

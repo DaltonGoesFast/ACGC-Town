@@ -338,6 +338,9 @@ extern int Actor_draw_actor_no_culling_check2(ACTOR* actor, xyz_t* camera_pos, f
     pc_cull_get_edges(&x_edge, &y_edge);
     f32 dist_scale = (y_edge > x_edge) ? y_edge : x_edge;
     f32 max_dist = (actor->cull_distance * dist_scale) + actor->cull_radius;
+    if (actor->cull_distance >= 400.0f && max_dist < 4000.0f) {
+        max_dist = 4000.0f;
+    }
 #else
     f32 x_edge = 1.0f;
     f32 y_edge = 1.0f;

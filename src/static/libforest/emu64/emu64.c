@@ -5274,7 +5274,7 @@ void emu64::dl_G_CULLDL() {
 
             if (oz > 0.0f) {
                 vtx->flag |= G_CULL_Z_LESSTHAN;
-            } else if (oz < -2.5f) {
+            } else if (oz < -4.0f) {
                 vtx->flag |= G_CULL_Z_GREATERTHAN;
             }
         }
