@@ -418,12 +418,14 @@ static void hud_build(Hud* h) {
         h->sub_tab_id[2] = 2; /* Fish */
         h->sub_tab_id[3] = 3; /* Bugs */
         if (g_pc_layout_portrait) {
+            int bx, by, bw, bh;
+            pc_layout_box(2, &bx, &by, &bw, &bh);
+            float tab_y = (float)(by + bh) + 42.0f;
+            if (tab_y > h->ay - rad * 1.25f) tab_y = h->ay - rad * 1.25f;
+            h->sub_tab_r = rad * 0.78f;
+            if (h->sub_tab_r > 42.0f) h->sub_tab_r = 42.0f;
+            if (h->sub_tab_r < 24.0f) h->sub_tab_r = 24.0f;
             float band_w = W - il - ir;
-            float tab_y = (float)(g_pc_content_y + g_pc_content_h) + 78.0f;
-            if (tab_y > h->ay - rad * 1.35f) tab_y = h->ay - rad * 1.35f;
-            h->sub_tab_r = rad * 0.70f;
-            if (h->sub_tab_r > 38.0f) h->sub_tab_r = 38.0f;
-            if (h->sub_tab_r < 22.0f) h->sub_tab_r = 22.0f;
             for (int i = 0; i < 4; i++) {
                 h->sub_tab_x[i] = il + band_w * (0.16f + 0.226f * (float)i);
                 h->sub_tab_y[i] = tab_y;
@@ -870,7 +872,7 @@ static void on_submenu_tap(float x, float y) {
     Submenu_Overlay_c* ovl;
     mTG_Ovl_c* tag_ovl;
     mTG_tag_c* tag;
-    float cw, ch_43, cx, cy_43, center_x, center_y, gx, gy;
+    float cw, ch_43, center_x, center_y, gx, gy;
     int hand_empty;
 
     if (play == NULL) return;
@@ -884,18 +886,14 @@ static void on_submenu_tap(float x, float y) {
     }
     tag = &tag_ovl->tags[tag_ovl->sel_tag_idx];
 
-    cw = (float)g_pc_content_w;
-    if (g_pc_layout_portrait) {
-        ch_43 = cw * 3.0f / 4.0f;
-        cx = (float)g_pc_content_x;
-        cy_43 = (float)g_pc_content_y + ((float)g_pc_content_h - ch_43) * 0.5f;
-    } else {
-        ch_43 = (float)g_pc_content_h;
-        cx = (float)g_pc_content_x;
-        cy_43 = (float)g_pc_content_y;
+    {
+        int bx, by, bw, bh;
+        pc_layout_box(2, &bx, &by, &bw, &bh);
+        cw = (float)bw;
+        ch_43 = (float)bh;
+        center_x = (float)bx + cw * 0.5f;
+        center_y = (float)by + ch_43 * 0.5f;
     }
-    center_x = cx + cw * 0.5f;
-    center_y = cy_43 + ch_43 * 0.5f;
 
     /* Convert touch point to GameCube 2D tag coordinate space:
      * X in [-160, 160], Y in [-120, 120] (GameCube Y is up) */
@@ -1543,7 +1541,11 @@ static float s_fade = 1.0f;
 
 static void disc(float cx, float cy, float rad, float r, float g, float b, float a) {
     float W = (float)g_pc_window_w, H = (float)g_pc_window_h;
-    a *= s_fade;
+    if (submenu_open() && a >= 0.8f) {
+        if (a < 0.92f) a = 0.92f;
+    } else {
+        a *= s_fade;
+    }
     float x0 = (cx - rad) / W * 2.0f - 1.0f;
     float x1 = (cx + rad) / W * 2.0f - 1.0f;
     float y0 = 1.0f - (cy + rad) / H * 2.0f;

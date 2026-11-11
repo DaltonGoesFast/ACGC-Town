@@ -509,6 +509,20 @@ void pc_layout_box(int stretch, int* x, int* y, int* w, int* h) {
         aw = W - il - ir;
         ah = H - it - ib;
         aspect = 4.0f / 3.0f;
+        if (g_pc_layout_portrait) {
+            /* Portrait menu UI: scale up so the menu palette fills the phone's width (1.355x),
+             * placing it comfortably in the thumb reach zone */
+            float scale = 1.355f;
+            cw = (int)((float)aw * scale);
+            ch = (int)((float)cw / aspect);
+            if (cw < 2) cw = 2;
+            if (ch < 2) ch = 2;
+            *w = cw;
+            *h = ch;
+            *x = il + (aw - cw) / 2;
+            *y = it + (int)((float)(ah - ch) * 0.50f);
+            return;
+        }
         if ((float)aw / (float)ah > aspect) {
             ch = ah;
             cw = (int)((float)ch * aspect);

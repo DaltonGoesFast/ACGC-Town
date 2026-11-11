@@ -1475,19 +1475,29 @@ void GXSetScissor(u32 left, u32 top, u32 wd, u32 ht) {
     gl_y = PC_GC_HEIGHT - (int)top - (int)ht;
 #endif
 
+    int sx = gl_x, sy = gl_y, sw = gl_w, sh = gl_h;
+    if (sx < 0) { sw += sx; sx = 0; }
+    if (sy < 0) { sh += sy; sy = 0; }
+    if (sw < 0) sw = 0;
+    if (sh < 0) sh = 0;
+    if (sx + sw > g_pc_window_w) sw = g_pc_window_w - sx;
+    if (sy + sh > g_pc_window_h) sh = g_pc_window_h - sy;
+    if (sw < 0) sw = 0;
+    if (sh < 0) sh = 0;
+
     /* Cache validity implies GL_SCISSOR_TEST is enabled */
-    if (s_gl_scissor.valid && gl_x == s_gl_scissor.x && gl_y == s_gl_scissor.y &&
-        gl_w == s_gl_scissor.w && gl_h == s_gl_scissor.h)
+    if (s_gl_scissor.valid && sx == s_gl_scissor.x && sy == s_gl_scissor.y &&
+        sw == s_gl_scissor.w && sh == s_gl_scissor.h)
         return;
 
     pc_gx_draw_pending(); /* glScissor is not dirty-tracked */
     glEnable(GL_SCISSOR_TEST);
-    glScissor(gl_x, gl_y, gl_w, gl_h);
+    glScissor(sx, sy, sw, sh);
     s_gl_scissor.valid = 1;
-    s_gl_scissor.x = gl_x;
-    s_gl_scissor.y = gl_y;
-    s_gl_scissor.w = gl_w;
-    s_gl_scissor.h = gl_h;
+    s_gl_scissor.x = sx;
+    s_gl_scissor.y = sy;
+    s_gl_scissor.w = sw;
+    s_gl_scissor.h = sh;
 }
 
 void GXSetScissorBoxOffset(s32 x, s32 y) { (void)x; (void)y; }
