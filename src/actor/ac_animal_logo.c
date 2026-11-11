@@ -27,6 +27,8 @@
 #include "pc_play_online_menu.h"
 #include "pc_menu_util.h"
 #include "pc_pause_menu.h" /* pc_version_corner_draw: the version in the title screen's bottom-right corner */
+#include "pc_touch.h"
+#include "pc_save_wire.h"
 #include "main.h"
 #include <stdio.h>
 #include <string.h>
@@ -353,7 +355,8 @@ enum {
   aAL_PC_ITEM_OPTIONS = 1,
   aAL_PC_ITEM_QUIT = 2,
   aAL_PC_ITEM_GUEST = 3,
-  aAL_PC_ITEM_ONLINE = 4 /* M4: "Play Online" (only when no network role is active) */
+  aAL_PC_ITEM_ONLINE = 4, /* M4: "Play Online" (only when no network role is active) */
+  aAL_PC_ITEM_OFFLINE = 5 /* local town in save/offline, no network */
 };
 
 /* Fills `items` (max 5) in display order: Start [, Join as Guest (client) | Play Online (no role)], Options, Quit. Returns the count. */
@@ -369,6 +372,7 @@ static int aAL_pc_menu_build(int items[5]) {
   if (pc_guest_title_item_visible()) {
     items[n++] = aAL_PC_ITEM_GUEST;
   } else if (pc_play_online_menu_available()) {
+    items[n++] = aAL_PC_ITEM_OFFLINE;
     items[n++] = aAL_PC_ITEM_ONLINE;
   }
   items[n++] = aAL_PC_ITEM_OPTIONS;
@@ -503,6 +507,19 @@ static void aAL_pc_game_start_wait(ANIMAL_LOGO_ACTOR* actor, GAME* game) {
     }
   }
 
+  /* A tap on a row selects it and confirms it. Done after the stick nudge so the tap wins. */
+  {
+    float tap_y = 0.0f;
+    if (pc_touch_take_title_tap(&tap_y)) {
+      int i = (int)((tap_y - 135.0f) / 18.0f);
+      int n = aAL_pc_menu_count();
+      if (i >= 0 && i < n) {
+        actor->pc_menu_sel = i;
+        on_btn = (u16)(on_btn | BUTTON_A);
+      }
+    }
+  }
+
   /* Select */
   if (on_btn & (BUTTON_A | BUTTON_START)) {
     switch (aAL_pc_menu_item(actor->pc_menu_sel)) {
@@ -527,6 +544,15 @@ static void aAL_pc_game_start_wait(ANIMAL_LOGO_ACTOR* actor, GAME* game) {
         break;
       case aAL_PC_ITEM_ONLINE: /* Play Online: server -> character selection, then an in-process connect (no relaunch: pc_main.c pc_main_play_online_poll) */
         pc_play_online_menu_enter();
+        actor->pc_cursor_cooldown = 10.0f;
+        break;
+      case aAL_PC_ITEM_OFFLINE: /* Local town. Same fade as Start Game, after the save dir is save/offline. */
+        if (pc_offline_solo_begin() &&
+            mLd_CheckStartFlag() == TRUE &&
+            aAL_wipe_end_check(game) == TRUE &&
+            mTD_tdemo_button_ok_check()) {
+          aAL_setupAction(actor, game, aAL_ACTION_FADE_OUT_START);
+        }
         actor->pc_cursor_cooldown = 10.0f;
         break;
       case aAL_PC_ITEM_OPTIONS: /* Options */
@@ -928,6 +954,8 @@ static void aAL_pc_menu_draw(ANIMAL_LOGO_ACTOR* actor, GAME* game) {
 
       if (item == aAL_PC_ITEM_ONLINE) {
         label = "Play Online";
+      } else if (item == aAL_PC_ITEM_OFFLINE) {
+        label = "Play Offline";
       } else if (item == aAL_PC_ITEM_GUEST) {
         extern const char* pc_guest_title_label(void); /* pc_m_card.c: "Join as Guest (NAME)" */
         label = pc_guest_title_label();

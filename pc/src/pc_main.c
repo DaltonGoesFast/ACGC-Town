@@ -21,6 +21,8 @@ static int s_boot_test = 0;
 #include "pc_keybindings.h"
 #include "pc_assets.h"
 #include "pc_crash.h"
+#include "pc_touch.h"
+#include "pc_save_wire.h"
 #include "pc_disc.h"
 #include "pc_typing.h"
 #include "pc_chat.h" /* chat (worker CH): the chat line owns the keyboard while it is open */
@@ -419,6 +421,7 @@ void pc_platform_init(void) {
 extern void PADCleanup(void);
 
 void pc_platform_shutdown(void) {
+    pc_hb_shutdown();
     pc_audio_shutdown();
     pc_audio_mq_shutdown();
     PADCleanup();
@@ -436,15 +439,103 @@ void pc_platform_shutdown(void) {
     SDL_Quit();
 }
 
+int g_pc_content_x = 0, g_pc_content_y = 0, g_pc_content_w = PC_SCREEN_WIDTH, g_pc_content_h = PC_SCREEN_HEIGHT;
+int g_pc_layout_portrait = 0;
+
+static void pc_layout_insets(int* l, int* t, int* r, int* b) {
+    FILE* f = fopen("safe_insets.txt", "r");
+    *l = *t = *r = *b = 0;
+    if (f == NULL) return;
+    if (fscanf(f, "%d %d %d %d", l, t, r, b) != 4) *l = *t = *r = *b = 0;
+    fclose(f);
+    if (*l < 0) *l = 0;
+    if (*t < 0) *t = 0;
+    if (*r < 0) *r = 0;
+    if (*b < 0) *b = 0;
+}
+
+void pc_layout_refresh(void) {
+    int W = g_pc_window_w, H = g_pc_window_h;
+    int il, it, ir, ib, aw, ah, cw, ch, cx, cy;
+    float aspect = 4.0f / 3.0f;
+    if (W < 2 || H < 2) return;
+    pc_layout_insets(&il, &it, &ir, &ib);
+    if (il + ir > W / 2) { il = 0; ir = 0; }
+    if (it + ib > H / 2) { it = 0; ib = 0; }
+    aw = W - il - ir;
+    ah = H - it - ib;
+    /* Cover screen is a tall strip. The unfolded inner screen is near square, so the
+     * HUD floats on the edges instead of claiming a band under the picture. */
+    g_pc_layout_portrait = (H > (W * 5) / 4);
+    if ((float)aw / (float)ah > aspect) {
+        ch = ah;
+        cw = (int)((float)ch * aspect);
+    } else {
+        cw = aw;
+        ch = (int)((float)cw / aspect);
+    }
+    if (cw < 2) cw = 2;
+    if (ch < 2) ch = 2;
+    cx = il + (aw - cw) / 2;
+    if (g_pc_layout_portrait) cy = it;
+    else cy = it + (ah - ch) / 2;
+    if (cx < 0) cx = 0;
+    if (cy < 0) cy = 0;
+    g_pc_content_x = cx;
+    g_pc_content_y = cy;
+    g_pc_content_w = cw;
+    g_pc_content_h = ch;
+    pc_hb_note_view(cx, cy, cw, ch);
+}
+
+void pc_layout_box(int stretch, int* x, int* y, int* w, int* h) {
+    int W, H, il, it, ir, ib, aw, ah, cw, ch;
+    float aspect;
+    if (g_pc_content_w < 2 || g_pc_content_h < 2) pc_layout_refresh();
+    if (stretch != 1) {
+        *x = g_pc_content_x;
+        *y = g_pc_content_y;
+        *w = g_pc_content_w;
+        *h = g_pc_content_h;
+        return;
+    }
+    /* Widescreen hack: 16:9 letterbox, still not stretched to the window. */
+    W = g_pc_window_w;
+    H = g_pc_window_h;
+    pc_layout_insets(&il, &it, &ir, &ib);
+    if (il + ir > W / 2) { il = 0; ir = 0; }
+    if (it + ib > H / 2) { it = 0; ib = 0; }
+    aw = W - il - ir;
+    ah = H - it - ib;
+    aspect = 16.0f / 9.0f;
+    if ((float)aw / (float)ah > aspect) {
+        ch = ah;
+        cw = (int)((float)ch * aspect);
+    } else {
+        cw = aw;
+        ch = (int)((float)cw / aspect);
+    }
+    if (cw < 2) cw = 2;
+    if (ch < 2) ch = 2;
+    *w = cw;
+    *h = ch;
+    *x = il + (aw - cw) / 2;
+    *y = g_pc_layout_portrait ? it : it + (ah - ch) / 2;
+    if (*x < 0) *x = 0;
+    if (*y < 0) *y = 0;
+}
+
 void pc_platform_update_window_size(void) {
     if (g_pc_window == NULL) {
         if (g_pc_window_w <= 0) g_pc_window_w = PC_SCREEN_WIDTH;
         if (g_pc_window_h <= 0) g_pc_window_h = PC_SCREEN_HEIGHT;
+        pc_layout_refresh();
         return;
     }
     SDL_GL_GetDrawableSize(g_pc_window, &g_pc_window_w, &g_pc_window_h);
     if (g_pc_window_w <= 0) g_pc_window_w = PC_SCREEN_WIDTH;
     if (g_pc_window_h <= 0) g_pc_window_h = PC_SCREEN_HEIGHT;
+    pc_layout_refresh();
 }
 
 #ifdef PC_NET_TEST_HOOKS
@@ -527,11 +618,20 @@ static void pc_test_frame_dump(void) {
 
 void pc_platform_swap_buffers(void) {
     static int s_first_frame = 0;
+    static int s_draw_w = -1;
+    static int s_draw_h = -1;
     if (!s_first_frame) {
         s_first_frame = 1;
         pc_diag_milestone("first frame");
     }
+    pc_platform_update_window_size();
+    if (g_pc_window_w != s_draw_w || g_pc_window_h != s_draw_h) {
+        s_draw_w = g_pc_window_w;
+        s_draw_h = g_pc_window_h;
+        pc_hb_note_gx(g_pc_window_w, g_pc_window_h);
+    }
     pc_gx_draw_pending();
+    pc_touch_present();
 #ifdef PC_NET_TEST_HOOKS
     pc_test_frame_dump();
 #endif
@@ -643,6 +743,7 @@ static void pc_client_log_tick(void) {
 
 int pc_platform_poll_events(void) {
     SDL_Event event;
+    static Uint32 s_back_down = 0;
 
     pc_client_log_tick();
     pc_typing_update();
@@ -653,9 +754,14 @@ int pc_platform_poll_events(void) {
                 g_pc_running = 0;
                 return 0;
             case SDL_APP_WILLENTERBACKGROUND:
-                /* Keep the GL context. Android may drop the surface; we rebind it on resume instead of creating a new one. */
+                /* Keep the GL context. Android may drop the surface; we rebind it on resume instead of creating a new one.
+                 * SDL_HINT_ANDROID_BLOCK_ON_PAUSE waits inside SDL until the surface is back, which is the multi-second
+                 * idle gap when the activity pauses (a redundant orientation request used to cause that). */
+                pc_diag_milestone("app background");
+                pc_save_flush_background();
                 break;
             case SDL_APP_DIDENTERFOREGROUND:
+                pc_diag_milestone("app foreground");
                 if (g_pc_window != NULL && g_pc_gl_context != NULL) {
                     SDL_GL_MakeCurrent(g_pc_window, g_pc_gl_context);
                 }
@@ -686,12 +792,14 @@ int pc_platform_poll_events(void) {
                     break;
                 }
                 /* (F3 is intentionally unbound: its old 10x speed toggle was removed.) */
-                if ((event.key.keysym.sym == SDLK_ESCAPE || event.key.keysym.sym == SDLK_AC_BACK) && !event.key.repeat) {
-                    if (g_pc_paused) {
-                        pc_pause_menu_handle_event(&event);
-                    } else {
-                        pc_pause_menu_toggle(); /* Android back opens the same menu as Esc */
-                    }
+                /* Android back is B. A long press opens pause. Esc still toggles pause immediately. */
+                if (event.key.keysym.sym == SDLK_AC_BACK && !event.key.repeat) {
+                    s_back_down = SDL_GetTicks();
+                    break;
+                }
+                if (event.key.keysym.sym == SDLK_ESCAPE && !event.key.repeat) {
+                    if (g_pc_paused) pc_pause_menu_handle_event(&event);
+                    else pc_pause_menu_toggle();
                     break;
                 }
                 if (g_pc_paused) {
@@ -700,10 +808,37 @@ int pc_platform_poll_events(void) {
                 }
                 pc_typing_handle_event(&event);
                 break;
+            case SDL_KEYUP:
+                if (event.key.keysym.sym == SDLK_AC_BACK) {
+                    Uint32 held = SDL_GetTicks() - s_back_down;
+                    if (held >= 500u) {
+                        pc_pause_menu_toggle();
+                    } else if (g_pc_paused) {
+                        SDL_Event fake;
+                        memset(&fake, 0, sizeof(fake));
+                        fake.type = SDL_KEYDOWN;
+                        fake.key.keysym.sym = SDLK_ESCAPE;
+                        pc_pause_menu_handle_event(&fake);
+                    } else {
+                        pc_touch_pulse_b();
+                    }
+                    break;
+                }
+                break;
             case SDL_MOUSEBUTTONDOWN:
-                if (pc_settings_menu_capture_active()) {
+            case SDL_FINGERDOWN:
+            case SDL_FINGERUP:
+            case SDL_FINGERMOTION:
+                pc_touch_note_event(&event);
+                if (event.type == SDL_MOUSEBUTTONDOWN && pc_settings_menu_capture_active()) {
                     pc_settings_menu_handle_capture_event(&event);
                 }
+                break;
+            case SDL_CONTROLLERDEVICEADDED:
+                pc_pad_device_added((int)event.cdevice.which);
+                break;
+            case SDL_CONTROLLERDEVICEREMOVED:
+                pc_pad_device_removed((int)event.cdevice.which);
                 break;
             case SDL_CONTROLLERBUTTONDOWN:
                 if (pc_play_online_menu_text_active()) {
@@ -1384,6 +1519,9 @@ static char s_po_character[48]; /* backing store of g_pc_character_spec for the 
 
 int pc_main_play_online_request(const char* host, int port, int kind, const char* name) {
     char tmp[320];
+    if (pc_offline_solo_active()) {
+        return 0;
+    }
     if (s_po.state != PO_IDLE || host == NULL || strlen(host) >= sizeof(s_po.host)) {
         return 0;
     }
@@ -1485,7 +1623,12 @@ static int pc_po_prepare_legacy_guest(char* err, size_t errcap) {
 
 /* Steps 2..8. 1 = committed (the fade to the title was requested), 0 = rolled back (err holds the menu message). */
 static int pc_po_connect(char* err, size_t errcap) {
-    PCConnectSession* ss = pc_session();
+    PCConnectSession* ss;
+    if (pc_offline_solo_active()) {
+        if (err != NULL && errcap > 0) snprintf(err, errcap, "Play Offline does not connect.");
+        return 0;
+    }
+    ss = pc_session();
     PCConnectSession ss_snap = *ss;
     char host_snap[sizeof(g_pc_net_host_ip)];
     char gspec_snap[sizeof(g_pc_guest_spec)];
@@ -1692,6 +1835,10 @@ int pc_play_online_title_hold(void) {
 
 void pc_main_play_online_poll(void) {
     char err[300];
+    if (pc_offline_solo_active()) {
+        s_po.state = PO_IDLE;
+        return;
+    }
     if (s_po.state == PO_IDLE) {
         return;
     }
@@ -2969,9 +3116,16 @@ int main(int argc, char* argv[]) {
 #ifdef __ANDROID__
     if (s_boot_test) {
         extern int boot_main(int argc, const char** argv);
+        extern void ac_entry(void);
+        extern void pc_install_stub_font(void);
         int rc;
+        pc_install_stub_font();
+        pc_disc_init();
+        pc_diag_milestone(pc_disc_is_open() ? "boot test: disc open" : "boot test: disc closed");
+        ac_entry();
         pc_diag_milestone("boot test: boot_main");
         rc = boot_main(argc, (const char**)argv);
+        pc_hb_shutdown();
         pc_diag_milestone("boot test: boot_main returned");
         if (pc_lowaddr_game_violation_count() != 0) {
             pc_diag_fail_box("ACGC Town", "A game pointer is still above 4 GB. See the lowaddr AUDIT log.");

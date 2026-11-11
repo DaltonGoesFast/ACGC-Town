@@ -34,6 +34,7 @@
 #include "m_map_ovl.h"
 #include "pc_bswap.h"
 #include "pc_crash.h"
+#include "sys_matrix.h"
 #ifdef __ANDROID__
 #include <unistd.h>
 #endif
@@ -809,11 +810,15 @@ int main(int argc, const char** argv) {
   }
   OSReport("[PC] boot: entering HotStartEntry loop (entry=%08x)...\n", (u32)HotStartEntry);
 #ifdef __ANDROID__
-  /* The emulator plants this file to run boot without a disc. Stop before the
-   * game loop, which needs the real archive. */
+  /* The emulator plants this file to run boot without a full ROM. The archive
+   * and font paths have already run. Exercise the matrix stack, which the
+   * pause menu uses before any scene calls new_Matrix, then stop. */
   if (access("audio_init_test", F_OK) == 0) {
-    boot_stage("boot: test stop before game loop");
-    return 0;
+    Matrix_push();
+    Matrix_pull();
+    boot_stage("boot: matrix push ok");
+    pc_hb_boot_test_arm();
+    boot_stage("boot: running 30s past HotStartEntry");
   }
 #endif
 #endif

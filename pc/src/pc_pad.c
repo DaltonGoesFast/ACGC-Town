@@ -4,6 +4,7 @@
 #include "pc_keybindings.h"
 #include "pc_settings.h"
 #include "pc_host_observer.h"
+#include "pc_crash.h"
 #include <dolphin/pad.h>
 
 /* analog stick constants */
@@ -40,11 +41,38 @@ static u8 pad_trigger_value(PCPadCode code) {
     return SDL_GameControllerGetButton(g_controller, (SDL_GameControllerButton)code) ? 255 : 0;
 }
 
+static void pc_pad_log_open(void) {
+    char line[96];
+    if (g_controller == NULL) return;
+    snprintf(line, sizeof(line), "pad controller %s", SDL_GameControllerName(g_controller));
+    pc_diag_milestone(line);
+}
+
+void pc_pad_device_added(int which) {
+    if (g_controller != NULL) return;
+    if (!SDL_IsGameController(which)) return;
+    g_controller = SDL_GameControllerOpen(which);
+    pc_pad_log_open();
+}
+
+void pc_pad_device_removed(int which) {
+    SDL_Joystick* joy;
+    if (g_controller == NULL) return;
+    joy = SDL_GameControllerGetJoystick(g_controller);
+    if (joy != NULL && SDL_JoystickInstanceID(joy) == which) {
+        SDL_GameControllerClose(g_controller);
+        g_controller = NULL;
+        pc_diag_milestone("pad controller removed");
+    }
+}
+
 BOOL PADInit(void) {
+    SDL_GameControllerEventState(SDL_ENABLE);
     for (int i = 0; i < SDL_NumJoysticks(); i++) {
         if (SDL_IsGameController(i)) {
             g_controller = SDL_GameControllerOpen(i);
             if (g_controller) {
+                pc_pad_log_open();
                 break;
             }
         }
@@ -259,6 +287,11 @@ u32 PADRead(PADStatus* status) {
     status[0].substickY = cstickY;
     status[0].err = 0; /* PAD_ERR_NONE */
 
+    {
+        char hud_state[80];
+        pc_touch_hud_state(hud_state, sizeof(hud_state));
+        pc_hb_note_input(buttons, (int)stickX, (int)stickY, pc_touch_finger_count(), pc_touch_hud_mode(), hud_state);
+    }
     return PAD_CHAN0_BIT; /* Controller 1 connected */
 }
 

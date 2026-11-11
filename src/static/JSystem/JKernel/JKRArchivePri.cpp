@@ -71,7 +71,7 @@ JKRArchive::SDIDirEntry* JKRArchive::findDirectory(const char* path, u32 index) 
 }
 
 JKRArchive::SDIFileEntry* JKRArchive::findTypeResource(u32 type, const char* name) const {
-    if (type != 0) {
+    if (type != 0 && name != nullptr && mDirectories != nullptr && mFileEntries != nullptr) {
         CArcName arcName;
         arcName.store(name);
         SDIDirEntry* dirEntry = findResType(type);

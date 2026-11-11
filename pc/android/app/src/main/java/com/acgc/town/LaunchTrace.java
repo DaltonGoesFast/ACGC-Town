@@ -92,7 +92,12 @@ public final class LaunchTrace {
         }
         sb.append("\n\n--- native and previous files ---\n");
         appendExisting(sb, context);
-        File out = writeCrash(context, sb.toString());
+        /* The native handler already wrote acgc-crash.log with symbolized frames.
+         * Do not replace that file with this logcat paste. */
+        File nativeCrash = new File(logDir(context), CrashLog.FILE_NAME);
+        String name = nativeCrash.isFile() && nativeCrash.length() > 0
+                ? "acgc-interrupted.txt" : CrashLog.FILE_NAME;
+        File out = writeCrash(context, sb.toString(), name);
         clear(context);
         return out;
     }
@@ -106,12 +111,17 @@ public final class LaunchTrace {
         sb.append("launch-in-progress ").append(p.getBoolean(KEY_IN_PROGRESS, false));
         sb.append(" savedPid ").append(p.getInt(KEY_PID, -1)).append('\n');
         sb.append("logdir ").append(logDir(context).getAbsolutePath()).append("\n\n");
-        appendExisting(sb, context);
+        appendFile(sb, new File(logDir(context), "acgc-session.log"), true);
         sb.append("\n--- logcat (filtered) ---\n");
         sb.append(logcat(new String[] {"logcat", "-d", "-v", "threadtime"}, true));
         String text = sb.toString();
-        writeCrash(context, text, "acgc-debug.txt");
         if (text.length() > TAIL) text = text.substring(text.length() - TAIL);
+        /* Keep the crash log, from the start, so the symbolized frames are not cut off. */
+        StringBuilder crash = new StringBuilder();
+        appendFile(crash, new File(logDir(context), CrashLog.FILE_NAME), false);
+        appendFile(crash, new File(context.getFilesDir(), CrashLog.FILE_NAME), false);
+        text = text + "\n--- acgc-crash.log (symbolized) ---\n" + crash;
+        writeCrash(context, text, "acgc-debug.txt");
         return text;
     }
 
@@ -173,13 +183,14 @@ public final class LaunchTrace {
     }
 
     private static void appendExisting(StringBuilder sb, Context context) {
-        appendFile(sb, new File(logDir(context), "acgc-session.log"));
-        appendFile(sb, new File(logDir(context), CrashLog.FILE_NAME));
-        appendFile(sb, new File(context.getFilesDir(), "acgc-session.log"));
-        appendFile(sb, new File(context.getFilesDir(), CrashLog.FILE_NAME));
+        appendFile(sb, new File(logDir(context), "acgc-session.log"), true);
+        appendFile(sb, new File(logDir(context), CrashLog.FILE_NAME), false);
+        appendFile(sb, new File(context.getFilesDir(), "acgc-session.log"), true);
+        appendFile(sb, new File(context.getFilesDir(), CrashLog.FILE_NAME), false);
     }
 
-    private static void appendFile(StringBuilder sb, File file) {
+    /** fromEnd keeps the tail of a long session log. The crash log is kept from the start, where the backtrace is. */
+    private static void appendFile(StringBuilder sb, File file, boolean fromEnd) {
         sb.append("\nfile ").append(file.getAbsolutePath()).append('\n');
         if (!file.isFile()) {
             sb.append("(missing)\n");
@@ -187,9 +198,11 @@ public final class LaunchTrace {
         }
         try (FileInputStream in = new FileInputStream(file)) {
             long len = file.length();
-            long skip = len > TAIL ? len - TAIL : 0;
+            long skip = (fromEnd && len > TAIL) ? len - TAIL : 0;
+            long take = len - skip;
+            if (take > TAIL) take = TAIL;
             if (skip > 0) in.skip(skip);
-            byte[] buf = new byte[(int) (len - skip)];
+            byte[] buf = new byte[(int) take];
             int n = 0;
             while (n < buf.length) {
                 int r = in.read(buf, n, buf.length - n);

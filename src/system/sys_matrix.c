@@ -26,19 +26,33 @@ MtxF MtxF_clear = { {
 
 static MtxF* Matrix_stack = NULL;
 static MtxF* Matrix_now = NULL;
+/* second_game (and the pause menu) draw before any scene calls new_Matrix. */
+static MtxF s_matrix_idle[16];
+
+static void Matrix_ensure(void) {
+    if (Matrix_now != NULL) return;
+    Matrix_copy_MtxF(&s_matrix_idle[0], &MtxF_clear);
+    Matrix_stack = s_matrix_idle;
+    Matrix_now = s_matrix_idle;
+}
 
 void new_Matrix(GAME* game) {
-    Matrix_now = THA_alloc16(&game->tha, 0x500);
-    Matrix_stack = Matrix_now;
+    MtxF* m = (MtxF*)THA_alloc16(&game->tha, 0x500);
+    if (m == NULL) return;
+    Matrix_now = m;
+    Matrix_stack = m;
+    Matrix_copy_MtxF(m, &MtxF_clear);
 }
 
 void Matrix_push() {
+    Matrix_ensure();
+    if (Matrix_stack == s_matrix_idle && Matrix_now >= &s_matrix_idle[15]) return;
     Matrix_copy_MtxF(Matrix_now + 1, Matrix_now);
     Matrix_now++;
 }
 
 void Matrix_pull() {
-    Matrix_now--;
+    if (Matrix_now != NULL && Matrix_now > Matrix_stack) Matrix_now--;
 }
 
 void Matrix_get(MtxF* dest) {

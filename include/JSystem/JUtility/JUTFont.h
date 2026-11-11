@@ -2,6 +2,7 @@
 #define JUTFONT_H
 
 #include "types.h"
+#include <stddef.h>
 #include "string.h"
 #include "dolphin/gx.h"
 #include "dolphin/os.h"
@@ -225,6 +226,9 @@ struct ResFONT {
     u8 mPadding[0x10]; // _10
     u8 mData[];        // _20
 };
+static_assert(sizeof(BlockHeader) == 8, "font block header is 8 bytes on disc");
+static_assert(sizeof(ResFONT::InfoBlock) == 0x14, "INF1 is 0x14 bytes on disc");
+static_assert(offsetof(ResFONT, mData) == 0x20, "ResFONT blocks start at 0x20");
 
 /**
  * @size{0x70}

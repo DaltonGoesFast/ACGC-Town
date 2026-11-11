@@ -26,6 +26,12 @@
 #include "zurumode.h"
 #include "pc_save_bswap.h"
 #include "pc_save_wire.h"
+#include "pc_crash.h"
+#ifndef _WIN32
+#include <unistd.h>
+#else
+#include <io.h>
+#endif
 #include "pc_settings.h"
 #include "m_cockroach.h"
 #include "m_all_grow_ovl.h"
@@ -538,6 +544,11 @@ static int pc_save_write_gci_to(const char* gci_path, const char* tmp_path) {
     }
 
     fflush(fp);
+#ifndef _WIN32
+    fsync(fileno(fp));
+#else
+    _commit(_fileno(fp));
+#endif
     fclose(fp);
     free(file_data);
 
@@ -617,6 +628,14 @@ static int pc_save_write_gci_to(const char* gci_path, const char* tmp_path) {
 static int s_pc_save_authoritative_client_reject_count = 0;
 
 static int pc_save_write_authoritative_impl(void);
+
+int pc_save_write_authoritative(void);
+
+int pc_save_flush_background(void) {
+    int ok = pc_save_write_authoritative();
+    pc_diag_milestone(ok ? "save flush background ok" : "save flush background skipped");
+    return ok;
+}
 
 int pc_save_write_authoritative(void) {
     int ok = pc_save_write_authoritative_impl();
@@ -2488,6 +2507,46 @@ int pc_play_online_save_load(void) {
     pc_save_ready = 0;
     pc_save_loaded = pc_save_check_and_load();
     return pc_save_loaded;
+}
+
+/* Play Offline. Card A becomes save/offline/card_a for the rest of this process.
+ * That is not save/card_a and not save/mp/towns/<key>, so a FastTown cache is left alone.
+ * No socket is opened here. */
+static int s_offline_solo = 0;
+
+int pc_offline_solo_active(void) {
+    return s_offline_solo;
+}
+
+int pc_offline_solo_begin(void) {
+    const char* cur;
+    if (pc_net_game_role() != PC_NETGAME_ROLE_NONE) {
+        pc_diag_milestone("offline solo refused role");
+        return 0;
+    }
+    cur = pc_card_town_dir();
+    if (cur != NULL && strcmp(cur, "save/offline") != 0) {
+        pc_diag_milestone("offline solo refused town dir");
+        return 0;
+    }
+    if (cur == NULL && !pc_card_set_town_dir("save/offline")) {
+        pc_diag_milestone("offline solo refused path");
+        return 0;
+    }
+    s_offline_solo = 1;
+    pc_save_ready = 0;
+    if (pc_save_check_and_load()) {
+        pc_save_loaded = 1;
+        pc_diag_milestone("offline solo loaded save/offline");
+        return 1;
+    }
+    /* No file in save/offline. Do not pretend the town from save/card_a is loaded.
+     * Clearing the save check makes the first-game path run: player select, the
+     * train, Rover, then a new town written only under save/offline. */
+    pc_save_loaded = 0;
+    mFRm_ClearSaveCheckData(Save_GetPointer(save_check));
+    pc_diag_milestone("offline solo new save/offline");
+    return 1;
 }
 
 /* Rollback helpers: read / restore the two save flags. */

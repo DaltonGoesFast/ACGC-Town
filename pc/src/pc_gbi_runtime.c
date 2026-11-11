@@ -55,6 +55,19 @@ unsigned int pc_gbi_intern(uintptr_t addr) {
 unsigned int pc_gbi_pack_u32(uintptr_t addr) {
     return pc_gbi_intern(addr);
 }
+
+unsigned int pc_gbi_pack_auto(uintptr_t addr, int is_ptr) {
+    /* Below 4 GB, keep the old intern result: the address itself, with no extra tag bit.
+     * Above 4 GB (the Android stack), always tokenise, even if the expression was not
+     * classified as a pointer. */
+    if (addr >= 0x100000000ull || is_ptr) return pc_gbi_intern(addr);
+    return (unsigned int)addr;
+}
+
+unsigned int pc_gbi_pack_word(uintptr_t addr) {
+    if (addr >= 0x100000000ull) return pc_gbi_intern(addr);
+    return (unsigned int)addr;
+}
 #endif
 
 static uintptr_t s_odd_ptr_tokens[PC_GBI_ODD_PTR_TOKEN_COUNT];

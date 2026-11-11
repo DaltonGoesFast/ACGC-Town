@@ -26,7 +26,7 @@ A Linux `--dedicated` process does not open a window, an OpenGL context, or an a
 What this milestone does not claim:
 
 - A disc image is required before the process can load assets and simulate a town. This repository must not contain one. Without a GAFE01 image the binary is expected to stop at the disc check. Save load of a real town across restarts was therefore not executed here. The code path is the one the multiplayer branch already uses: first launch generates or adopts a town into `servers/default/town/`, later launches open that directory as Card A.
-- There is no Android or browser client in this milestone. Native clients still join over UDP.
+- The Android client is linked (arm64-v8a, OpenGL ES 3, the same `Save_t` as the 32-bit server). See `docs/ANDROID.md`. A browser client is not built yet. Native clients still join over UDP.
 - Villager and wildlife behaviour was not re-verified on a headless Linux process.
 
 ## Known constraints
@@ -45,7 +45,7 @@ These come from the original game and from the multiplayer branch. They are limi
 Build the same `pc/` sources three ways:
 
 - Linux/Windows native (what this branch builds), UDP to the server.
-- Android, GLES 3, touch overlay. Prior art: [zwaetschge/ACGC-Android-Port](https://github.com/zwaetschge/ACGC-Android-Port) (same CC0 decomp + MIT PC-port licence as upstream). Study its EGL/GLES context and touch overlay. Do not copy files in blindly; keep this repo's MIT header on new code and do not take assets. The first project is `pc/android/` (SDL2 activity, armeabi-v7a, GLES 3 shell). The game itself is not linked into that APK yet. See `docs/ANDROID.md`.
+- Android is linked. `pc/android/` is an SDL2 activity, arm64-v8a only, OpenGL ES 3, and the decomp is `libmain.so`. The old `pc/android/app/src/main/cpp/` CMake shell (`android_main.c`) is not what Gradle builds. Prior art: [zwaetschge/ACGC-Android-Port](https://github.com/zwaetschge/ACGC-Android-Port) (CC0 decomp, MIT PC-port layer). What we took from it, and what the low-4GB mapping already covers, is `docs/ANDROID_ARM64_AUDIT.md`. Touch is the desktop tap-to-move overlay. See `docs/ANDROID.md`.
 - Browser, Emscripten + WebGL 2, WebSocket to `ws_port`. Prior art: [turtlekiosk/slider](https://github.com/turtlekiosk/slider) `wasm` branch (Emscripten, WebGL 2, touch joystick). Slider's own web/Android modifications are MIT (Copyright 2026 turtlekiosk). It also vendors nipplejs (MIT) and the Work Sans font (SIL OFL). Those are not imported here. The WebSocket server in this branch speaks raw RFC 6455 so a later Emscripten client can use the browser `WebSocket` API without a UDP shim.
 
 [Dia2809/ACGC-PC-Port](https://github.com/Dia2809/ACGC-PC-Port) is a Linux fork of the single-player port (CC0 + MIT, same shape as flyngmt). Useful for Linux build notes. It has no dedicated server and no WebSocket layer; this branch does not vendor it.

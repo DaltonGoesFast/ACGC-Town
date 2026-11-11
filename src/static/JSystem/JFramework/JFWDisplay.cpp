@@ -312,6 +312,15 @@ void JFWDisplay::waitBlanking(int p1) {
 }
 
 void waitForTick(u32 p1, u16 p2) {
+#ifdef TARGET_PC
+    /* The VI manager thread is not started on PC, and OSReceiveMessage does not
+     * block, so the retrace-message loop below spins forever once a retrace
+     * count exists. Pump the real swap instead. */
+    (void)p1;
+    (void)p2;
+    VIWaitForRetrace();
+    return;
+#endif
     if (p1 != 0) {
         static s64 nextTick = OSGetTime();
         s64 time = OSGetTime();

@@ -11,4 +11,14 @@
 void pc_save_wire_store(const Save_t* native, void* wire);
 void pc_save_wire_load(const void* wire, Save_t* native);
 
+/* Write the 148128-byte town image and fsync it. No write when the save is not ready.
+ * Called when the app is backgrounded so a kill does not drop the last town. */
+int pc_save_flush_background(void);
+
+/* Play Offline. Points Card A at save/offline (never save/card_a and never a server
+ * town cache) and reloads that file. Returns 0 if a different town dir is already
+ * set or networking is already running, and then nothing is changed. */
+int pc_offline_solo_begin(void);
+int pc_offline_solo_active(void);
+
 #endif

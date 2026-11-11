@@ -26,6 +26,8 @@ int  pc_settings_menu_nav_down(void);
 int  pc_settings_menu_nav_left(void);
 int  pc_settings_menu_nav_right(void);
 int  pc_settings_menu_confirm(void);
+/* Tap in font space (320x240). Selects that row and confirms it. 1 = handled. */
+int  pc_settings_menu_pointer(float font_x, float font_y);
 int  pc_settings_menu_cancel(void); /* Esc/B - reverts on res-confirm, else closes */
 
 /* Call once per frame while the revert menu is active. Auto-reverts if the 15s expires. */

@@ -29,6 +29,17 @@ PCSettings g_pc_settings = {
     .touch_camera = 1,
     .touch_menus = 1,
     .touch_keyboard = 1,
+    .touch_hud_scale = 100,
+    .touch_hud_opacity = 85,
+    .touch_left_hand = 0,
+    .touch_stick = 0,
+    .touch_move = 1,
+#ifdef __ANDROID__
+    .touch_haptics = 1,
+#else
+    .touch_haptics = 0,
+#endif
+    .touch_virtual_pad = 0,
     .nes_aspect = 1,
     .master_volume = 100,
 #ifdef __ANDROID__
@@ -127,6 +138,14 @@ static const char* DEFAULT_SETTINGS =
     "touch_camera = 1\n"
     "touch_menus = 1\n"
     "touch_keyboard = 1\n"
+    "# Touch HUD: scale 70-140, opacity 40-100, left hand 0/1, stick 0/1, tap-to-move 0/1, haptics 0/1, virtual pad 0/1\n"
+    "touch_hud_scale = 100\n"
+    "touch_hud_opacity = 85\n"
+    "touch_left_hand = 0\n"
+    "touch_stick = 0\n"
+    "touch_move = 1\n"
+    "touch_haptics = 1\n"
+    "touch_virtual_pad = 0\n"
     "\n"
     "# NES emulator aspect ratio: 0 = stretch to fullscreen, 1 = 4:3 pillarbox\n"
     "nes_aspect = 1\n"
@@ -270,6 +289,20 @@ static void apply_setting(const char* key, const char* value) {
         if (val == 0 || val == 1) g_pc_settings.touch_menus = val;
     } else if (strcmp(key, "touch_keyboard") == 0) {
         if (val == 0 || val == 1) g_pc_settings.touch_keyboard = val;
+    } else if (strcmp(key, "touch_hud_scale") == 0) {
+        if (val >= 70 && val <= 140) g_pc_settings.touch_hud_scale = val;
+    } else if (strcmp(key, "touch_hud_opacity") == 0) {
+        if (val >= 40 && val <= 100) g_pc_settings.touch_hud_opacity = val;
+    } else if (strcmp(key, "touch_left_hand") == 0) {
+        if (val == 0 || val == 1) g_pc_settings.touch_left_hand = val;
+    } else if (strcmp(key, "touch_stick") == 0) {
+        if (val == 0 || val == 1) g_pc_settings.touch_stick = val;
+    } else if (strcmp(key, "touch_move") == 0) {
+        if (val == 0 || val == 1) g_pc_settings.touch_move = val;
+    } else if (strcmp(key, "touch_haptics") == 0) {
+        if (val == 0 || val == 1) g_pc_settings.touch_haptics = val;
+    } else if (strcmp(key, "touch_virtual_pad") == 0) {
+        if (val == 0 || val == 1) g_pc_settings.touch_virtual_pad = val;
     } else if (strcmp(key, "emotes") == 0) {
         if (val == 0 || val == 1) g_pc_settings.emotes = val;
     } else if (strcmp(key, "handover_anim") == 0) {
@@ -428,6 +461,14 @@ void pc_settings_save(void) {
     fprintf(f, "touch_camera = %d\n", g_pc_settings.touch_camera);
     fprintf(f, "touch_menus = %d\n", g_pc_settings.touch_menus);
     fprintf(f, "touch_keyboard = %d\n", g_pc_settings.touch_keyboard);
+    fprintf(f, "# Touch HUD: scale 70-140, opacity 40-100, left hand 0/1, stick 0/1, tap-to-move 0/1, haptics 0/1\n");
+    fprintf(f, "touch_hud_scale = %d\n", g_pc_settings.touch_hud_scale);
+    fprintf(f, "touch_hud_opacity = %d\n", g_pc_settings.touch_hud_opacity);
+    fprintf(f, "touch_left_hand = %d\n", g_pc_settings.touch_left_hand);
+    fprintf(f, "touch_stick = %d\n", g_pc_settings.touch_stick);
+    fprintf(f, "touch_move = %d\n", g_pc_settings.touch_move);
+    fprintf(f, "touch_haptics = %d\n", g_pc_settings.touch_haptics);
+    fprintf(f, "touch_virtual_pad = %d\n", g_pc_settings.touch_virtual_pad);
     fprintf(f, "\n");
     fprintf(f, "# NES emulator aspect ratio: 0 = stretch to fullscreen, 1 = 4:3 pillarbox\n");
     fprintf(f, "nes_aspect = %d\n", g_pc_settings.nes_aspect);

@@ -30,9 +30,11 @@ enum {
     ITEM_TOUCH,
     ITEM_NES_ASPECT,
     ITEM_MASTER_VOLUME,
+    ITEM_SOUND,
     ITEM_STICK_DEADZONE,
     ITEM_CSTICK_DEADZONE,
     ITEM_BINDINGS,
+    ITEM_TOUCH_HUD,
 };
 
 /* Per-item static metadata. restart=1 appends " *" and folds into the
@@ -64,12 +66,14 @@ static const Item tab_gameplay_items[] = {
 };
 
 static const Item tab_audio_items[] = {
+    { "Sound",         ITEM_SOUND,         0 },
     { "Master volume", ITEM_MASTER_VOLUME, 0 },
 };
 
 static const Item tab_controls_items[] = {
     { "Stick deadzone",   ITEM_STICK_DEADZONE,  0 },
     { "C-stick deadzone", ITEM_CSTICK_DEADZONE, 0 },
+    { "Touch HUD",        ITEM_TOUCH_HUD,       0 },
     { "Keybindings",      ITEM_BINDINGS,        0 },
 };
 
@@ -94,7 +98,11 @@ typedef enum {
     SUB_CONFIRM_RES = 1,
     SUB_CONFIRM_BACK = 2,
     SUB_BINDINGS = 3,
+    SUB_HUD = 4,
 } SubPage;
+
+static int s_hud_sel = 0;
+#define HUD_BACK 7
 
 static int     s_active = 0;
 static SubPage s_sub    = SUB_SETTINGS;
@@ -280,7 +288,15 @@ static void recompute_dirty(void) {
         (s_pending.nes_aspect       != g_pc_settings.nes_aspect) ||
         (s_pending.master_volume    != g_pc_settings.master_volume) ||
         (s_pending.stick_deadzone   != g_pc_settings.stick_deadzone) ||
-        (s_pending.cstick_deadzone  != g_pc_settings.cstick_deadzone);
+        (s_pending.cstick_deadzone  != g_pc_settings.cstick_deadzone) ||
+        (s_pending.touch_hud_scale  != g_pc_settings.touch_hud_scale) ||
+        (s_pending.touch_hud_opacity != g_pc_settings.touch_hud_opacity) ||
+        (s_pending.touch_left_hand  != g_pc_settings.touch_left_hand) ||
+        (s_pending.touch_stick      != g_pc_settings.touch_stick) ||
+        (s_pending.touch_move       != g_pc_settings.touch_move) ||
+        (s_pending.touch_haptics    != g_pc_settings.touch_haptics) ||
+        (s_pending.touch_virtual_pad != g_pc_settings.touch_virtual_pad) ||
+        (s_pending.audio            != g_pc_settings.audio);
 }
 
 static void snapshot(void) {
@@ -348,6 +364,9 @@ static void item_cycle(int id, int dir) {
         case ITEM_NES_ASPECT:
             s_pending.nes_aspect = !s_pending.nes_aspect;
             break;
+        case ITEM_SOUND:
+            s_pending.audio = !s_pending.audio;
+            break;
         case ITEM_MASTER_VOLUME: {
             int v = s_pending.master_volume + (dir > 0 ? 10 : -10);
             if (v < 0)   v = 0;
@@ -367,6 +386,7 @@ static void item_cycle(int id, int dir) {
             s_pending.cstick_deadzone = v;
         } break;
         case ITEM_BINDINGS:
+        case ITEM_TOUCH_HUD:
             /* opened via confirm, left/right does nothing */
             break;
     }
@@ -427,6 +447,9 @@ static void item_format(int id, char* buf, size_t n) {
         case ITEM_NES_ASPECT:
             snprintf(buf, n, "%s", s_pending.nes_aspect ? "< 4:3 >" : "< Stretch >");
             break;
+        case ITEM_SOUND:
+            snprintf(buf, n, "%s", s_pending.audio ? "< On >" : "< Off >");
+            break;
         case ITEM_MASTER_VOLUME:
             snprintf(buf, n, "< %d%% >", s_pending.master_volume);
             break;
@@ -437,6 +460,9 @@ static void item_format(int id, char* buf, size_t n) {
             snprintf(buf, n, "< %d%% >", s_pending.cstick_deadzone);
             break;
         case ITEM_BINDINGS:
+            snprintf(buf, n, "Edit...");
+            break;
+        case ITEM_TOUCH_HUD:
             snprintf(buf, n, "Edit...");
             break;
         default:
@@ -463,10 +489,12 @@ static int item_changed(int id) {
         case ITEM_SHOW_ACRE:        return s_pending.show_acre        != g_pc_settings.show_acre;
         case ITEM_TOUCH:            return s_pending.touch_controls   != g_pc_settings.touch_controls;
         case ITEM_NES_ASPECT:    return s_pending.nes_aspect    != g_pc_settings.nes_aspect;
+        case ITEM_SOUND:         return s_pending.audio != g_pc_settings.audio;
         case ITEM_MASTER_VOLUME: return s_pending.master_volume != g_pc_settings.master_volume;
         case ITEM_STICK_DEADZONE:  return s_pending.stick_deadzone  != g_pc_settings.stick_deadzone;
         case ITEM_CSTICK_DEADZONE: return s_pending.cstick_deadzone != g_pc_settings.cstick_deadzone;
         case ITEM_BINDINGS:      return 0; /* bindings save themselves */
+        case ITEM_TOUCH_HUD:     return 0;
     }
     return 0;
 }
@@ -539,6 +567,10 @@ static void apply_pending(void) {
 
     g_pc_settings = s_pending;
     pc_settings_apply();
+    {
+        extern void pc_audio_apply_setting(void);
+        pc_audio_apply_setting();
+    }
     s_pending_dirty = 0;
     recompute_restart_needed();
 
@@ -579,10 +611,72 @@ int pc_settings_menu_active(void) {
     return s_active;
 }
 
+/* Touch HUD page. Values live in s_pending until Apply, same as the other rows. */
+
+static void hud_cycle(int dir) {
+    int v;
+    switch (s_hud_sel) {
+        case 0:
+            v = s_pending.touch_hud_scale + (dir >= 0 ? 10 : -10);
+            if (v < 70) v = 70;
+            if (v > 140) v = 140;
+            s_pending.touch_hud_scale = v;
+            break;
+        case 1:
+            v = s_pending.touch_hud_opacity + (dir >= 0 ? 10 : -10);
+            if (v < 40) v = 40;
+            if (v > 100) v = 100;
+            s_pending.touch_hud_opacity = v;
+            break;
+        case 2: s_pending.touch_left_hand = !s_pending.touch_left_hand; break;
+        case 3: s_pending.touch_stick = !s_pending.touch_stick; break;
+        case 4: s_pending.touch_move = !s_pending.touch_move; break;
+        case 5: s_pending.touch_haptics = !s_pending.touch_haptics; break;
+        case 6: s_pending.touch_virtual_pad = !s_pending.touch_virtual_pad; break;
+        default: s_sub = SUB_SETTINGS; return;
+    }
+    recompute_dirty();
+}
+
+static void hud_value(int row, char* buf, size_t n) {
+    switch (row) {
+        case 0: snprintf(buf, n, "%d%%", s_pending.touch_hud_scale); break;
+        case 1: snprintf(buf, n, "%d%%", s_pending.touch_hud_opacity); break;
+        case 2: snprintf(buf, n, "%s", s_pending.touch_left_hand ? "Left" : "Right"); break;
+        case 3: snprintf(buf, n, "%s", s_pending.touch_stick ? "On" : "Off"); break;
+        case 4: snprintf(buf, n, "%s", s_pending.touch_move ? "On" : "Off"); break;
+        case 5: snprintf(buf, n, "%s", s_pending.touch_haptics ? "On" : "Off"); break;
+        case 6: snprintf(buf, n, "%s", s_pending.touch_virtual_pad ? "On" : "Off"); break;
+        default: snprintf(buf, n, "Back"); break;
+    }
+}
+
+static void draw_hud_page(struct game_s* game) {
+    static const char* names[8] = {
+        "HUD scale", "HUD opacity", "Hand", "Stick", "Tap to move", "Haptics", "Virtual pad", "Back"
+    };
+    int i, r, g, b, a;
+    pc_menu_draw_centered(game, "- Touch HUD -", 28.0f, 255, 255, 255, 255, 1.0f);
+    for (i = 0; i < 8; i++) {
+        char value[24];
+        int on = (i == s_hud_sel);
+        float y = 52.0f + (float)i * 18.0f;
+        hud_value(i, value, sizeof(value));
+        pc_menu_row_colors(on, &r, &g, &b, &a);
+        pc_menu_draw_left(game, names[i], 48.0f, y, r, g, b, a, on ? PC_MENU_SCALE_SELECTED : 1.0f);
+        if (i < HUD_BACK) pc_menu_draw_left(game, value, 200.0f, y, r, g, b, a, 1.0f);
+    }
+    pc_menu_draw_centered(game, "Apply on the previous page saves these", 214.0f, 150, 150, 150, 180, 1.0f);
+}
+
 /* --- Navigation --- */
 
 int pc_settings_menu_nav_up(void) {
     if (!s_active) return 0;
+    if (s_sub == SUB_HUD) {
+        if (s_hud_sel > 0) s_hud_sel--;
+        return 1;
+    }
     if (s_sub == SUB_BINDINGS) {
         if (s_capture) return 1;
         if (s_bind_sel > 0) s_bind_sel--;
@@ -598,6 +692,10 @@ int pc_settings_menu_nav_up(void) {
 
 int pc_settings_menu_nav_down(void) {
     if (!s_active) return 0;
+    if (s_sub == SUB_HUD) {
+        if (s_hud_sel < HUD_BACK) s_hud_sel++;
+        return 1;
+    }
     if (s_sub == SUB_BINDINGS) {
         if (s_capture) return 1;
         if (s_bind_sel < BIND_IDX_BACK) s_bind_sel++;
@@ -615,6 +713,11 @@ int pc_settings_menu_nav_down(void) {
  * switching on the tab row, and value cycling on a selected item. */
 static int nav_horizontal(int dir) {
     if (!s_active) return 0;
+    if (s_sub == SUB_HUD) {
+        if (s_hud_sel == HUD_BACK) s_sub = SUB_SETTINGS;
+        else hud_cycle(dir);
+        return 1;
+    }
     if (s_sub == SUB_BINDINGS) {
         if (s_capture) return 1;
         if (s_bind_sel < BIND_ROW_COUNT) {
@@ -646,6 +749,11 @@ int pc_settings_menu_nav_right(void) { return nav_horizontal(+1); }
 
 int pc_settings_menu_confirm(void) {
     if (!s_active) return 0;
+    if (s_sub == SUB_HUD) {
+        if (s_hud_sel == HUD_BACK) s_sub = SUB_SETTINGS;
+        else hud_cycle(+1);
+        return 1;
+    }
     if (s_sub == SUB_BINDINGS) {
         if (s_capture) return 1;
         if (s_bind_sel < BIND_ROW_COUNT) {
@@ -677,6 +785,7 @@ int pc_settings_menu_confirm(void) {
     } else if (s_sel < cur_item_count()) {
         int id = s_tabs[s_tab].items[s_sel].id;
         if (id == ITEM_BINDINGS) bind_enter_page();
+        else if (id == ITEM_TOUCH_HUD) { s_sub = SUB_HUD; s_hud_sel = 0; }
         else                     item_cycle(id, +1);
     } else if (s_sel == idx_apply()) {
         apply_pending();
@@ -692,8 +801,72 @@ int pc_settings_menu_confirm(void) {
     return 1;
 }
 
+int pc_settings_menu_pointer(float font_x, float font_y) {
+    int i, n, max_items, t;
+    float y0, line_h, apy;
+    if (!s_active || s_capture) return 0;
+    if (s_sub == SUB_HUD) {
+        int i = (int)((font_y - 58.0f) / 20.0f);
+        if (i < 0 || i > HUD_BACK) return 0;
+        s_hud_sel = i;
+        if (i == HUD_BACK) s_sub = SUB_SETTINGS;
+        else hud_cycle(font_x >= 180.0f ? +1 : -1);
+        return 1;
+    }
+    if (s_sub == SUB_CONFIRM_RES) {
+        if (font_y < 110.0f || font_y > 150.0f) return 0;
+        s_res_sel = (font_x < 160.0f) ? 0 : 1;
+        pc_settings_menu_confirm();
+        return 1;
+    }
+    if (s_sub == SUB_CONFIRM_BACK) {
+        if (font_y < 110.0f || font_y > 160.0f) return 0;
+        s_back_sel = (font_x < 160.0f) ? 0 : 1;
+        pc_settings_menu_confirm();
+        return 1;
+    }
+    if (s_sub != SUB_SETTINGS) return 0;
+    if (font_y >= 44.0f && font_y < 70.0f) {
+        t = (int)((font_x - 20.0f) / 70.0f);
+        if (t < 0) t = 0;
+        if (t >= TAB_COUNT) t = TAB_COUNT - 1;
+        s_tab = t;
+        s_sel = -1;
+        return 1;
+    }
+    y0 = 78.0f;
+    line_h = 15.0f;
+    n = cur_item_count();
+    i = (int)((font_y - y0) / line_h);
+    if (i >= 0 && i < n) {
+        s_sel = i;
+        pc_settings_menu_confirm();
+        return 1;
+    }
+    max_items = 0;
+    for (t = 0; t < TAB_COUNT; t++) {
+        if (s_tabs[t].count > max_items) max_items = s_tabs[t].count;
+    }
+    apy = y0 + (float)max_items * line_h + 10.0f;
+    if (font_y >= apy - 4.0f && font_y < apy + line_h) {
+        s_sel = idx_apply();
+        pc_settings_menu_confirm();
+        return 1;
+    }
+    if (font_y >= apy + line_h - 2.0f && font_y < apy + line_h * 2.0f + 4.0f) {
+        s_sel = idx_back();
+        pc_settings_menu_confirm();
+        return 1;
+    }
+    return 0;
+}
+
 int pc_settings_menu_cancel(void) {
     if (!s_active) return 0;
+    if (s_sub == SUB_HUD) {
+        s_sub = SUB_SETTINGS;
+        return 1;
+    }
     if (s_sub == SUB_BINDINGS) {
         if (s_capture) { capture_finish(0); return 1; }
         s_sub = SUB_SETTINGS;
@@ -1033,5 +1206,6 @@ void pc_settings_menu_draw(struct game_s* game, int with_dim_backdrop) {
     if (s_sub == SUB_SETTINGS)          draw_settings_page(game);
     else if (s_sub == SUB_CONFIRM_RES)  draw_res_confirm_page(game);
     else if (s_sub == SUB_BINDINGS)     draw_bindings_page(game);
+    else if (s_sub == SUB_HUD)          draw_hud_page(game);
     else                                draw_back_confirm_page(game);
 }

@@ -9,6 +9,7 @@
 #include "pc_text_draw.h"
 #include "pc_relaunch.h" /* PC_RELAUNCH_* kinds (the relaunch itself is no longer used here) */
 #include "pc_servers.h"
+#include "pc_pause_menu.h" /* pc_net_status_toast */
 
 #include "m_font.h"
 #include "m_rcp.h"
@@ -154,6 +155,29 @@ static int row_count(void) {
     return 2;
 }
 
+int pc_play_online_menu_pointer(float font_x, float font_y) {
+    int i, n, vis;
+    if (!s_active || s_text != T_NONE) return 0;
+    if (s_page == PG_DELETE || s_page == PG_ICONF) {
+        if (font_y < 155.0f || font_y > 190.0f) return 0;
+        s_del_sel = (font_x < 160.0f) ? 0 : 1;
+        pc_play_online_menu_confirm();
+        return 1;
+    }
+    n = row_count();
+    if (s_page == PG_CHARS || s_page == PG_MCHARS) {
+        i = (int)((font_y - 44.0f) / 30.0f);
+        vis = 5;
+    } else {
+        i = (int)((font_y - 55.0f) / 15.0f);
+        vis = VISIBLE;
+    }
+    if (i < 0 || i >= vis || s_scroll + i >= n) return 0;
+    s_sel = s_scroll + i;
+    pc_play_online_menu_confirm();
+    return 1;
+}
+
 static void sel_clamp(void) {
     const int n = row_count();
     if (s_sel < 0) s_sel = 0;
@@ -221,6 +245,7 @@ static void do_connect(const PCServer* s, int kind, const char* name, const char
     /* In-process connect (no relaunch): the request is executed by pc_main_play_online_poll() (pc_vi.c) at the end of this frame. The menu ignores input meanwhile. */
     if (pc_main_play_online_request(s->address, s->port, kind, name)) {
         s_launched = 1;
+        pc_net_status_toast("connecting");
         set_msg(0, "Connecting to %s ...", s->name);
     } else {
         set_msg(1, "%s", "Could not start the connection (bad server or character name)");
@@ -240,9 +265,11 @@ static const char* friendly_join_error(const char* msg) {
 
 void pc_play_online_menu_connect_result(int ok, const char* msg) {
     if (ok) {
+        pc_net_status_toast("connected");
         set_msg(0, "%s", msg != NULL ? msg : "Connected: loading the town ...");
         /* s_launched stays 1: the menu is inert (and drawn) while the title fades out; pc_main closes it once the title scene is gone */
     } else {
+        pc_net_status_toast("disconnected");
         s_launched = 0; /* back to the menu, the character page, with the reason */
         set_msg(1, "%s", friendly_join_error(msg));
     }

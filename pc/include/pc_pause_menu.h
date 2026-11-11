@@ -21,6 +21,8 @@ void pc_pause_menu_toggle(void);
 
 /* Forward an SDL event for menu navigation. Returns 1 if consumed. No-op if not paused. */
 int  pc_pause_menu_handle_event(const SDL_Event* e);
+/* Tap in font space. Selects that row and activates it. 1 = handled. */
+int  pc_pause_menu_pointer(float font_x, float font_y);
 
 /* Append the pause overlay to the game's font display list, from graph_main
  * after game_main() returns. No-op if not paused. */
@@ -29,6 +31,9 @@ void pc_pause_menu_draw(struct game_s* game);
 /* Batch A (A3): draws the small "not connected" notice of a network CLIENT whose link is not READY (pc_net_game_client_notice_visible()); same font
  * path and call site as the pause overlay. No-op while the pause overlay is up or when the notice is hidden. */
 void pc_net_notice_draw(struct game_s* game);
+
+/* Play Online status pill. kind is "connecting", "connected", or "disconnected". */
+void pc_net_status_toast(const char* kind);
 
 /* "v" PC_VERSION_STRING (pc_version.h) in the bottom-right corner of the window. ONLY the title screen calls it (ac_animal_logo.c, inside its font phase);
  * overlay_open = the Play Online / Options overlay is up (skipped where its hint line could reach the corner). No-op for --dedicated. */

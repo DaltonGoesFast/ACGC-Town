@@ -17,6 +17,9 @@
 #include "dolphin/os.h"
 #include "libforest/osreport.h"
 #include "m_land.h"
+#ifdef TARGET_PC
+#include "pc_crash.h"
+#endif
 
 // TODO: actually add all the stacks and headers
 
@@ -40,6 +43,7 @@ extern void mainproc(void* val) {
 
 #ifdef TARGET_PC
     OSReport("[PC] mainproc: JW_BeginFrame/EndFrame...\n");
+    pc_hb_set_step("mainproc begin frame");
 #endif
     JW_BeginFrame();
     JW_EndFrame();
@@ -49,6 +53,7 @@ extern void mainproc(void* val) {
     osCreateMesgQueue(&irqMgrMsgQueue, irqMsgBuf, 10);
 #ifdef TARGET_PC
     OSReport("[PC] mainproc: CreateIRQManager...\n");
+    pc_hb_set_step("mainproc irq");
 #endif
     CreateIRQManager(irqmgrStack + IRQMGR_STACK_SIZE, IRQMGR_STACK_SIZE, 18, 1);
     irqmgr_AddClient(&irqClient, &irqMgrMsgQueue);
@@ -56,6 +61,7 @@ extern void mainproc(void* val) {
 
 #ifdef TARGET_PC
     OSReport("[PC] mainproc: padmgr_Create...\n");
+    pc_hb_set_step("mainproc padmgr");
 #endif
     padmgr_Create(&l_serialMsgQ, 7, 15, padmgrStack + PADMGR_STACK_SIZE, PADMGR_STACK_SIZE);
 
@@ -69,10 +75,12 @@ extern void mainproc(void* val) {
 
 #ifdef TARGET_PC
     OSReport("[PC] mainproc: JW_Init3...\n");
+    pc_hb_set_step("mainproc JW_Init3");
 #endif
     JW_Init3();
 #ifdef TARGET_PC
     OSReport("[PC] mainproc: mMsg_aram_init2...\n");
+    pc_hb_set_step("mainproc messages");
 #endif
     mMsg_aram_init2();
 #ifdef TARGET_PC
@@ -81,6 +89,7 @@ extern void mainproc(void* val) {
     mLd_StartFlagOn();
 #ifdef TARGET_PC
     OSReport("[PC] mainproc: famicom_mount_archive...\n");
+    pc_hb_set_step("mainproc famicom");
 #endif
     famicom_mount_archive();
 
@@ -94,6 +103,7 @@ extern void mainproc(void* val) {
     /* On PC, the graph thread was skipped (single-threaded).
      * Instead of blocking in the message loop, call graph_proc directly. */
     OSReport("[PC] mainproc: calling graph_proc directly (single-threaded)...\n");
+    pc_hb_set_step("mainproc graph_proc");
     graph_proc(val);
     OSReport("[PC] mainproc: graph_proc returned\n");
     /* Stage 0.5E: one final authoritative-town save on the normal graceful shutdown path (this is
@@ -181,6 +191,7 @@ extern void mainproc(void* val) {
 u32 entry(void) {
 #ifdef TARGET_PC
     OSReport("[PC] entry() called\n");
+    pc_hb_set_step("entry");
 #endif
     padmgr_Init(NULL);
     new_Debug_mode();
