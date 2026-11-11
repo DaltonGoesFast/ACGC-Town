@@ -305,6 +305,33 @@ static int graph_draw_finish(GRAPH* this) {
         err = TRUE;
     }
 
+    if (THA_GA_isCrash(&this->work_thaga)) {
+        err = TRUE;
+    }
+
+#ifdef TARGET_PC
+    if (err) {
+        static int s_err_count = 0;
+        if ((s_err_count++ % 60) == 0) {
+            printf("[GRAPH] Frame display list buffer overflow (crash detected)!\n");
+            if (sys_dynamic.start_magic != SYSDYNAMIC_START_MAGIC || sys_dynamic.end_magic != SYSDYNAMIC_END_MAGIC) {
+                printf("[GRAPH]  -> sys_dynamic magic corrupted! (start=%04x expected=%04x, end=%04x expected=%04x)\n",
+                       sys_dynamic.start_magic, SYSDYNAMIC_START_MAGIC,
+                       sys_dynamic.end_magic, SYSDYNAMIC_END_MAGIC);
+            }
+            if (THA_GA_isCrash(&this->polygon_opaque_thaga)) printf("[GRAPH]  -> polygon_opaque_thaga crashed (size %d)\n", POLY_OPA_SIZE);
+            if (THA_GA_isCrash(&this->polygon_translucent_thaga)) printf("[GRAPH]  -> polygon_translucent_thaga crashed (size %d)\n", POLY_XLU_SIZE);
+            if (THA_GA_isCrash(&this->overlay_thaga)) printf("[GRAPH]  -> overlay_thaga crashed (size %d)\n", OVERLAY_SIZE);
+            if (THA_GA_isCrash(&this->font_thaga)) printf("[GRAPH]  -> font_thaga crashed (size %d)\n", FONT_SIZE);
+            if (THA_GA_isCrash(&this->shadow_thaga)) printf("[GRAPH]  -> shadow_thaga crashed (size %d)\n", SHADOW_SIZE);
+            if (THA_GA_isCrash(&this->light_thaga)) printf("[GRAPH]  -> light_thaga crashed (size %d)\n", LIGHT_SIZE);
+            if (THA_GA_isCrash(&this->bg_opaque_thaga)) printf("[GRAPH]  -> bg_opaque_thaga crashed (size %d)\n", NEW0_SIZE);
+            if (THA_GA_isCrash(&this->bg_translucent_thaga)) printf("[GRAPH]  -> bg_translucent_thaga crashed (size %d)\n", NEW1_SIZE);
+            if (THA_GA_isCrash(&this->work_thaga)) printf("[GRAPH]  -> work_thaga crashed (size %d)\n", WORK_SIZE);
+        }
+    }
+#endif
+
     return err;
 }
 

@@ -24,17 +24,45 @@ extern "C" {
 #define FONT_SIZE 256
 */
 
-#define POLY_OPA_SIZE 9952
-#define POLY_XLU_SIZE 2048
-#define OVERLAY_SIZE 1024
-#define WORK_SIZE 128
-#define UNK_BUF0_SIZE 32
-#define FONT_SIZE 1792
-#define SHADOW_SIZE 512
-#define LIGHT_SIZE 256
 #ifdef TARGET_PC
-#define NEW0_SIZE 2048
-#define NEW1_SIZE 1024
+#define POLY_OPA_SIZE 32768
+#else
+#define POLY_OPA_SIZE 9952
+#endif
+#ifdef TARGET_PC
+#define POLY_XLU_SIZE 8192
+#else
+#define POLY_XLU_SIZE 2048
+#endif
+#ifdef TARGET_PC
+#define OVERLAY_SIZE 4096
+#else
+#define OVERLAY_SIZE 1024
+#endif
+#ifdef TARGET_PC
+#define WORK_SIZE 2048
+#else
+#define WORK_SIZE 128
+#endif
+#define UNK_BUF0_SIZE 32
+#ifdef TARGET_PC
+#define FONT_SIZE 4096
+#else
+#define FONT_SIZE 1792
+#endif
+#ifdef TARGET_PC
+#define SHADOW_SIZE 4096
+#else
+#define SHADOW_SIZE 512
+#endif
+#ifdef TARGET_PC
+#define LIGHT_SIZE 2048
+#else
+#define LIGHT_SIZE 256
+#endif
+#ifdef TARGET_PC
+#define NEW0_SIZE 8192
+#define NEW1_SIZE 4096
 #else
 #define NEW0_SIZE 512
 #define NEW1_SIZE 256
