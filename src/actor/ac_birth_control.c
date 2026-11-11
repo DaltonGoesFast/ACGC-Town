@@ -71,9 +71,15 @@ static void aBC_deleteActor_part(GAME_PLAY* play, int part) {
 
       /* Keep actors in adjacent acres alive so borderless camera movement does not cause pop-in. */
       if (check_bx >= 0 && check_bz >= 0) {
+#ifdef PC_ENHANCEMENTS
+        if (dx > 3 || dz > 4) {
+          Actor_delete(actor);
+        }
+#else
         if (dx > 1 || dz > 1) {
           Actor_delete(actor);
         }
+#endif
       }
     } else {
       /* Delete any actors which aren't in the current block or the last block */

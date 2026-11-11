@@ -241,7 +241,11 @@ typedef struct common_data_s {
     /* 0x028558 */ mDemo_Request_c start_demo_request;
     /* 0x028568 */ Door_data_c event_door_data;
     /* 0x02857C */ Door_data_c famicom_emu_exit_door_data;
+#ifdef PC_ENHANCEMENTS
+    /* 0x028590 */ u32 remove_cut_tree_info_bitfield; /* resets the cut tree states for trees in a visible acre */
+#else
     /* 0x028590 */ u8 remove_cut_tree_info_bitfield; /* resets the cut tree states for trees in a visible acre */
+#endif
     /* 0x028591 */ s8 floor_idx;
     /* 0x028592 */ s16 demo_profiles[2]; /* demo_profiles[0] is for demo_clip, demo_profiles[1] is for demo_clip2 */
     /* 0x028596 */ u16 copy_protect;

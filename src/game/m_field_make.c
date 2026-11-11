@@ -1335,9 +1335,15 @@ extern void mFM_FieldInit(GAME_PLAY* play) {
     int scene = Save_Get(scene_no);
 
     mFM_LoadBGCommonTex(TRUE, Save_Get(bg_tex_idx));
+#ifdef PC_ENHANCEMENTS
+    if (bg_disp_num > 1) {
+        bg_disp_num = mFM_VISIBLE_BLOCK_NUM;
+    }
+#else
     if (bg_disp_num > mFM_VISIBLE_BLOCK_NUM) {
         bg_disp_num = mFM_VISIBLE_BLOCK_NUM;
     }
+#endif
 
     g_fdinfo = mFM_MakeField(scene, bg_disp_size, bg_disp_num);
     mFI_InitMoveActorBitData();

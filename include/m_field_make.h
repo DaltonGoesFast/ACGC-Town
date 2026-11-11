@@ -37,7 +37,11 @@ extern "C" {
 #define BLOCKXZ_2_BLOCKIDX(x, z) ((z) * BLOCK_X_NUM + (x))
 #define UNITXZ_2_UNIT(x, z) ((z) * UT_X_NUM + (x))
 
+#ifdef PC_ENHANCEMENTS
+#define mFM_VISIBLE_BLOCK_NUM 32 /* Full town visible acres (5x6 FG grid = 30 acres) */
+#else
 #define mFM_VISIBLE_BLOCK_NUM 4 /* number of visible blocks (nearest to the Player) */
+#endif
 #define mFM_SOUND_SOURCE_NUM 6
 #define mFM_MOVE_ACTOR_NUM 16
 #define mFM_HANIWA_STEP_NUM 4

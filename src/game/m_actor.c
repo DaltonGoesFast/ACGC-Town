@@ -377,11 +377,17 @@ static void Actor_delete_check(ACTOR* actor, GAME* game) {
             if (actor->block_x >= 0 && actor->block_z >= 0) {
                 int dx = ABS(actor->block_x - play->block_table.block_x);
                 int dz = ABS(actor->block_z - play->block_table.block_z);
+#ifdef PC_ENHANCEMENTS
+                if (dx > 3 || dz > 4) {
+                    Actor_delete(actor);
+                }
+#else
                 int keep_range = g_mPlib_wade_disabled ? 1 : 0;
 
                 if (dx > keep_range || dz > keep_range) {
                     Actor_delete(actor);
                 }
+#endif
             }
         }
     }
@@ -810,7 +816,7 @@ extern ACTOR* Actor_info_make_actor(Actor_info* actor_info, GAME* game, s16 prof
     profile = dlftbl->profile;
 #ifdef TARGET_PC
     /* Skip actors with NULL or stubbed profiles (stub functions masquerading as struct data) */
-    if (profile == NULL || profile->class_size == 0 || profile->class_size > 0x100000) {
+    if (profile == NULL || profile->class_size == 0 || profile->class_size > 0x400000) {
         return NULL;
     }
 #endif

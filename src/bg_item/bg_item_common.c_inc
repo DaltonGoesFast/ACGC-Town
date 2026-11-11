@@ -2345,7 +2345,11 @@ typedef struct {
 
 static void m_GetCItTable_TreeTblChk(bg_item_block_info_tbl_c* block_info_table, mFI_item_table_c* item_table,
                                      xyz_t wpos) {
+#ifdef PC_ENHANCEMENTS
+    u32 remove_cut_tree_info_bitfield;
+#else
     int remove_cut_tree_info_bitfield;
+#endif
     mFI_block_tbl_c* block_table;
     bIT_block_c block_info[2];
     int dst_idx_tbl[mFM_VISIBLE_BLOCK_NUM];
@@ -2822,7 +2826,11 @@ static void bg_item_common_chg_draw_tbl_perfect(GAME_PLAY* play, bg_item_common_
     int* order_tbl = common->_139F4;
     mFI_block_tbl_c* block_tbl;
     int flag0;
+#ifdef PC_ENHANCEMENTS
+    u32 clear_tree_cut_flags;
+#else
     u8 clear_tree_cut_flags;
+#endif
     int t0[mFM_VISIBLE_BLOCK_NUM];
     int t1[mFM_VISIBLE_BLOCK_NUM];
     int t2[mFM_VISIBLE_BLOCK_NUM];
@@ -2954,11 +2962,15 @@ static void bg_item_common_culling_check_loop(GAME_PLAY* play, ACTOR* actorx, bg
         Matrix_put(&draw_pos->mtxf);
         Matrix_Position(&ZeroVec, &pos);
 
+#ifdef PC_ENHANCEMENTS
+        draw_pos->cull_flag = FALSE;
+#else
         if (bg_item_common_culling_check(play, actorx, &pos) == TRUE) {
             draw_pos->cull_flag = FALSE;
         } else {
             draw_pos->cull_flag = TRUE;
         }
+#endif
 
         draw_pos += draw_pos->next_add_cnt;
     }

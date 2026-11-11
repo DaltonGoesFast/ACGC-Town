@@ -5316,6 +5316,11 @@ void emu64::dl_G_CULLDL() {
     }
 
     this->cullDL_calls++;
+#ifdef PC_ENHANCEMENTS
+    /* On modern PC/mobile GPUs, frustum clipping is handled in hardware.
+     * Bypass software RSP bounding-box aborts so edge/tall models are never culled prematurely. */
+    mask = 0;
+#endif
     if (mask != 0) {
         EMU64_LOGF("カリングされました mask=%02x\n", mask); /* Translation: Was culled mask=%02x */
 

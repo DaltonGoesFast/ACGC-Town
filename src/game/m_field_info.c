@@ -625,10 +625,12 @@ static void mFI_DmaBg() {
             mFI_DmaBg_sub(bg_info);
             mFI_BornItemON();
             Common_Set(remove_cut_tree_info_bitfield,
-                       Common_Get(remove_cut_tree_info_bitfield) | (1 << bg_info->bg_num));
+                       Common_Get(remove_cut_tree_info_bitfield) | (1U << bg_info->bg_num));
             bg_info->dma_active = FALSE;
 
+#ifndef PC_ENHANCEMENTS
             break;
+#endif
         }
 
         bg_info++;
@@ -1007,7 +1009,11 @@ static int mFI_SearchNullDisp(int* idx) {
     return res;
 }
 
+#ifdef PC_ENHANCEMENTS
+static void mFI_BGDispMake(u32* disp_bitfield, int bx, int bz) {
+#else
 static void mFI_BGDispMake(u8* disp_bitfield, int bx, int bz) {
+#endif
     int num = mFI_GetBlockNum(bx, bz);
     int idx;
 
@@ -1017,10 +1023,10 @@ static void mFI_BGDispMake(u8* disp_bitfield, int bx, int bz) {
                                   g_fdinfo->block_info[num].bg_info.rom_size);
             g_fdinfo->bg_draw_info[idx].block_x = bx;
             g_fdinfo->bg_draw_info[idx].block_z = bz;
-            disp_bitfield[0] |= (1 << idx);
+            disp_bitfield[0] |= (1U << idx);
         }
     } else {
-        disp_bitfield[0] |= (1 << idx);
+        disp_bitfield[0] |= (1U << idx);
     }
 }
 
@@ -1081,8 +1087,12 @@ static void mFI_WhereisInBlock(u8* pos_bitfield, xyz_t wpos) {
 }
 
 extern void mFI_BGDisplayListRefresh(xyz_t wpos) {
-    u8 disp_bitfield;
-    u8 where_bitfield;
+#ifdef PC_ENHANCEMENTS
+    u32 disp_bitfield = 0;
+#else
+    u8 disp_bitfield = 0;
+#endif
+    u8 where_bitfield = 0;
     int bx;
     int bz;
     int i;
@@ -1091,9 +1101,32 @@ extern void mFI_BGDisplayListRefresh(xyz_t wpos) {
     int num;
     int temp;
 
-    disp_bitfield = 0;
-    where_bitfield = 0;
     Common_Set(remove_cut_tree_info_bitfield, 0);
+
+#ifdef PC_ENHANCEMENTS
+    int max_x = mFI_GetBlockXMax();
+    int max_z = mFI_GetBlockZMax();
+
+    if (max_x > 1 || max_z > 1) {
+        int x, z;
+        /* Register all acres with foreground items/trees (in town: rows 1..6, cols 1..5) */
+        for (z = 1; z < max_z && z <= 6; z++) {
+            for (x = 1; x < max_x && x <= 5; x++) {
+                if (mFI_BlockCheck(x, z)) {
+                    num = mFI_GetBlockNum(x, z);
+                    if (g_fdinfo->block_info[num].bg_info.bg_id.combination_type != BG_TYPE_292) {
+                        mFI_BGDispMake(&disp_bitfield, x, z);
+                    }
+                }
+            }
+        }
+    } else {
+        /* Indoor room */
+        if (mFI_Wpos2BlockNum(&bx, &bz, wpos)) {
+            mFI_BGDispMake(&disp_bitfield, bx, bz);
+        }
+    }
+#else
     if (mFI_Wpos2BlockNum(&bx, &bz, wpos)) {
         num = mFI_GetBlockNum(bx, bz);
 
@@ -1145,6 +1178,7 @@ extern void mFI_BGDisplayListRefresh(xyz_t wpos) {
             }
         }
     }
+#endif
 
     for (i = 0; i < mFM_VISIBLE_BLOCK_NUM; i++) {
         if (((disp_bitfield >> i) & 1) != 1) {
@@ -1506,8 +1540,13 @@ extern int mFI_GetItemTable_NoReset(mFI_item_table_c* item_table, xyz_t wpos) {
     mFM_field_draw_info_c* bg_disp = mFI_BGDisplayListTop();
     int t_no;
     u8 _num = 0;
+#ifdef PC_ENHANCEMENTS
+    u32 _bitfield = 0;
+    u32 clear_tree_cut_bitfield = 0;
+#else
     u8 _bitfield = 0;
     u8 clear_tree_cut_bitfield = 0;
+#endif
     int bx;
     int bz;
     int block_x_tbl[mFM_VISIBLE_BLOCK_NUM];
@@ -1534,10 +1573,10 @@ extern int mFI_GetItemTable_NoReset(mFI_item_table_c* item_table, xyz_t wpos) {
                 if (bg_disp->block_x == bx_near) {
                     mFI_SetBlockTable(&item_table->block_info_tbl[t_no], bx_near, bz);
                     _num++;
-                    _bitfield |= (1 << i);
+                    _bitfield |= (1U << i);
 
                     if ((Common_Get(remove_cut_tree_info_bitfield) >> i) & 1) {
-                        clear_tree_cut_bitfield |= (1 << t_no);
+                        clear_tree_cut_bitfield |= (1U << t_no);
                     }
 
                     break;
@@ -1559,7 +1598,7 @@ extern int mFI_GetItemTable_NoReset(mFI_item_table_c* item_table, xyz_t wpos) {
             mFI_SetBlockTable(&item_table->block_info_tbl[_num], bg_disp->block_x, bg_disp->block_z);
 
             if ((Common_Get(remove_cut_tree_info_bitfield) >> i) & 1) {
-                clear_tree_cut_bitfield |= (1 << _num);
+                clear_tree_cut_bitfield |= (1U << _num);
             }
 
             _num++;
