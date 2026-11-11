@@ -197,16 +197,21 @@ void pc_touch_note_event(const SDL_Event* e) {
     }
 }
 
+static GAME_PLAY* get_game_play(void) {
+    if (gamePT == NULL || gamePT->exec != play_main) return NULL;
+    return (GAME_PLAY*)gamePT;
+}
+
 static int message_open(void) {
+    if (get_game_play() == NULL) return 0;
     mMsg_Window_c* w = mMsg_Get_base_window_p();
     return w != NULL && mMsg_Check_main_hide(w) == FALSE;
 }
 
 static int submenu_open(void) {
-    GAME_PLAY* play;
-    if (gamePT == NULL) return 0;
-    play = (GAME_PLAY*)gamePT;
-    return play->submenu.menu_type != 0;
+    GAME_PLAY* play = get_game_play();
+    if (play == NULL) return 0;
+    return play->submenu.menu_type != 0 && play->submenu.overlay != NULL;
 }
 
 static int keys_up(void) {
@@ -374,7 +379,7 @@ static void hud_build(Hud* h) {
     }
 
     h->choice_n = 0;
-    {
+    if (get_game_play() != NULL) {
         mChoice_c* choice = mChoice_Get_base_window_p();
         int nchoice = 0;
         if (choice != NULL && mChoice_check_main_normal(choice)) nchoice = choice->data.choice_num;
@@ -405,7 +410,7 @@ static void hud_build(Hud* h) {
     }
 
     h->show_sub_tabs = 0;
-    if (submenu_open() && !h->show_keys && h->choice_n == 0) {
+    if (get_game_play() != NULL && submenu_open() && !h->show_keys && h->choice_n == 0) {
         h->show_sub_tabs = 1;
         h->sub_tab_n = 4;
         h->sub_tab_id[0] = 0; /* Items */
@@ -488,20 +493,18 @@ static int classify(float x, float y, Hud* h, int* key) {
 }
 
 static int can_steer(void) {
-    GAME_PLAY* play;
-    if (gamePT == NULL || message_open() || g_pc_paused || g_pc_title_main_menu_visible) return 0;
+    GAME_PLAY* play = get_game_play();
+    if (play == NULL || message_open() || g_pc_paused || g_pc_title_main_menu_visible) return 0;
     if (pc_settings_menu_active() || pc_play_online_menu_active() || pc_creator_menu_active()) return 0;
-    play = (GAME_PLAY*)gamePT;
     if (play->submenu.menu_type != 0 || play->submenu.start_refuse) return 0;
     return 1;
 }
 
 static int steer_toward(float tx, float tz, signed char* stick_x, signed char* stick_y) {
-    GAME_PLAY* play;
+    GAME_PLAY* play = get_game_play();
     PLAYER_ACTOR* player;
     float px, pz, dx, dz, dist, fx, fz, fl, rx, rz, sx, sy, mag;
-    if (!can_steer() || gamePT == NULL) return 0;
-    play = (GAME_PLAY*)gamePT;
+    if (!can_steer() || play == NULL) return 0;
     player = get_player_actor_withoutCheck(play);
     if (player == NULL) return 0;
     px = player->actor_class.world.position.x;
@@ -561,11 +564,10 @@ static int steer_toward(float tx, float tz, signed char* stick_x, signed char* s
 }
 
 static int tap_to_world(float wx, float wy, float* out_x, float* out_z) {
-    GAME_PLAY* play;
+    GAME_PLAY* play = get_game_play();
     PLAYER_ACTOR* player;
     float fov, aspect, nx, ny, tan_y, fx, fy, fz, fl, rx, rz, ux, uy, uz, dx, dy, dz, dl, t, py;
-    if (!in_picture(wx, wy) || gamePT == NULL) return 0;
-    play = (GAME_PLAY*)gamePT;
+    if (!in_picture(wx, wy) || play == NULL) return 0;
     player = get_player_actor_withoutCheck(play);
     if (player == NULL) return 0;
     fov = play->camera.perspective.fov_y;
@@ -601,13 +603,12 @@ static int tap_to_world(float wx, float wy, float* out_x, float* out_z) {
 
 /* "npc", "item", or "ground". An NPC wins when one is standing on the point. */
 static const char* ground_kind(float wx, float wz) {
-    GAME_PLAY* play;
+    GAME_PLAY* play = get_game_play();
     PLAYER_ACTOR* player;
     xyz_t at;
     mActor_name_t* fg;
     int i;
-    if (gamePT == NULL) return "ground";
-    play = (GAME_PLAY*)gamePT;
+    if (play == NULL) return "ground";
     player = get_player_actor_withoutCheck(play);
     if (player == NULL) return "ground";
     if (play->actor_info.list[ACTOR_PART_NPC].actor != NULL) {
@@ -679,20 +680,20 @@ static int submenu_hand_is_empty(Submenu* submenu) {
 }
 
 static void refresh_action_label(void) {
-    GAME_PLAY* play;
+    GAME_PLAY* play = get_game_play();
     PLAYER_ACTOR* player;
     xyz_t ahead;
     mActor_name_t* fg;
     int i;
     snprintf(s_action, sizeof(s_action), "A");
+    if (play == NULL) return;
     if (message_open()) { snprintf(s_action, sizeof(s_action), "Next"); return; }
     if (submenu_open()) {
-        GAME_PLAY* pl = (GAME_PLAY*)gamePT;
-        Submenu* sm = (pl != NULL) ? &pl->submenu : NULL;
-        Submenu_Overlay_c* ov = (sm != NULL) ? sm->overlay : NULL;
+        Submenu* sm = &play->submenu;
+        Submenu_Overlay_c* ov = sm->overlay;
         mTG_Ovl_c* tovl = (ov != NULL) ? ov->tag_ovl : NULL;
         mTG_tag_c* tag = (tovl != NULL && tovl->sel_tag_idx >= 0 && tovl->sel_tag_idx < mTG_TAG_NUM) ? &tovl->tags[tovl->sel_tag_idx] : NULL;
-        if (sm != NULL && !submenu_hand_is_empty(sm)) {
+        if (!submenu_hand_is_empty(sm)) {
             snprintf(s_action, sizeof(s_action), "Drop");
             return;
         }
@@ -707,8 +708,6 @@ static void refresh_action_label(void) {
         snprintf(s_action, sizeof(s_action), "OK");
         return;
     }
-    if (gamePT == NULL) return;
-    play = (GAME_PLAY*)gamePT;
     player = get_player_actor_withoutCheck(play);
     if (player == NULL) return;
     ahead = player->actor_class.world.position;
@@ -805,14 +804,13 @@ static int choice_is_up(void);
 static void note_tap(const char* kind);
 
 static void handle_sub_tab_tap(int tab_id) {
-    GAME_PLAY* play;
+    GAME_PLAY* play = get_game_play();
     Submenu* submenu;
     Submenu_Overlay_c* ovl;
     mTG_Ovl_c* tag_ovl;
     mTG_tag_c* tag;
 
-    if (gamePT == NULL) return;
-    play = (GAME_PLAY*)gamePT;
+    if (play == NULL) return;
     submenu = &play->submenu;
     ovl = submenu->overlay;
     if (ovl == NULL || ovl->tag_ovl == NULL) return;
@@ -867,7 +865,7 @@ static void handle_sub_tab_tap(int tab_id) {
 }
 
 static void on_submenu_tap(float x, float y) {
-    GAME_PLAY* play;
+    GAME_PLAY* play = get_game_play();
     Submenu* submenu;
     Submenu_Overlay_c* ovl;
     mTG_Ovl_c* tag_ovl;
@@ -875,14 +873,10 @@ static void on_submenu_tap(float x, float y) {
     float cw, ch_43, cx, cy_43, center_x, center_y, gx, gy;
     int hand_empty;
 
-    if (gamePT == NULL) return;
-    play = (GAME_PLAY*)gamePT;
+    if (play == NULL) return;
     submenu = &play->submenu;
     ovl = submenu->overlay;
-    if (ovl == NULL || ovl->tag_ovl == NULL) {
-        s_pulse_a = 1;
-        return;
-    }
+    if (ovl == NULL || ovl->tag_ovl == NULL) return;
     tag_ovl = ovl->tag_ovl;
     if (tag_ovl->sel_tag_idx < 0 || tag_ovl->sel_tag_idx >= mTG_TAG_NUM) {
         s_pulse_a = 1;
@@ -1177,6 +1171,7 @@ static void on_picture_release(float x, float y) {
 }
 
 static int choice_count_now(void) {
+    if (get_game_play() == NULL) return 0;
     mChoice_c* c = mChoice_Get_base_window_p();
     if (c == NULL || !mChoice_check_main_normal(c)) return 0;
     if (c->data.choice_num < 1) return 0;
@@ -1186,6 +1181,7 @@ static int choice_count_now(void) {
 /* True from the moment a choice window is on screen, including the appear
  * animation. A text-advance tap must not confirm the highlighted row. */
 static int choice_is_up(void) {
+    if (get_game_play() == NULL) return 0;
     mChoice_c* c = mChoice_Get_base_window_p();
     if (c == NULL || c->data.choice_num < 1) return 0;
     return c->main_index != mChoice_MAIN_HIDE;
@@ -1634,7 +1630,7 @@ static void info_line(char* buf, size_t n) {
     localtime_r(&now, &tm);
 #endif
     priv = Now_Private;
-    if (priv != NULL) {
+    if (priv != NULL && get_game_play() != NULL) {
         for (i = 0; i < mPr_POCKETS_SLOT_COUNT && i < 15; i++) {
             if (priv->inventory.pockets[i] != EMPTY_NO) filled++;
         }
