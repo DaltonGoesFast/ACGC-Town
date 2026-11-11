@@ -2937,6 +2937,14 @@ static int bg_item_common_culling_check(GAME_PLAY* play, ACTOR* actorx, xyz_t* p
     xyz_t camera_pos;
     f32 camera_w;
 
+#ifdef PC_ENHANCEMENTS
+    /* Generous margins so trees/scenery never pop in while within or near the viewport */
+    actorx->cull_width = 300.0f;
+    actorx->cull_height = 600.0f;
+    actorx->cull_radius = 300.0f;
+    actorx->cull_distance = 4000.0f;
+#endif
+
     Skin_Matrix_PrjMulVector(&play->projection_matrix, pos, &camera_pos, &camera_w);
     return Actor_draw_actor_no_culling_check2(actorx, &camera_pos, camera_w);
 }
@@ -2962,15 +2970,11 @@ static void bg_item_common_culling_check_loop(GAME_PLAY* play, ACTOR* actorx, bg
         Matrix_put(&draw_pos->mtxf);
         Matrix_Position(&ZeroVec, &pos);
 
-#ifdef PC_ENHANCEMENTS
-        draw_pos->cull_flag = FALSE;
-#else
         if (bg_item_common_culling_check(play, actorx, &pos) == TRUE) {
             draw_pos->cull_flag = FALSE;
         } else {
             draw_pos->cull_flag = TRUE;
         }
-#endif
 
         draw_pos += draw_pos->next_add_cnt;
     }
