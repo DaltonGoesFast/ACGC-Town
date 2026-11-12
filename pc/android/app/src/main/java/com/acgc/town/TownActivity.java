@@ -89,7 +89,15 @@ public class TownActivity extends SDLActivity {
     @Override
     protected String[] getArguments() {
         File rom = new File(getFilesDir(), "gafe01.iso");
+        String romPath = rom.isFile() ? rom.getAbsolutePath() : "";
+        android.content.Intent intent = getIntent();
+        if (intent != null && intent.hasExtra("args")) {
+            String[] extra = intent.getStringArrayExtra("args");
+            if (extra != null && extra.length > 0) {
+                return extra;
+            }
+        }
         if (!rom.isFile()) return new String[] { "--no-rom" };
-        return new String[] { "--rom", rom.getAbsolutePath() };
+        return new String[] { "--rom", romPath };
     }
 }

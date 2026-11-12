@@ -35,7 +35,8 @@
 #include "pc_wildlife_authority.h" /* T8 audit fix (Bug 3): pcwld_should_suppress_local_wildlife() --
                                      * see m_player_main_notice_rod.c_inc / m_player_main_notice_net.c_inc's
                                      * own catch-interception seams. */
-#include "pc_pvp_authority.h" /* player-vs-player tool hits: puppet filter (axe), victim reaction + attacker contact hooks */
+#include "pc_pvp_authority.h"
+#include "pc_bedroom.h" /* player-vs-player tool hits: puppet filter (axe), victim reaction + attacker contact hooks */
 static void Player_actor_pc_pvp_pre(ACTOR* actorx, GAME* game);
 static void Player_actor_pc_pvp_post(ACTOR* actorx, GAME* game);
 #endif

@@ -5,7 +5,9 @@
 #include "m_private.h"
 #ifdef TARGET_PC
 #include <stdio.h>
+#include <string.h>
 #include "pc_host_observer.h" /* --host-observer: pc_host_observer_active() */
+#include "pc_bedroom.h"
 #endif
 
 #define DEFAULT_ARRANGEMENT ((mHS_HOUSE3 << 6) | (mHS_HOUSE2 << 4) | (mHS_HOUSE1 << 2) | (mHS_HOUSE0 << 0))
@@ -122,9 +124,9 @@ extern int mHS_set_use(int player_no, int house_no) {
                  */
                 Save_Set(house_arrangement,
                          (((house_arrangement & mask) | /* Clear old values */
-                           (((house_arrangement >> plr_shift) & 3))
-                               << new_shift) |       /* move current player house idx to old player house idx */
-                          (house_no << plr_shift))); /* set current player new house idx */
+                            (((house_arrangement >> plr_shift) & 3))
+                                << new_shift) |       /* move current player house idx to old player house idx */
+                           (house_no << plr_shift))); /* set current player new house idx */
             }
 
             mHm_InitHomeInfo(Save_Get(homes + house_no), player_no);
@@ -134,3 +136,22 @@ extern int mHS_set_use(int player_no, int house_no) {
 
     return res;
 }
+
+#ifdef TARGET_PC
+/* Phase 2: Boarding House Bedroom Slot Helpers */
+extern int mHS_bedroom_slot(int floor, int wing) {
+    return pc_bedroom_calc_room_idx(floor, wing);
+}
+
+extern int mHS_town_bedroom_id(int house_no, int floor, int wing) {
+    return pc_bedroom_calc_town_id(house_no, floor, wing);
+}
+
+extern int mHS_is_bedroom_owner(const char* uuid, int house_no, int floor, int wing) {
+    PCBedroomRecord* r = pc_bedroom_store_get(house_no, floor, wing);
+    if (r != NULL && r->claimed && uuid != NULL && uuid[0] != '\0') {
+        return (strcmp(r->owner_uuid, uuid) == 0);
+    }
+    return FALSE;
+}
+#endif

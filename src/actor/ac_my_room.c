@@ -19,7 +19,8 @@
 #include "sys_matrix.h"
 #include "m_rcp.h"
 #ifdef TARGET_PC
-#include "pc_net_game.h" /* pc_net_game_client_room_edit_locked() (own-room edit lock, see ac_my_room_msg_ctrl.c_inc / ac_my_room_move.c_inc) */
+#include "pc_net_game.h"
+#include "pc_bedroom.h" /* pc_net_game_client_room_edit_locked() (own-room edit lock, see ac_my_room_msg_ctrl.c_inc / ac_my_room_move.c_inc) */
 #endif
 
 enum {
@@ -335,6 +336,15 @@ static mActor_name_t* aMR_GetLayerTopFg(s16 layer) {
 static u64* aMR_GetBitSwitchTable(int layer, MY_ROOM_ACTOR* my_room) {
     mActor_name_t field_id = mFI_GetFieldId();
 
+#ifdef TARGET_PC
+    if (pc_bedroom_is_in_bedroom()) {
+        PCBedroomRecord* br = pc_bedroom_get_active_record();
+        if (br != NULL) {
+            return &(&br->flr.layer_main)[layer].ftr_switch;
+        }
+    }
+#endif
+
     if (my_room->scene == SCENE_COTTAGE_MY) {
         return &(&Save_Get(island).cottage.room.layer_main)[layer].ftr_switch;
     }
@@ -356,6 +366,15 @@ static u64* aMR_GetBitSwitchTable(int layer, MY_ROOM_ACTOR* my_room) {
 
 static u32* aMR_GetHaniwaStepSaveData(s16 layer, MY_ROOM_ACTOR* my_room) {
     mActor_name_t field_id = mFI_GetFieldId();
+
+#ifdef TARGET_PC
+    if (pc_bedroom_is_in_bedroom()) {
+        PCBedroomRecord* br = pc_bedroom_get_active_record();
+        if (br != NULL) {
+            return (&br->flr.layer_main)[layer].haniwa_step;
+        }
+    }
+#endif
 
     if (my_room->scene == SCENE_COTTAGE_MY) {
         return (&Save_Get(island).cottage.room.layer_main)[layer].haniwa_step;

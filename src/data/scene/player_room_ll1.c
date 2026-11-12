@@ -13,7 +13,7 @@ extern Scene_Word_u player_room_ll1_info[] = {
     mSc_DATA_ARRANGE_FTR(48),                                  // Arrange furniture params
     mSc_DATA_CTRL_ACTORS(12, PLAYER_ROOM_LL1_ctrl_actor_data), // Control actors
     mSc_DATA_ACTORS(2, PLAYER_ROOM_LL1_actor_data),            // Player Data
-    mSc_DATA_OBJ_BANK(2, PLAYER_ROOM_LL1_object_bank),         // Required object banks
+    mSc_DATA_OBJ_BANK(3, PLAYER_ROOM_LL1_object_bank),         // Required object banks
     mSc_DATA_FIELDCT(mSc_ITEM_TYPE_DUMMY, 1, 0xA000, mSc_ROOM_TYPE_MY_ROOM,
                      FIELD_DRAW_TYPE_INDOORS), // Field construct params
     mSc_DATA_END(),                            // End of scene data
@@ -61,6 +61,7 @@ extern Actor_data PLAYER_ROOM_LL1_actor_data[] = {
 extern s16 PLAYER_ROOM_LL1_object_bank[] = {
     ACTOR_OBJ_BANK_ROOM_SUNSHINE, // 0
     ACTOR_OBJ_BANK_HOUSE_GOKI,           // 1
+    ACTOR_OBJ_BANK_12,                   // 2 (House Gyroid Ledger)
 };
 
 extern Door_data_c PLAYER_ROOM_LL1_door_data[] = {

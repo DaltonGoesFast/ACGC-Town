@@ -11,6 +11,7 @@
 #include "pc_crash.h"
 #include "pc_typing.h"
 #include "pc_chat.h"
+#include "pc_bedroom.h"
 
 extern int pc_creator_menu_active(void);
 extern void pc_creator_menu_pointer(float fx, float fy);
@@ -1418,6 +1419,20 @@ void pc_touch_apply(unsigned short* buttons, signed char* stick_x, signed char* 
     (void)wheel_hold; (void)emote_hold; (void)pointer_x; (void)pointer_y;
     if (s_title_life > 0 && --s_title_life == 0) s_title_valid = 0;
     refresh_action_label();
+    if (pc_bedroom_claim_prompt_active()) {
+        if (buttons != NULL) {
+            if (*buttons & PAD_BUTTON_A) {
+                *buttons &= ~PAD_BUTTON_A;
+                pc_bedroom_confirm_claim();
+                return;
+            }
+            if (*buttons & PAD_BUTTON_B) {
+                *buttons &= ~PAD_BUTTON_B;
+                pc_bedroom_cancel_claim();
+                return;
+            }
+        }
+    }
     if (!pc_touch_enabled() || buttons == NULL || g_pc_window_w < 2) return;
     hud_build(&hud);
     if (s_cam_pulse_timer > 0) {
@@ -1450,6 +1465,34 @@ void pc_touch_apply(unsigned short* buttons, signed char* stick_x, signed char* 
         s_tap_ready = 0;
         tap_handled = 1;
         if (dx * dx + dy * dy < 64.0f * 64.0f) {
+            if (pc_bedroom_claim_prompt_active()) {
+                float W = (float)g_pc_window_w, H = (float)g_pc_window_h;
+                float ui = fmaxf(1.0f, H / 720.0f);
+                float cw = fminf(380.0f * ui, W * 0.90f);
+                float ch = 190.0f * ui;
+                float cx = W * 0.5f, cy = H * 0.5f;
+                float bh = 42.0f * ui;
+                float bw = (cw - 40.0f * ui) * 0.46f;
+                float btn_y = cy + 45.0f * ui;
+                float claim_cx = cx - bw * 0.55f;
+                float cancel_cx = cx + bw * 0.55f;
+                if (fabsf(s_tap_x - claim_cx) <= bw * 0.5f && fabsf(s_tap_y - btn_y) <= bh * 0.5f) {
+                    pc_touch_buzz();
+                    pc_bedroom_confirm_claim();
+                    return;
+                }
+                if (fabsf(s_tap_x - cancel_cx) <= bw * 0.5f && fabsf(s_tap_y - btn_y) <= bh * 0.5f) {
+                    pc_touch_buzz();
+                    pc_bedroom_cancel_claim();
+                    return;
+                }
+                if (fabsf(s_tap_x - cx) > cw * 0.5f || fabsf(s_tap_y - cy) > ch * 0.5f) {
+                    pc_touch_buzz();
+                    pc_bedroom_cancel_claim();
+                    return;
+                }
+                return;
+            }
             int th = 0, tk = -1;
             th = classify(s_tap_x, s_tap_y, &hud, &tk);
             if (th == HIT_SHEET_CLOSE) {
@@ -2016,20 +2059,47 @@ static void rect_raw(float x0, float y0, float x1, float y1, float r, float g, f
     vert(rx0, ry1, 0.0f, 0.0f, r, g, b, a);
 }
 
+static void corner_quarter_raw(float cx, float cy, float rad, float qx, float qy, float r, float g, float b, float a) {
+    float W = (float)g_pc_window_w, H = (float)g_pc_window_h;
+    float px0 = (qx < 0.0f) ? (cx - rad) : cx;
+    float px1 = (qx < 0.0f) ? cx : (cx + rad);
+    float py0 = (qy < 0.0f) ? (cy - rad) : cy;
+    float py1 = (qy < 0.0f) ? cy : (cy + rad);
+    float u0 = (qx < 0.0f) ? -1.0f : 0.0f;
+    float u1 = (qx < 0.0f) ? 0.0f : 1.0f;
+    float v0 = (qy < 0.0f) ? -1.0f : 0.0f;
+    float v1 = (qy < 0.0f) ? 0.0f : 1.0f;
+    float rx0 = px0 / W * 2.0f - 1.0f;
+    float rx1 = px1 / W * 2.0f - 1.0f;
+    float ry0 = 1.0f - py1 / H * 2.0f;
+    float ry1 = 1.0f - py0 / H * 2.0f;
+    vert(rx0, ry0, u0, v1, r, g, b, a);
+    vert(rx1, ry0, u1, v1, r, g, b, a);
+    vert(rx1, ry1, u1, v0, r, g, b, a);
+    vert(rx0, ry0, u0, v1, r, g, b, a);
+    vert(rx1, ry1, u1, v0, r, g, b, a);
+    vert(rx0, ry1, u0, v0, r, g, b, a);
+}
+
 static void round_rect(float x0, float y0, float x1, float y1, float rad, float r, float g, float b, float a) {
+    if (x1 <= x0 || y1 <= y0) return;
     if (rad * 2.0f > (x1 - x0)) rad = (x1 - x0) * 0.5f;
     if (rad * 2.0f > (y1 - y0)) rad = (y1 - y0) * 0.5f;
     if (rad < 2.0f) {
         rect_raw(x0, y0, x1, y1, r, g, b, a);
         return;
     }
-    rect_raw(x0 + rad, y0, x1 - rad, y1, r, g, b, a);
-    rect_raw(x0, y0 + rad, x0 + rad, y1 - rad, r, g, b, a);
-    rect_raw(x1 - rad, y0 + rad, x1, y1 - rad, r, g, b, a);
-    disc_raw(x0 + rad, y0 + rad, rad, r, g, b, a);
-    disc_raw(x1 - rad, y0 + rad, rad, r, g, b, a);
-    disc_raw(x0 + rad, y1 - rad, rad, r, g, b, a);
-    disc_raw(x1 - rad, y1 - rad, rad, r, g, b, a);
+    if (x1 - rad > x0 + rad) {
+        rect_raw(x0 + rad, y0, x1 - rad, y1, r, g, b, a);
+    }
+    if (y1 - rad > y0 + rad) {
+        rect_raw(x0, y0 + rad, x0 + rad, y1 - rad, r, g, b, a);
+        rect_raw(x1 - rad, y0 + rad, x1, y1 - rad, r, g, b, a);
+    }
+    corner_quarter_raw(x0 + rad, y0 + rad, rad, -1.0f, -1.0f, r, g, b, a);
+    corner_quarter_raw(x1 - rad, y0 + rad, rad,  1.0f, -1.0f, r, g, b, a);
+    corner_quarter_raw(x0 + rad, y1 - rad, rad, -1.0f,  1.0f, r, g, b, a);
+    corner_quarter_raw(x1 - rad, y1 - rad, rad,  1.0f,  1.0f, r, g, b, a);
 }
 
 static void pill(float cx, float cy, float w, float h, float r, float g, float b, float a) {
@@ -2124,10 +2194,10 @@ static void draw_text_ac(const char* s, float cx, float cy, float pix, float r, 
         if (s[i] != ' ') {
             int row = ac >> 4;
             int col = ac & 0x0F;
-            float u0 = (float)(col * 12) / 192.0f;
-            float u1 = (float)(col * 12 + cw) / 192.0f;
-            float v0 = (float)(row * 16) / 256.0f;
-            float v1 = (float)(row * 16 + 16) / 256.0f;
+            float u0 = ((float)(col * 12) + 0.5f) / 192.0f;
+            float u1 = ((float)(col * 12 + cw) - 0.5f) / 192.0f;
+            float v0 = ((float)(row * 16) + 0.5f) / 256.0f;
+            float v1 = ((float)(row * 16 + 16) - 0.5f) / 256.0f;
 
             float qx0 = cur_x;
             float qx1 = cur_x + gw;
@@ -2251,51 +2321,96 @@ static const char* get_item_category_name(mActor_name_t item) {
     return "ITEM";
 }
 
+static void mobile_sheet_compute_dims(float W, float H, float* out_ui, float* out_sheet_y0,
+                                      float* out_margin_x, float* out_gap_x, float* out_gap_y,
+                                      float* out_card_w, float* out_card_h,
+                                      float* out_header_h, float* out_tab_h,
+                                      float* out_detail_h, float* out_act_h) {
+    float ui = (W > 0.0f) ? (W / 1080.0f) : 1.0f;
+    float margin_x, gap_x, gap_y, card_w, card_h;
+    float header_h, tab_h, detail_h, act_h, fixed_h, sheet_content_h, max_sheet_h, sheet_y0;
+
+    if (ui < 0.55f) ui = 0.55f;
+    if (ui > 1.35f) ui = 1.35f;
+
+    margin_x = 14.0f * ui;
+    gap_x = 8.0f * ui;
+    gap_y = 8.0f * ui;
+    card_w = (W - 2.0f * margin_x - 4.0f * gap_x) / 5.0f;
+    card_h = card_w * 0.70f;
+    if (card_h < 84.0f * ui) card_h = 84.0f * ui;
+
+    header_h = 48.0f * ui;
+    tab_h = 48.0f * ui;
+    detail_h = 74.0f * ui;
+    act_h = 58.0f * ui;
+
+    fixed_h = 26.0f * ui /* top handle zone */
+            + header_h + 10.0f * ui
+            + tab_h + 10.0f * ui
+            + 2.0f * gap_y + 10.0f * ui
+            + detail_h + 10.0f * ui
+            + act_h + 18.0f * ui /* bottom margin */;
+
+    max_sheet_h = H * 0.48f;
+    if (fixed_h + 3.0f * card_h > max_sheet_h) {
+        float avail_cards = (max_sheet_h - fixed_h) / 3.0f;
+        if (avail_cards < 72.0f * ui) avail_cards = 72.0f * ui;
+        card_h = avail_cards;
+    }
+
+    sheet_content_h = fixed_h + 3.0f * card_h;
+    sheet_y0 = H - sheet_content_h;
+    if (sheet_y0 < H * 0.44f) sheet_y0 = H * 0.44f;
+
+    if (out_ui) *out_ui = ui;
+    if (out_sheet_y0) *out_sheet_y0 = sheet_y0;
+    if (out_margin_x) *out_margin_x = margin_x;
+    if (out_gap_x) *out_gap_x = gap_x;
+    if (out_gap_y) *out_gap_y = gap_y;
+    if (out_card_w) *out_card_w = card_w;
+    if (out_card_h) *out_card_h = card_h;
+    if (out_header_h) *out_header_h = header_h;
+    if (out_tab_h) *out_tab_h = tab_h;
+    if (out_detail_h) *out_detail_h = detail_h;
+    if (out_act_h) *out_act_h = act_h;
+}
+
+int pc_touch_sheet_top_y(void) {
+    float sheet_y0;
+    if (g_pc_window_w < 2 || g_pc_window_h < 2) return 0;
+    if (!pc_touch_enabled() || !g_pc_layout_portrait || !submenu_open()) return 0;
+    mobile_sheet_compute_dims((float)g_pc_window_w, (float)g_pc_window_h,
+                              NULL, &sheet_y0, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL);
+    return (int)sheet_y0;
+}
+
 static void mobile_sheet_layout(void) {
     float W = (float)g_pc_window_w, H = (float)g_pc_window_h;
-    float sheet_y0, tab_h, header_h, act_h, detail_h;
+    float ui, sheet_y0, tab_h, header_h, act_h, detail_h;
     float margin_x, gap_x, gap_y, card_w, card_h, cur_y;
     int c, r, i;
 
-    if (!g_pc_layout_portrait) {
-        s_sheet.active = 0;
-        return;
-    }
-    if (!submenu_open()) {
+    if (!g_pc_layout_portrait || pc_creator_menu_active()) {
         s_sheet.active = 0;
         s_sheet.swap_mode = 0;
         return;
+    }
+    {
+        GAME_PLAY* play = get_game_play();
+        if (!submenu_open() || play == NULL || play->submenu.overlay == NULL || play->submenu.overlay->inventory_ovl == NULL) {
+            s_sheet.active = 0;
+            s_sheet.swap_mode = 0;
+            return;
+        }
     }
     s_sheet.active = 1;
     if (s_sheet.sel_slot < 0 || s_sheet.sel_slot >= 15) {
         s_sheet.sel_slot = 0;
     }
 
-    margin_x = 12.0f;
-    gap_x = 8.0f;
-    gap_y = 10.0f;
-    card_w = (W - 2.0f * margin_x - 4.0f * gap_x) / 5.0f;
-
-    /* Responsive card height based on screen height */
-    card_h = (H * 0.65f - 350.0f) / 3.0f;
-    if (card_h > 230.0f) card_h = 230.0f;
-    if (card_h < 130.0f) card_h = 130.0f;
-
-    act_h = 58.0f;
-    detail_h = (card_h > 180.0f) ? 92.0f : 78.0f;
-    tab_h = 46.0f;
-    header_h = 44.0f;
-
-    /* Total sheet height from top handle to bottom */
-    float sheet_content_h = 24.0f /* top handle */
-                          + header_h + 12.0f
-                          + tab_h + 12.0f
-                          + (3.0f * card_h + 2.0f * gap_y) + 12.0f
-                          + detail_h + 12.0f
-                          + act_h + 22.0f /* bottom margin */;
-
-    sheet_y0 = H - sheet_content_h;
-    if (sheet_y0 < H * 0.28f) sheet_y0 = H * 0.28f;
+    mobile_sheet_compute_dims(W, H, &ui, &sheet_y0, &margin_x, &gap_x, &gap_y,
+                              &card_w, &card_h, &header_h, &tab_h, &detail_h, &act_h);
 
     s_sheet.sheet_x0 = 0.0f;
     s_sheet.sheet_y0 = sheet_y0;
@@ -2303,35 +2418,33 @@ static void mobile_sheet_layout(void) {
     s_sheet.sheet_y1 = H;
 
     /* Lay out elements from top to bottom */
-    cur_y = sheet_y0 + 18.0f;
+    cur_y = sheet_y0 + 26.0f * ui;
 
     /* Header */
-    s_sheet.close_w = 92.0f;
+    s_sheet.close_w = 98.0f * ui;
     s_sheet.close_h = header_h;
     s_sheet.close_cx = W - margin_x - s_sheet.close_w * 0.5f;
     s_sheet.close_cy = cur_y + header_h * 0.5f;
 
-    s_sheet.bells_w = 140.0f;
+    s_sheet.bells_w = 126.0f * ui;
     s_sheet.bells_h = header_h;
-    s_sheet.bells_cx = s_sheet.close_cx - s_sheet.close_w * 0.5f - 10.0f - s_sheet.bells_w * 0.5f;
+    s_sheet.bells_cx = s_sheet.close_cx - s_sheet.close_w * 0.5f - 10.0f * ui - s_sheet.bells_w * 0.5f;
     s_sheet.bells_cy = cur_y + header_h * 0.5f;
 
-    cur_y += header_h + 10.0f;
+    cur_y += header_h + 10.0f * ui;
 
     /* Category Tabs (4 tabs) */
     {
-        float tab_margin = 12.0f;
-        float tab_gap = 8.0f;
-        float tab_w = (W - 2.0f * tab_margin - 3.0f * tab_gap) / 4.0f;
+        float tab_w = (W - 2.0f * margin_x - 3.0f * gap_x) / 4.0f;
         float tab_cy = cur_y + tab_h * 0.5f;
         for (i = 0; i < 4; i++) {
-            s_sheet.tab_cx[i] = tab_margin + tab_w * 0.5f + (float)i * (tab_w + tab_gap);
+            s_sheet.tab_cx[i] = margin_x + tab_w * 0.5f + (float)i * (tab_w + gap_x);
             s_sheet.tab_cy[i] = tab_cy;
             s_sheet.tab_w[i] = tab_w;
             s_sheet.tab_h[i] = tab_h;
         }
     }
-    cur_y += tab_h + 10.0f;
+    cur_y += tab_h + 10.0f * ui;
 
     /* 15 Pocket Cards Grid */
     for (r = 0; r < 3; r++) {
@@ -2345,36 +2458,40 @@ static void mobile_sheet_layout(void) {
             s_sheet.card_y1[slot] = y0 + card_h;
         }
     }
-    cur_y += 3.0f * card_h + 2.0f * gap_y + 10.0f;
+    cur_y += 3.0f * card_h + 2.0f * gap_y + 10.0f * ui;
 
     /* Detail Banner */
     s_sheet.detail_x0 = margin_x;
     s_sheet.detail_x1 = W - margin_x;
     s_sheet.detail_y0 = cur_y;
     s_sheet.detail_y1 = cur_y + detail_h;
-    cur_y += detail_h + 10.0f;
+    cur_y += detail_h + 10.0f * ui;
 
     /* Action bar */
     {
         float act_cy = cur_y + act_h * 0.5f;
-        float act_w, act_margin, act_step;
+        float act_w, act_margin, act_gap, act_step;
         Private_c* priv = Now_Private;
         mActor_name_t item = EMPTY_NO;
 
-        if (act_cy + act_h * 0.5f > H - 8.0f) act_cy = H - 8.0f - act_h * 0.5f;
+        if (act_cy + act_h * 0.5f > H - 8.0f * ui) act_cy = H - 8.0f * ui - act_h * 0.5f;
 
         s_sheet.num_actions = 0;
         if (priv != NULL && s_sheet.sel_slot >= 0 && s_sheet.sel_slot < 15) {
             item = priv->inventory.pockets[s_sheet.sel_slot];
         }
 
-        if (s_sheet.swap_mode) {
+        if (s_sheet.current_tab != 0) {
+            s_sheet.action_labels[0] = "BACK TO POCKETS";
+            s_sheet.action_ids[0] = 5;
+            s_sheet.num_actions = 1;
+        } else if (s_sheet.swap_mode) {
             s_sheet.action_labels[0] = "SWAP HERE";
             s_sheet.action_ids[0] = 30;
             s_sheet.action_labels[1] = "CANCEL";
             s_sheet.action_ids[1] = 4;
             s_sheet.num_actions = 2;
-        } else if (item != EMPTY_NO) {
+        } else if (item != EMPTY_NO && item != 0) {
             if (ITEM_IS_TOOL(item) || (item >= ITM_MY_ORG_UMBRELLA0 && item <= ITM_MY_ORG_UMBRELLA7)) {
                 if (priv != NULL && priv->equipment == item) {
                     s_sheet.action_labels[0] = "UNEQUIP";
@@ -2403,24 +2520,25 @@ static void mobile_sheet_layout(void) {
             s_sheet.action_ids[1] = 2;
             s_sheet.action_labels[2] = "SWAP";
             s_sheet.action_ids[2] = 3;
-            s_sheet.action_labels[3] = "CLOSE";
-            s_sheet.action_ids[3] = 4;
-            s_sheet.num_actions = 4;
+            s_sheet.num_actions = 3;
         } else {
-            /* Empty slot */
-            s_sheet.action_labels[0] = "CLOSE";
-            s_sheet.action_ids[0] = 4;
-            s_sheet.num_actions = 1;
+            /* Empty slot: keep bar space for a muted hint without duplicate Close button */
+            s_sheet.num_actions = 0;
+            s_sheet.act_cy[0] = act_cy;
+            s_sheet.act_h[0] = act_h;
         }
 
-        act_margin = 14.0f;
-        act_w = (W - 2.0f * act_margin - (float)(s_sheet.num_actions - 1) * 10.0f) / (float)s_sheet.num_actions;
-        act_step = act_w + 10.0f;
-        for (i = 0; i < s_sheet.num_actions; i++) {
-            s_sheet.act_cx[i] = act_margin + act_w * 0.5f + (float)i * act_step;
-            s_sheet.act_cy[i] = act_cy;
-            s_sheet.act_w[i] = act_w;
-            s_sheet.act_h[i] = act_h;
+        if (s_sheet.num_actions > 0) {
+            act_margin = margin_x;
+            act_gap = 10.0f * ui;
+            act_w = (W - 2.0f * act_margin - (float)(s_sheet.num_actions - 1) * act_gap) / (float)s_sheet.num_actions;
+            act_step = act_w + act_gap;
+            for (i = 0; i < s_sheet.num_actions; i++) {
+                s_sheet.act_cx[i] = act_margin + act_w * 0.5f + (float)i * act_step;
+                s_sheet.act_cy[i] = act_cy;
+                s_sheet.act_w[i] = act_w;
+                s_sheet.act_h[i] = act_h;
+            }
         }
     }
 }
@@ -2428,8 +2546,9 @@ static void mobile_sheet_layout(void) {
 static int mobile_sheet_hit(float x, float y, int* key) {
     int i;
     if (!s_sheet.active) return HIT_NONE;
+    /* Let taps above the bottom sheet interact directly with the OG menu on top */
     if (y < s_sheet.sheet_y0) {
-        return HIT_SHEET_CLOSE;
+        return HIT_NONE;
     }
     if (x >= s_sheet.close_cx - s_sheet.close_w * 0.5f && x <= s_sheet.close_cx + s_sheet.close_w * 0.5f &&
         y >= s_sheet.close_cy - s_sheet.close_h * 0.5f && y <= s_sheet.close_cy + s_sheet.close_h * 0.5f) {
@@ -2453,11 +2572,13 @@ static int mobile_sheet_hit(float x, float y, int* key) {
             return HIT_SHEET_ACT;
         }
     }
-    for (i = 0; i < 15; i++) {
-        if (x >= s_sheet.card_x0[i] && x <= s_sheet.card_x1[i] &&
-            y >= s_sheet.card_y0[i] && y <= s_sheet.card_y1[i]) {
-            *key = i;
-            return HIT_SHEET_CARD;
+    if (s_sheet.current_tab == 0) {
+        for (i = 0; i < 15; i++) {
+            if (x >= s_sheet.card_x0[i] && x <= s_sheet.card_x1[i] &&
+                y >= s_sheet.card_y0[i] && y <= s_sheet.card_y1[i]) {
+                *key = i;
+                return HIT_SHEET_CARD;
+            }
         }
     }
     return HIT_SHEET_BODY;
@@ -2671,6 +2792,8 @@ static void mobile_sheet_handle_act(int act_id) {
             pc_touch_buzz();
             note_tap("sheet_close");
         }
+    } else if (act_id == 5) { /* BACK TO POCKETS */
+        mobile_sheet_handle_tab(0);
     }
 }
 
@@ -2719,45 +2842,45 @@ static void mobile_sheet_handle_tab(int tab_id) {
 
 static void mobile_sheet_draw(void) {
     float W = (float)g_pc_window_w, H = (float)g_pc_window_h;
+    float ui, margin_x;
     Private_c* priv = Now_Private;
     char buf[64];
     int i;
     if (!s_sheet.active || priv == NULL) return;
 
-    /* Semi-transparent frosted backdrop behind sheet to darken the 3D scene slightly */
-    rect_raw(0.0f, 0.0f, W, s_sheet.sheet_y0, 0.0f, 0.0f, 0.0f, 0.20f);
+    mobile_sheet_compute_dims(W, H, &ui, NULL, &margin_x, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL);
 
-    /* Shadow behind the top edge of sheet */
-    rect_raw(0.0f, s_sheet.sheet_y0 - 8.0f, W, s_sheet.sheet_y0, 0.02f, 0.03f, 0.02f, 0.25f);
+    /* Subtle drop shadow right above the top edge of the bottom sheet (do not dim the OG menu) */
+    rect_raw(0.0f, s_sheet.sheet_y0 - 10.0f * ui, W, s_sheet.sheet_y0, 0.02f, 0.03f, 0.02f, 0.22f);
 
     /* Sheet body: rounded top, creamy warm parchment */
-    round_rect(0.0f, s_sheet.sheet_y0, W, H + 40.0f, 26.0f, 0.96f, 0.95f, 0.92f, 0.99f);
+    round_rect(0.0f, s_sheet.sheet_y0, W, H + 40.0f * ui, 26.0f * ui, 0.96f, 0.95f, 0.92f, 0.99f);
 
     /* Mobile drawer top handle pill */
-    pill(W * 0.5f, s_sheet.sheet_y0 + 10.0f, 48.0f, 5.0f, 0.68f, 0.66f, 0.62f, 0.85f);
+    pill(W * 0.5f, s_sheet.sheet_y0 + 11.0f * ui, 52.0f * ui, 5.0f * ui, 0.68f, 0.66f, 0.62f, 0.85f);
 
-    /* Header: Player Name & Land (clean string without non-ASCII garbage) */
+    /* Header: Player Name & Land (preserve exact case, clean ASCII without garbage) */
     {
         char pname[16], lname[16];
         get_clean_string(priv->player_ID.player_name, 8, pname, sizeof(pname));
         get_clean_string(priv->player_ID.land_name, 8, lname, sizeof(lname));
-        if (pname[0] == 0) snprintf(pname, sizeof(pname), "PLAYER");
+        if (pname[0] == 0) snprintf(pname, sizeof(pname), "Player");
         if (lname[0] != 0) {
             snprintf(buf, sizeof(buf), "%s * %s", pname, lname);
         } else {
             snprintf(buf, sizeof(buf), "%s", pname);
         }
-        draw_str_left_raw(buf, 18.0f, s_sheet.close_cy, 3.2f, 0.22f, 0.26f, 0.24f, 1.0f, 22);
+        draw_text_ac(buf, margin_x + 4.0f * ui, s_sheet.close_cy, 3.3f * ui, 0.22f, 0.26f, 0.24f, 1.0f, 0, 22);
     }
 
     /* Bells button */
     pill_button_shadow(s_sheet.bells_cx, s_sheet.bells_cy, s_sheet.bells_w, s_sheet.bells_h, 0.98f, 0.82f, 0.20f, 1.0f);
     snprintf(buf, sizeof(buf), "$ %u", (unsigned int)priv->inventory.wallet);
-    draw_str_raw(buf, s_sheet.bells_cx, s_sheet.bells_cy, 2.7f, 0.18f, 0.16f, 0.05f, 1.0f, 14);
+    draw_str_raw(buf, s_sheet.bells_cx, s_sheet.bells_cy, 3.0f * ui, 0.18f, 0.16f, 0.05f, 1.0f, 14);
 
     /* Close button */
     pill_button_shadow(s_sheet.close_cx, s_sheet.close_cy, s_sheet.close_w, s_sheet.close_h, 0.92f, 0.40f, 0.35f, 1.0f);
-    draw_str_raw("CLOSE", s_sheet.close_cx, s_sheet.close_cy, 2.7f, 1.0f, 1.0f, 1.0f, 1.0f, 6);
+    draw_str_raw("CLOSE", s_sheet.close_cx, s_sheet.close_cy, 3.0f * ui, 1.0f, 1.0f, 1.0f, 1.0f, 6);
 
     /* Category Tabs */
     {
@@ -2768,10 +2891,10 @@ static void mobile_sheet_draw(void) {
             float tw = s_sheet.tab_w[i], th = s_sheet.tab_h[i];
             if (active) {
                 pill_button_shadow(cx, cy, tw, th, 0.28f, 0.70f, 0.46f, 1.0f);
-                draw_str_raw(tab_names[i], cx, cy, 2.8f, 1.0f, 1.0f, 1.0f, 1.0f, 8);
+                draw_str_raw(tab_names[i], cx, cy, 3.0f * ui, 1.0f, 1.0f, 1.0f, 1.0f, 8);
             } else {
                 pill_button_shadow(cx, cy, tw, th, 0.89f, 0.87f, 0.83f, 0.95f);
-                draw_str_raw(tab_names[i], cx, cy, 2.6f, 0.42f, 0.40f, 0.38f, 1.0f, 8);
+                draw_str_raw(tab_names[i], cx, cy, 2.8f * ui, 0.42f, 0.40f, 0.38f, 1.0f, 8);
             }
         }
     }
@@ -2789,23 +2912,26 @@ static void mobile_sheet_draw(void) {
 
             /* Selection / Swap highlight ring */
             if (s_sheet.swap_mode && s_sheet.swap_source == i) {
-                round_rect(x0 - 4.0f, y0 - 4.0f, x1 + 4.0f, y1 + 4.0f, 16.0f, 0.98f, 0.60f, 0.12f, 0.95f);
+                round_rect(x0 - 4.0f * ui, y0 - 4.0f * ui, x1 + 4.0f * ui, y1 + 4.0f * ui, 16.0f * ui, 0.98f, 0.60f, 0.12f, 0.95f);
             } else if (s_sheet.sel_slot == i) {
-                round_rect(x0 - 4.0f, y0 - 4.0f, x1 + 4.0f, y1 + 4.0f, 16.0f, 0.20f, 0.55f, 0.98f, 0.95f);
+                round_rect(x0 - 4.0f * ui, y0 - 4.0f * ui, x1 + 4.0f * ui, y1 + 4.0f * ui, 16.0f * ui, 0.20f, 0.55f, 0.98f, 0.95f);
             }
 
             if (item == EMPTY_NO || item == 0) {
                 /* Empty card */
-                round_rect(x0, y0, x1, y1, 14.0f, 0.92f, 0.91f, 0.88f, 0.75f);
-                draw_str_raw("EMPTY", cx, cy, 2.6f, 0.60f, 0.58f, 0.55f, 0.90f, 6);
+                round_rect(x0, y0, x1, y1, 13.0f * ui, 0.92f, 0.91f, 0.88f, 0.75f);
+                draw_str_raw("EMPTY", cx, cy, 2.7f * ui, 0.60f, 0.58f, 0.55f, 0.90f, 6);
             } else {
+                int badged = (priv->equipment == item || priv->cloth.item == item);
+                float text_cy = badged ? (cy - 4.0f * ui) : (cy + 3.0f * ui);
+
                 /* Filled card */
-                round_rect(x0 + 1.5f, y0 + 2.0f, x1 + 1.5f, y1 + 2.0f, 14.0f, 0.05f, 0.08f, 0.05f, 0.14f);
-                round_rect(x0, y0, x1, y1, 14.0f, 1.0f, 1.0f, 1.0f, 0.99f);
+                round_rect(x0 + 1.5f * ui, y0 + 2.0f * ui, x1 + 1.5f * ui, y1 + 2.0f * ui, 13.0f * ui, 0.05f, 0.08f, 0.05f, 0.14f);
+                round_rect(x0, y0, x1, y1, 13.0f * ui, 1.0f, 1.0f, 1.0f, 0.99f);
 
                 /* Category top bar */
                 get_item_category_color(item, &cr, &cg, &cb);
-                round_rect(x0 + 4.0f, y0 + 4.0f, x1 - 4.0f, y0 + 16.0f, 4.0f, cr, cg, cb, 0.95f);
+                round_rect(x0 + 5.0f * ui, y0 + 5.0f * ui, x1 - 5.0f * ui, y0 + 13.0f * ui, 4.0f * ui, cr, cg, cb, 0.95f);
 
                 /* Item name */
                 get_item_name(item, iname, sizeof(iname));
@@ -2817,20 +2943,20 @@ static void mobile_sheet_draw(void) {
                         memcpy(w1, iname, l1);
                         w1[l1] = 0;
                         snprintf(w2, sizeof(w2), "%s", sp + 1);
-                        draw_str_raw(w1, cx, cy - 13.0f, 2.8f, 0.16f, 0.18f, 0.16f, 1.0f, 12);
-                        draw_str_raw(w2, cx, cy + 13.0f, 2.8f, 0.16f, 0.18f, 0.16f, 1.0f, 12);
+                        draw_str_raw(w1, cx, text_cy - 12.0f * ui, 2.85f * ui, 0.16f, 0.18f, 0.16f, 1.0f, 12);
+                        draw_str_raw(w2, cx, text_cy + 12.0f * ui, 2.85f * ui, 0.16f, 0.18f, 0.16f, 1.0f, 12);
                     } else {
-                        draw_str_raw(iname, cx, cy, 2.9f, 0.16f, 0.18f, 0.16f, 1.0f, 13);
+                        draw_str_raw(iname, cx, text_cy, 2.95f * ui, 0.16f, 0.18f, 0.16f, 1.0f, 13);
                     }
                 }
 
                 /* Badges */
                 if (priv->equipment == item) {
-                    pill_button_shadow(cx, y1 - 18.0f, 62.0f, 22.0f, 0.28f, 0.75f, 0.45f, 1.0f);
-                    draw_str_raw("HELD", cx, y1 - 18.0f, 2.0f, 1.0f, 1.0f, 1.0f, 1.0f, 4);
+                    pill_button_shadow(cx, y1 - 14.0f * ui, 64.0f * ui, 20.0f * ui, 0.28f, 0.75f, 0.45f, 1.0f);
+                    draw_str_raw("HELD", cx, y1 - 14.0f * ui, 2.0f * ui, 1.0f, 1.0f, 1.0f, 1.0f, 4);
                 } else if (priv->cloth.item == item) {
-                    pill_button_shadow(cx, y1 - 18.0f, 62.0f, 22.0f, 0.96f, 0.52f, 0.30f, 1.0f);
-                    draw_str_raw("WORN", cx, y1 - 18.0f, 2.0f, 1.0f, 1.0f, 1.0f, 1.0f, 4);
+                    pill_button_shadow(cx, y1 - 14.0f * ui, 64.0f * ui, 20.0f * ui, 0.96f, 0.52f, 0.30f, 1.0f);
+                    draw_str_raw("WORN", cx, y1 - 14.0f * ui, 2.0f * ui, 1.0f, 1.0f, 1.0f, 1.0f, 4);
                 }
             }
         }
@@ -2842,38 +2968,38 @@ static void mobile_sheet_draw(void) {
             float dcx = (dx0 + dx1) * 0.5f, dcy = (dy0 + dy1) * 0.5f;
 
             if (s_sheet.swap_mode) {
-                round_rect(dx0 + 1.5f, dy0 + 2.0f, dx1 + 1.5f, dy1 + 2.0f, 14.0f, 0.05f, 0.08f, 0.05f, 0.15f);
-                round_rect(dx0, dy0, dx1, dy1, 14.0f, 0.98f, 0.78f, 0.20f, 0.98f);
-                draw_str_raw("SWAP MODE ACTIVE", dcx, dcy - 12.0f, 3.2f, 0.18f, 0.16f, 0.05f, 1.0f, 20);
-                draw_str_raw("TAP A SECOND SLOT TO SWAP ITEMS", dcx, dcy + 14.0f, 2.4f, 0.25f, 0.20f, 0.08f, 1.0f, 32);
+                round_rect(dx0 + 1.5f * ui, dy0 + 2.0f * ui, dx1 + 1.5f * ui, dy1 + 2.0f * ui, 14.0f * ui, 0.05f, 0.08f, 0.05f, 0.15f);
+                round_rect(dx0, dy0, dx1, dy1, 14.0f * ui, 0.98f, 0.78f, 0.20f, 0.98f);
+                draw_str_raw("SWAP MODE ACTIVE", dcx, dcy - 12.0f * ui, 3.2f * ui, 0.18f, 0.16f, 0.05f, 1.0f, 20);
+                draw_str_raw("TAP A SECOND SLOT TO SWAP ITEMS", dcx, dcy + 13.0f * ui, 2.5f * ui, 0.25f, 0.20f, 0.08f, 1.0f, 32);
             } else {
                 mActor_name_t sel_item = EMPTY_NO;
                 if (s_sheet.sel_slot >= 0 && s_sheet.sel_slot < 15) {
                     sel_item = priv->inventory.pockets[s_sheet.sel_slot];
                 }
-                round_rect(dx0 + 1.5f, dy0 + 2.0f, dx1 + 1.5f, dy1 + 2.0f, 14.0f, 0.05f, 0.08f, 0.05f, 0.12f);
-                round_rect(dx0, dy0, dx1, dy1, 14.0f, 1.0f, 1.0f, 1.0f, 0.98f);
+                round_rect(dx0 + 1.5f * ui, dy0 + 2.0f * ui, dx1 + 1.5f * ui, dy1 + 2.0f * ui, 14.0f * ui, 0.05f, 0.08f, 0.05f, 0.12f);
+                round_rect(dx0, dy0, dx1, dy1, 14.0f * ui, 1.0f, 1.0f, 1.0f, 0.98f);
 
                 if (sel_item == EMPTY_NO || sel_item == 0) {
-                    pill(dx0 + 54.0f, dcy, 76.0f, 28.0f, 0.78f, 0.78f, 0.78f, 1.0f);
+                    pill(dx0 + 58.0f * ui, dcy, 84.0f * ui, 30.0f * ui, 0.78f, 0.78f, 0.78f, 1.0f);
                     snprintf(buf, sizeof(buf), "SLOT %d", s_sheet.sel_slot + 1);
-                    draw_str_raw(buf, dx0 + 54.0f, dcy, 2.2f, 1.0f, 1.0f, 1.0f, 1.0f, 8);
-                    draw_str_left_raw("EMPTY POCKET SLOT", dx0 + 106.0f, dcy, 3.0f, 0.50f, 0.50f, 0.50f, 1.0f, 20);
+                    draw_str_raw(buf, dx0 + 58.0f * ui, dcy, 2.4f * ui, 1.0f, 1.0f, 1.0f, 1.0f, 8);
+                    draw_str_left_raw("EMPTY POCKET SLOT", dx0 + 114.0f * ui, dcy, 3.1f * ui, 0.50f, 0.50f, 0.50f, 1.0f, 20);
                 } else {
                     float cr, cg, cb;
                     char iname[32];
                     get_item_category_color(sel_item, &cr, &cg, &cb);
-                    pill(dx0 + 56.0f, dcy, 80.0f, 28.0f, cr, cg, cb, 1.0f);
-                    draw_str_raw(get_item_category_name(sel_item), dx0 + 56.0f, dcy, 2.2f, 1.0f, 1.0f, 1.0f, 1.0f, 10);
+                    pill(dx0 + 62.0f * ui, dcy, 94.0f * ui, 30.0f * ui, cr, cg, cb, 1.0f);
+                    draw_str_raw(get_item_category_name(sel_item), dx0 + 62.0f * ui, dcy, 2.4f * ui, 1.0f, 1.0f, 1.0f, 1.0f, 10);
                     get_item_name(sel_item, iname, sizeof(iname));
-                    draw_str_left_raw(iname, dx0 + 110.0f, dcy, 3.2f, 0.16f, 0.18f, 0.16f, 1.0f, 18);
+                    draw_str_left_raw(iname, dx0 + 122.0f * ui, dcy, 3.3f * ui, 0.16f, 0.18f, 0.16f, 1.0f, 18);
 
                     if (priv->equipment == sel_item) {
-                        pill_button_shadow(dx1 - 56.0f, dcy, 86.0f, 26.0f, 0.28f, 0.75f, 0.45f, 1.0f);
-                        draw_str_raw("EQUIPPED", dx1 - 56.0f, dcy, 2.0f, 1.0f, 1.0f, 1.0f, 1.0f, 9);
+                        pill_button_shadow(dx1 - 58.0f * ui, dcy, 92.0f * ui, 28.0f * ui, 0.28f, 0.75f, 0.45f, 1.0f);
+                        draw_str_raw("EQUIPPED", dx1 - 58.0f * ui, dcy, 2.2f * ui, 1.0f, 1.0f, 1.0f, 1.0f, 9);
                     } else if (priv->cloth.item == sel_item) {
-                        pill_button_shadow(dx1 - 56.0f, dcy, 86.0f, 26.0f, 0.96f, 0.52f, 0.30f, 1.0f);
-                        draw_str_raw("WORN", dx1 - 56.0f, dcy, 2.0f, 1.0f, 1.0f, 1.0f, 1.0f, 5);
+                        pill_button_shadow(dx1 - 58.0f * ui, dcy, 92.0f * ui, 28.0f * ui, 0.96f, 0.52f, 0.30f, 1.0f);
+                        draw_str_raw("WORN", dx1 - 58.0f * ui, dcy, 2.2f * ui, 1.0f, 1.0f, 1.0f, 1.0f, 5);
                     }
                 }
             }
@@ -2882,62 +3008,69 @@ static void mobile_sheet_draw(void) {
         /* Letters Tab (10 letter slots) */
         for (i = 0; i < 10; i++) {
             int c = i % 2, r = i / 2;
-            float margin_x = 16.0f, gap_x = 10.0f, gap_y = 10.0f;
+            float gap_x = 10.0f * ui, gap_y = 8.0f * ui;
             float grid_top = s_sheet.card_y0[0];
+            float grid_bot = s_sheet.detail_y1;
             float lw = (W - 2.0f * margin_x - gap_x) / 2.0f;
-            float lh = (s_sheet.card_y1[14] - grid_top - 4.0f * gap_y) / 5.0f;
+            float lh = (grid_bot - grid_top - 4.0f * gap_y) / 5.0f;
             float x0 = margin_x + (float)c * (lw + gap_x);
             float y0 = grid_top + (float)r * (lh + gap_y);
             float x1 = x0 + lw, y1 = y0 + lh;
             float cx = (x0 + x1) * 0.5f, cy = (y0 + y1) * 0.5f;
             Mail_c* m = &priv->mail[i];
 
-            round_rect(x0 + 1.5f, y0 + 2.0f, x1 + 1.5f, y1 + 2.0f, 12.0f, 0.05f, 0.08f, 0.05f, 0.14f);
-            round_rect(x0, y0, x1, y1, 12.0f, 1.0f, 1.0f, 1.0f, 0.98f);
-            round_rect(x0 + 3.0f, y0 + 3.0f, x1 - 3.0f, y0 + 12.0f, 3.0f, 0.95f, 0.50f, 0.45f, 0.95f);
+            round_rect(x0 + 1.5f * ui, y0 + 2.0f * ui, x1 + 1.5f * ui, y1 + 2.0f * ui, 12.0f * ui, 0.05f, 0.08f, 0.05f, 0.14f);
+            round_rect(x0, y0, x1, y1, 12.0f * ui, 1.0f, 1.0f, 1.0f, 0.98f);
+            round_rect(x0 + 4.0f * ui, y0 + 4.0f * ui, x1 - 4.0f * ui, y0 + 11.0f * ui, 3.0f * ui, 0.95f, 0.50f, 0.45f, 0.95f);
 
             char sname[16];
             get_clean_string(m->header.sender.personalID.player_name, 8, sname, sizeof(sname));
             if (sname[0] != 0) {
-                snprintf(buf, sizeof(buf), "FROM: %s", sname);
-                draw_str_raw(buf, cx, cy, 2.6f, 0.16f, 0.18f, 0.16f, 1.0f, 18);
+                snprintf(buf, sizeof(buf), "From: %s", sname);
+                draw_text_ac(buf, cx, cy + 2.0f * ui, 2.7f * ui, 0.16f, 0.18f, 0.16f, 1.0f, 1, 18);
                 if (m->present != EMPTY_NO) {
-                    pill_button_shadow(x1 - 32.0f, cy, 54.0f, 22.0f, 0.96f, 0.78f, 0.18f, 1.0f);
-                    draw_str_raw("GIFT", x1 - 32.0f, cy, 2.0f, 0.20f, 0.18f, 0.05f, 1.0f, 4);
+                    pill_button_shadow(x1 - 34.0f * ui, cy + 2.0f * ui, 54.0f * ui, 22.0f * ui, 0.96f, 0.78f, 0.18f, 1.0f);
+                    draw_str_raw("GIFT", x1 - 34.0f * ui, cy + 2.0f * ui, 2.1f * ui, 0.20f, 0.18f, 0.05f, 1.0f, 4);
                 }
             } else {
-                draw_str_raw("EMPTY LETTER", cx, cy, 2.4f, 0.60f, 0.58f, 0.55f, 0.85f, 14);
+                draw_str_raw("EMPTY LETTER", cx, cy + 2.0f * ui, 2.5f * ui, 0.60f, 0.58f, 0.55f, 0.85f, 14);
             }
         }
     } else {
         /* Fish / Bugs Tab Info */
-        float cx = W * 0.5f, cy = (s_sheet.card_y0[0] + s_sheet.card_y1[14]) * 0.5f;
-        draw_str_raw(s_sheet.current_tab == 2 ? "FISH COLLECTION" : "INSECT COLLECTION", cx, cy - 24.0f, 3.4f, 0.20f, 0.24f, 0.20f, 1.0f, 20);
-        draw_str_raw("BROWSE COLLECTION IN VIEWPORT ABOVE", cx, cy + 24.0f, 2.6f, 0.45f, 0.45f, 0.45f, 1.0f, 36);
+        float cx = W * 0.5f, cy = (s_sheet.card_y0[0] + s_sheet.detail_y1) * 0.5f;
+        draw_str_raw(s_sheet.current_tab == 2 ? "FISH COLLECTION" : "INSECT COLLECTION", cx, cy - 22.0f * ui, 3.5f * ui, 0.20f, 0.24f, 0.20f, 1.0f, 20);
+        draw_str_raw("BROWSE COLLECTION IN OG MENU ABOVE", cx, cy + 22.0f * ui, 2.7f * ui, 0.45f, 0.45f, 0.45f, 1.0f, 36);
     }
 
     /* Action Bar Buttons */
-    for (i = 0; i < s_sheet.num_actions; i++) {
-        float cx = s_sheet.act_cx[i], cy = s_sheet.act_cy[i];
-        float aw = s_sheet.act_w[i], ah = s_sheet.act_h[i];
-        int aid = s_sheet.action_ids[i];
-        float br = 0.32f, bg = 0.68f, bb = 0.48f, tr = 1.0f, tg = 1.0f, tb = 1.0f;
+    if (s_sheet.num_actions == 0 && s_sheet.current_tab == 0) {
+        float cy = s_sheet.act_cy[0], ah = s_sheet.act_h[0];
+        round_rect(margin_x, cy - ah * 0.5f, W - margin_x, cy + ah * 0.5f, ah * 0.5f, 0.90f, 0.89f, 0.85f, 0.90f);
+        draw_str_raw("TAP A FILLED ITEM FOR ACTIONS", W * 0.5f, cy, 2.8f * ui, 0.50f, 0.48f, 0.45f, 1.0f, 32);
+    } else {
+        for (i = 0; i < s_sheet.num_actions; i++) {
+            float cx = s_sheet.act_cx[i], cy = s_sheet.act_cy[i];
+            float aw = s_sheet.act_w[i], ah = s_sheet.act_h[i];
+            int aid = s_sheet.action_ids[i];
+            float br = 0.32f, bg = 0.68f, bb = 0.48f, tr = 1.0f, tg = 1.0f, tb = 1.0f;
 
-        if (aid == 10 || aid == 12 || aid == 13 || aid == 15 || aid == 16 || aid == 30) {
-            br = 0.20f; bg = 0.72f; bb = 0.42f;
-        } else if (aid == 2) {
-            br = 0.90f; bg = 0.35f; bb = 0.32f;
-        } else if (aid == 3) {
-            br = 0.96f; bg = 0.68f; bb = 0.18f;
-            tr = tg = tb = 0.15f;
-        } else if (aid == 11) {
-            br = 0.45f; bg = 0.55f; bb = 0.62f;
-        } else {
-            br = 0.52f; bg = 0.55f; bb = 0.58f;
+            if (aid == 10 || aid == 12 || aid == 13 || aid == 15 || aid == 16 || aid == 30) {
+                br = 0.20f; bg = 0.72f; bb = 0.42f;
+            } else if (aid == 2) {
+                br = 0.90f; bg = 0.35f; bb = 0.32f;
+            } else if (aid == 3) {
+                br = 0.96f; bg = 0.68f; bb = 0.18f;
+                tr = tg = tb = 0.15f;
+            } else if (aid == 11) {
+                br = 0.45f; bg = 0.55f; bb = 0.62f;
+            } else {
+                br = 0.52f; bg = 0.55f; bb = 0.58f;
+            }
+
+            pill_button_shadow(cx, cy, aw, ah, br, bg, bb, 1.0f);
+            draw_str_raw(s_sheet.action_labels[i], cx, cy, 3.1f * ui, tr, tg, tb, 1.0f, 16);
         }
-
-        pill_button_shadow(cx, cy, aw, ah, br, bg, bb, 1.0f);
-        draw_str_raw(s_sheet.action_labels[i], cx, cy, 3.0f, tr, tg, tb, 1.0f, 12);
     }
 }
 
@@ -2979,10 +3112,39 @@ static const char* action_word(void) {
     return "Action";
 }
 
+static void pc_bedroom_draw_claim_modal(void) {
+    if (!pc_bedroom_claim_prompt_active()) return;
+    float W = (float)g_pc_window_w, H = (float)g_pc_window_h;
+    float ui = fmaxf(1.0f, H / 720.0f);
+    float cw = fminf(380.0f * ui, W * 0.90f);
+    float ch = 190.0f * ui;
+    float cx = W * 0.5f, cy = H * 0.5f;
+    float x0 = cx - cw * 0.5f, y0 = cy - ch * 0.5f;
+    float x1 = cx + cw * 0.5f, y1 = cy + ch * 0.5f;
+    float bh = 42.0f * ui;
+    float bw = (cw - 40.0f * ui) * 0.46f;
+    float btn_y = cy + 45.0f * ui;
+    float claim_cx = cx - bw * 0.55f;
+    float cancel_cx = cx + bw * 0.55f;
+    float claim_x0 = claim_cx - bw * 0.5f, claim_x1 = claim_cx + bw * 0.5f;
+    float cancel_x0 = cancel_cx - bw * 0.5f, cancel_x1 = cancel_cx + bw * 0.5f;
+    round_rect(0.0f, 0.0f, W, H, 0.0f, 0.05f, 0.08f, 0.05f, 0.55f);
+    round_rect(x0 + 2.0f * ui, y0 + 3.0f * ui, x1 + 2.0f * ui, y1 + 3.0f * ui, 18.0f * ui, 0.02f, 0.04f, 0.02f, 0.28f);
+    round_rect(x0, y0, x1, y1, 18.0f * ui, 0.98f, 0.97f, 0.95f, 0.99f);
+    draw_str_raw("Claim this room?", cx, cy - 42.0f * ui, 2.3f * ui, 0.16f, 0.18f, 0.15f, 0.98f, 24);
+    draw_str_raw("Make this your private residence", cx, cy - 14.0f * ui, 1.4f * ui, 0.40f, 0.44f, 0.40f, 0.90f, 36);
+    round_rect(claim_x0 + 1.0f * ui, btn_y - bh * 0.5f + 2.0f * ui, claim_x1 + 1.0f * ui, btn_y + bh * 0.5f + 2.0f * ui, bh * 0.5f, 0.05f, 0.10f, 0.05f, 0.20f);
+    round_rect(claim_x0, btn_y - bh * 0.5f, claim_x1, btn_y + bh * 0.5f, bh * 0.5f, 0.32f, 0.68f, 0.42f, 0.98f);
+    draw_str_raw("CLAIM", claim_cx, btn_y, 1.8f * ui, 1.0f, 1.0f, 1.0f, 1.0f, 12);
+    round_rect(cancel_x0 + 1.0f * ui, btn_y - bh * 0.5f + 2.0f * ui, cancel_x1 + 1.0f * ui, btn_y + bh * 0.5f + 2.0f * ui, bh * 0.5f, 0.05f, 0.10f, 0.05f, 0.15f);
+    round_rect(cancel_x0, btn_y - bh * 0.5f, cancel_x1, btn_y + bh * 0.5f, bh * 0.5f, 0.86f, 0.85f, 0.82f, 0.98f);
+    draw_str_raw("CANCEL", cancel_cx, btn_y, 1.8f * ui, 0.25f, 0.26f, 0.24f, 0.98f, 12);
+}
+
 void pc_touch_present(void) {
     Hud h;
     int i;
-    if (!pc_touch_enabled() || g_pc_window_w < 2 || g_pc_window_h < 2) return;
+    if ((!pc_touch_enabled() && !pc_bedroom_claim_prompt_active()) || g_pc_window_w < 2 || g_pc_window_h < 2) return;
     refresh_action_label();
     hud_build(&h);
     if (!s_overlay_logged) {
@@ -3132,6 +3294,9 @@ void pc_touch_present(void) {
     }
     if (s_sheet.active) {
         mobile_sheet_draw();
+    }
+    if (pc_bedroom_claim_prompt_active()) {
+        pc_bedroom_draw_claim_modal();
     }
     if (s_nvert < 3) { pc_gx_external_gl_done(); return; }
     glDisable(GL_DEPTH_TEST);

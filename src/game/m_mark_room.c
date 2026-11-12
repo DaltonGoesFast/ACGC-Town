@@ -4,6 +4,9 @@
 #include "m_common_data.h"
 #include "m_scene_table.h"
 #include "m_handbill.h"
+#ifdef TARGET_PC
+#include "pc_bedroom.h"
+#endif
 
 static int mMkRm_GetMarkOrder(int player_no) {
   if (mEv_CheckArbeit() == FALSE && player_no < PLAYER_NUM) {
@@ -40,6 +43,12 @@ static void mMkRm_ReportMarkEnd(int player_no) {
 }
 
 extern void mMkRm_ReportChangePlayerRoom() {
+#ifdef TARGET_PC
+  if (pc_bedroom_is_in_bedroom()) {
+    pc_bedroom_save_active();
+    return;
+  }
+#endif
   int player_no = Common_Get(player_no);
 
   if (Save_Get(scene_no) == SCENE_COTTAGE_MY || mSc_IS_SCENE_BASEMENT(Save_Get(scene_no))) {

@@ -39,6 +39,10 @@ int pc_dresser_item_class(unsigned item) {
     }
 }
 
+int pc_dresser_item_is_critter(unsigned item) {
+    return pc_dresser_item_class(item) == PC_DRESSER_ITEM_CREATURE;
+}
+
 int pc_dresser_item_extra_ok(unsigned item) {
     return pc_dresser_item_class(item) != PC_DRESSER_ITEM_REJECT;
 }

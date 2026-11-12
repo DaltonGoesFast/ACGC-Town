@@ -2787,6 +2787,19 @@ static void aMR_SetReserveFurniture(MY_ROOM_ACTOR* my_room, GAME* game) {
                                                 my_room->rsv_ftr[i].layer, TRUE);
                                 aMR_PlussWeight(actorx, &ftr_actor[my_room->rsv_ftr[i].free_no]);
                                 mMkRm_ReportChangePlayerRoom();
+#ifdef TARGET_PC
+                                if (pc_bedroom_is_in_bedroom()) {
+                                    aFTR_PROFILE* ftr_prof = aMR_GetFurnitureProfile(ftr_no);
+                                    if (ftr_prof != NULL && aFTR_CHK_BED(ftr_prof->contact_action)) {
+                                        PCBedroomRecord* br = pc_bedroom_get_active_record();
+                                        if (br != NULL && br->claimed == 0) {
+                                            int h = 0, f = 0, w = 0;
+                                            pc_bedroom_get_active_location(&h, &f, &w);
+                                            pc_bedroom_arm_claim_prompt(h, f, w);
+                                        }
+                                    }
+                                }
+#endif
                             } else {
                                 my_room->rsv_ftr[i].exist_flag = FALSE;
                             }

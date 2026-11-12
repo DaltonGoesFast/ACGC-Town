@@ -32,6 +32,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 extern int pc_town_same_position_reload(const char* why); /* pc_m_card.c */
 
@@ -316,11 +317,36 @@ void pc_day_roll_poll(void) {
     if (!in.world_ready || gamePT == NULL || gamePT->exec != play_main) {
         return;
     }
+
+    /* Phase 3: 12-Hour Mid-Day Restock Cycle (triggers every 12 hours: 08:00 and 20:00 local time) */
+    {
+        static int s_last_restock_slot = -1;
+        lbRTC_time_c rtc = Common_Get(time.rtc_time);
+        if (rtc.year > 0) {
+            int current_slot = (rtc.hour >= 8 && rtc.hour < 20) ? 0 : 1;
+            if (s_last_restock_slot == -1) {
+                s_last_restock_slot = current_slot;
+            } else if (current_slot != s_last_restock_slot) {
+                s_last_restock_slot = current_slot;
+                pc_dr_log("12-Hour Mid-Day Restock triggered at %02d:%02d: replenishing showcase stock", (int)rtc.hour, (int)rtc.min);
+                extern void pc_net_game_trigger_12h_restock(void);
+                pc_net_game_trigger_12h_restock();
+            }
+        }
+    }
     if (!s_dr.init_date_valid) {
         pc_dr_note_init_date(); /* the boot's own new-day init (the vanilla boot / observer init) was for today */
         if (s_dr.init_date_valid) {
             pc_dr_log("ON: the boot's new-day init is for %04d-%02d-%02d; the next roll comes with the next game date (and growth after 6 AM)", s_dr.init_date.year,
                       s_dr.init_date.month, s_dr.init_date.day);
+            /* Phase 3: Automated 60-Day Inactivity Room Reclamation audit at boot */
+            {
+                extern int pc_bedroom_reclamation_check(const char* dir, uint32_t now);
+                int reclaimed = pc_bedroom_reclamation_check(NULL, (uint32_t)time(NULL));
+                if (reclaimed > 0) {
+                    pc_dr_log("60-Day Inactivity Audit: reclaimed %d inactive bedroom(s)", reclaimed);
+                }
+            }
         }
         return;
     }
@@ -429,6 +455,15 @@ void pc_day_roll_play_init(void* p) {
     pc_dr_note_init_date();
     pc_dr_log("new-day init ran (binding player_no %d) for %04d-%02d-%02d: weather %d, villagers %d", (int)Common_Get(player_no), s_dr.init_date.year, s_dr.init_date.month,
               s_dr.init_date.day, (int)Common_Get(weather), pc_dr_villagers());
+
+    /* Phase 3: Automated 60-Day Inactivity Room Reclamation in authoritative daily loop */
+    {
+        extern int pc_bedroom_reclamation_check(const char* dir, uint32_t now);
+        int reclaimed = pc_bedroom_reclamation_check(NULL, (uint32_t)time(NULL));
+        if (reclaimed > 0) {
+            pc_dr_log("60-Day Inactivity Audit: reclaimed %d inactive bedroom(s)", reclaimed);
+        }
+    }
 }
 
 int pc_day_roll_save_due(void) {

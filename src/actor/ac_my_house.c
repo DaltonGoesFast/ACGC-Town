@@ -4,6 +4,9 @@
 #include "bg_item_h.h"
 #include "m_common_data.h"
 #include "m_house.h"
+#ifdef TARGET_PC
+#include "pc_bedroom.h"
+#endif
 #include "m_player_lib.h"
 #include "m_demo.h"
 #include "ac_intro_demo.h"

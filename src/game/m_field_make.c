@@ -17,7 +17,8 @@
 #include "pc_bswap.h"
 #include "pc_net_game.h"        /* pc_net_game_world_is_host_authoritative(), pc_net_game_role() */
 #include "pc_field_authority.h" /* pcfa_mark_all_dirty() */
-#include "pc_platform.h"        /* g_pc_verbose */
+#include "pc_platform.h"
+#include "pc_bedroom.h"        /* g_pc_verbose */
 #include <stdio.h>
 /* Byte-swap all u16 fields in FG data loaded from big-endian ARAM. */
 static void mFM_ByteSwapFGData(mFM_fg_data_c* data, int count) {
@@ -810,6 +811,16 @@ static mFM_fdinfo_c* mFM_MakeField(u16 scene, u16 bg_max, u8 bg_num) {
 
         if (Save_Get(scene_no) == SCENE_COTTAGE_MY) {
             mFM_SetFgUtPtoCottageInfo(field_info->block_info, field_info->block_x_max, field_info->block_z_max);
+#ifdef TARGET_PC
+        } else if (pc_bedroom_is_in_bedroom()) {
+            PCBedroomRecord* br = pc_bedroom_get_active_record();
+            if (br != NULL) {
+                field_info->block_info->fg_info.items_p = br->flr.layer_main.items[0];
+            } else {
+                mFM_SetFgUtPtoHomeInfo(field_info->block_info, field_info->block_x_max, field_info->block_z_max,
+                                       house_owner_id, floor_no);
+            }
+#endif
         } else {
             mFM_SetFgUtPtoHomeInfo(field_info->block_info, field_info->block_x_max, field_info->block_z_max,
                                    house_owner_id, floor_no);
@@ -839,6 +850,18 @@ static mFM_fdinfo_c* mFM_MakeField(u16 scene, u16 bg_max, u8 bg_num) {
 
         if (Save_Get(scene_no) == SCENE_COTTAGE_MY) {
             layer = &Save_Get(island).cottage.room.layer_main;
+#ifdef TARGET_PC
+        } else if (pc_bedroom_is_in_bedroom()) {
+            PCBedroomRecord* br = pc_bedroom_get_active_record();
+            if (br != NULL) {
+                layer = &br->flr.layer_main;
+            } else {
+                mActor_name_t house_owner_id = Common_Get(house_owner_name);
+                floor_no = mFI_GetNowPlayerHouseFloorNo();
+                if (floor_no == -1) floor_no = 0;
+                layer = &Save_Get(homes[house_owner_id]).floors[floor_no].layer_main;
+            }
+#endif
         } else {
             mActor_name_t house_owner_id = Common_Get(house_owner_name);
             floor_no = mFI_GetNowPlayerHouseFloorNo();
@@ -1156,6 +1179,19 @@ static void set_field_type() {
         }
 #endif
     }
+
+#ifdef TARGET_PC
+    if (pc_bedroom_is_in_bedroom()) {
+        PCBedroomRecord* br = pc_bedroom_get_active_record();
+        if (br != NULL) {
+            if (br->claimed == 0 || mHS_is_bedroom_owner(Common_Get(player_no), br)) {
+                house_owner_id = field_id;
+            } else {
+                house_owner_id = RSV_NO;
+            }
+        }
+    }
+#endif
 
     if (field_id == mFI_FIELD_FG) {
         field_type = mFI_FIELDTYPE2_FG;

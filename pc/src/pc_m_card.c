@@ -33,6 +33,7 @@
 #include <io.h>
 #endif
 #include "pc_settings.h"
+#include "pc_bedroom.h"
 #include "m_cockroach.h"
 #include "m_all_grow_ovl.h"
 #include "m_home.h"
@@ -2231,6 +2232,9 @@ static void pc_guest_station_door(Door_data_c* door_data) {
  * check, runs no new-town / new-player init and allocates no house. */
 static int pc_guest_arrive(const char* tag, const char* spec, char* err, size_t errcap) {
     int roommate_house = -1; /* roommates: the house this guest shares (it starts at its door) */
+    int bedroom_house = -1, bedroom_floor = -1, bedroom_wing = -1;
+    const char* my_uuid = (pc_session()->storage == PC_CHARACTER_STORAGE_STORE) ? pc_session()->character.uuid : NULL;
+    int has_bedroom = 0;
     PersonalID_c home;
     Private_c* pass;
     Private_c* prev_private;
@@ -2323,6 +2327,10 @@ static int pc_guest_arrive(const char* tag, const char* spec, char* err, size_t 
              tag, (int)mEv_CheckGateway(), (int)Common_Get(player_no));
     /* pc_save_ready is deliberately NOT armed: this process can never write a save. */
 
+    if (my_uuid != NULL && pc_bedroom_find_by_owner(my_uuid, &bedroom_house, &bedroom_floor, &bedroom_wing)) {
+        has_bedroom = 1;
+    }
+
     if (create) {
         /* the vanilla Rover entry (aNPS2_make_door_data type DEMO2): SCENE_START_DEMO2, north, (120, 340), no RIDE_OFF_DEMO */
         door_data.next_scene_id = SCENE_START_DEMO2;
@@ -2336,6 +2344,20 @@ static int pc_guest_arrive(const char* tag, const char* spec, char* err, size_t 
         door_data.wipe_type = WIPE_TYPE_FADE_BLACK;
         OSReport("[PC] %s: FIRST-RUN guest creation: profile file %s does not exist yet -> the real Rover scene (SCENE_START_DEMO2) creates it\n", tag,
                  pc_guest_profile_selected_path());
+    } else if (has_bedroom) {
+        /* Multi-Resident Housing: claimed private bedroom resident wakes up inside their bedroom! */
+        door_data.next_scene_id = SCENE_MY_ROOM_S;
+        door_data.exit_orientation = mSc_DIRECT_NORTH;
+        door_data.exit_type = 0;
+        door_data.extra_data = 0;
+        door_data.exit_position.x = 120;
+        door_data.exit_position.y = 0;
+        door_data.exit_position.z = 150;
+        door_data.door_actor_name = EMPTY_NO;
+        door_data.wipe_type = WIPE_TYPE_TRIFORCE;
+        pc_bedroom_set_active_location(bedroom_house, bedroom_floor, bedroom_wing);
+        Common_Set(demo_profiles[0], mAc_PROFILE_NUM);
+        Common_Set(demo_profiles[1], mAc_PROFILE_NUM);
     } else if ((roommate_house = pc_guest_roommate_house(&home)) >= 0) {
         /* roommates: a guest that shares a house arrives like a resident: out of that house's door (no train, no station) */
         pc_guest_house_door(&door_data, roommate_house);
@@ -2347,7 +2369,7 @@ static int pc_guest_arrive(const char* tag, const char* spec, char* err, size_t 
         Common_Get(transition).wipe_type = WIPE_TYPE_CIRCLE_LEFT;
     }
     scene_res = goto_other_scene(play, &door_data, TRUE);
-    if (scene_res == TRUE && roommate_house >= 0) {
+    if (scene_res == TRUE && (roommate_house >= 0 || has_bedroom)) {
         Common_Get(transition).wipe_type = WIPE_TYPE_TRIFORCE;
     }
     if (scene_res != TRUE) {

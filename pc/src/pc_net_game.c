@@ -144,7 +144,8 @@
  */
 #include "m_quest.h" /* mQst_PC_SlotHasQuestEntry */
 #include "pc_net_game.h"
-#include "pc_residence.h"   /* PC_RESIDENCE_SLOTS / PC_RESIDENCE_HOUSES: the one place that knows "4 resident slots, 4 houses" */
+#include "pc_residence.h"
+#include "pc_bedroom.h"   /* PC_RESIDENCE_SLOTS / PC_RESIDENCE_HOUSES: the one place that knows "4 resident slots, 4 houses" */
 #include "pc_test_hooks.h"  /* test-hook guard (PC_NET_TEST_HOOKS + env AC_TEST_HOOKS=1) */
 #ifdef PC_NET_TEST_HOOKS
 static uint32_t s_ac_result_entity; /* TEST-ONLY auto-catch: the last catch outcome this client received from the host */
@@ -632,7 +633,13 @@ typedef enum PCNetGameMsgType {
                                              * READY client STATE (the arrival timeline: trains, seats, ages; at READY, on change, every 3 s while a train exists); client -> host
                                              * REQUEST / STEPPED_OFF / WELCOMED / ABORT (sent only after the host's STATE arrived). PRESENTATION ONLY. An old peer ignores the
                                              * id. Kill switch AC_MP_TRAIN_SYNC=0. See the SYNCED ARRIVAL TRAIN block (pc_net_game_arrtrain.c_inc). */
+    PC_NETGAME_MSG_BEDROOM              = 106, /* multi-resident housing bedrooms (Phase 2), RELIABLE, 64 bytes (PCBedroomMsg, pc_bedroom.h) */
 } PCNetGameMsgType;
+_Static_assert((int)PC_NETGAME_MSG_BEDROOM == 106, "BEDROOM msg id drifted (pc_bedroom.h)");
+/* MULTI-RESIDENT BEDROOMS (pc_net_game_bedroom.c_inc, included at the end of this file) */
+static void pcnetgame_bedroom_host_on_ready(PCNetPeerId peer);
+static void pcnetgame_handle_host_bedroom(PCNetPeerId peer, const uint8_t* data, uint16_t size);
+static void pcnetgame_handle_client_bedroom(const uint8_t* data, uint16_t size);
 _Static_assert((int)PC_NETGAME_MSG_ARRIVAL_TRAIN == (int)PCAT_MSG_ID, "ARRIVAL_TRAIN id drifted (pc_arrival_train.h)");
 /* SYNCED ARRIVAL TRAIN (pc_net_game_arrtrain.c_inc, included at the end of this file) */
 static void pcnetgame_arrtrain_host_on_ready(PCNetPeerId peer);
@@ -24527,6 +24534,20 @@ static void pcnetgame_shop_catalog_watch(void) {
     }
 }
 
+void pc_net_game_trigger_12h_restock(void) {
+    if (s_role != PC_NETGAME_ROLE_HOST) {
+        return;
+    }
+    mSP_ExchangeLineUp_ZeldaMalloc();
+    s_restock.cat_gen++;
+    s_restock.cat_key = 0;
+    s_restock.cat_key_valid = 0;
+    printf("[NET][SHOP] host: 12-hour restock cycle triggered: showcase stock replenished, generation %u\n", (unsigned)s_restock.cat_gen);
+    (void)pcnetgame_ts_refresh((int)PC_NETGAME_TS_SHOP);
+    (void)pcnetgame_ts_refresh((int)PC_NETGAME_TS_HOSTCFG);
+    pcnetgame_host_ts_push_all();
+}
+
 /* Once per host tick (world ready): the restart resume (once) and the deadline. */
 static void pcnetgame_restock_host_tick(uint32_t now) {
     pcnetgame_shop_catalog_watch();
@@ -35101,6 +35122,7 @@ static void pcnetgame_host_process_identity(PCNetPeerId peer) {
     /* v2: bootstrap the client's world (initial connect, late join and reconnect all land here). */
     pcnetgame_host_ts_push_hostcfg(peer); /* batch A (A1): the wildlife mode is announced BEFORE any snapshot message */
     pcnetgame_arrtrain_host_on_ready(peer); /* synced arrival train: the timeline (and the capability) BEFORE the snapshot the guest's arrival waits for */
+    pcnetgame_bedroom_host_on_ready(peer);  /* multi-resident bedrooms: sync claimed bedroom status table */
     pcnetgame_host_start_snapshot(peer, "joined");
     pcnetgame_host_rec_on_ready(peer); /* D3: AWAIT_HELLO */
 }
@@ -35860,6 +35882,10 @@ static void pcnetgame_handle_host_data(PCNetPeerId peer, const uint8_t* data, ui
     }
     if (data[0] == (uint8_t)PC_NETGAME_MSG_ARRIVAL_TRAIN) { /* SYNCED ARRIVAL TRAIN: a passenger's seat request / progress (validated; never a violation) */
         pcnetgame_handle_host_arrtrain(peer, data, size);
+        return;
+    }
+    if (data[0] == (uint8_t)PC_NETGAME_MSG_BEDROOM) { /* MULTI-RESIDENT BEDROOMS: claim requests / queries */
+        pcnetgame_handle_host_bedroom(peer, data, size);
         return;
     }
     if (data[0] == (uint8_t)PC_NETGAME_MSG_HANDOVER) { /* HAND-OVER ANIMATIONS: presentation only (villager: the host's held actor; shop: relayed within the sender's scene) */
@@ -36635,6 +36661,10 @@ static void pcnetgame_handle_client_data(const uint8_t* data, uint16_t size) {
     }
     if (size == sizeof(PCArrTrainMsg) && data[0] == (uint8_t)PC_NETGAME_MSG_ARRIVAL_TRAIN) {
         pcnetgame_handle_client_arrtrain(data, size); /* SYNCED ARRIVAL TRAIN: the host's arrival timeline */
+        return;
+    }
+    if (size == sizeof(PCBedroomMsg) && data[0] == (uint8_t)PC_NETGAME_MSG_BEDROOM) {
+        pcnetgame_handle_client_bedroom(data, size); /* MULTI-RESIDENT BEDROOMS: claim ACK / info sync */
         return;
     }
     if (size == sizeof(PCHandoverMsg) && data[0] == (uint8_t)PC_NETGAME_MSG_HANDOVER) {
@@ -53913,4 +53943,5 @@ void pc_net_game_dedicated_chat(const char* cmd, const char* args, void (*out)(c
 /* ===== CHAT END ===== */
 
 #include "pc_net_game_arrtrain.c_inc" /* SYNCED ARRIVAL TRAIN (message 105): the host's arrival timeline, the client's copy, the game-facing API */
+#include "pc_net_game_bedroom.c_inc"   /* MULTI-RESIDENT BEDROOMS (message 106): authoritative bedroom wire sync */
 #include "pc_net_game_roommates.c_inc" /* ROOMMATES / MOVE-IN (message 104): the host relations, the client seam, the console */

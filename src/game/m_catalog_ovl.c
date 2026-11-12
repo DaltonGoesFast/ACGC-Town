@@ -1356,7 +1356,8 @@ static void mCL_catalog_ovl_init(Submenu* submenu) {
     menu = &catalog_ovl->menu_data[mCL_MENU_FTR];
     item_list = menu->item_list;
     for (i = 0; i < mCL_FTR_LIST_COUNT; i++) {
-        if (mCL_check_item_collect_bit(Now_Private->furniture_collected_bitfield, ftr_info->ftr_idx)) {
+        if (ftr_info->ftr_idx == FTR_SUM_LOG_BED01 ||
+            mCL_check_item_collect_bit(Now_Private->furniture_collected_bitfield, ftr_info->ftr_idx)) {
             *item_list++ = mRmTp_FtrIdx2FtrItemNo(ftr_info->ftr_idx, mRmTp_DIRECT_SOUTH);
             menu->item_count++;
         }

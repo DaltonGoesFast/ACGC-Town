@@ -21,7 +21,7 @@
         </activity>
         <activity
             android:name=".TownActivity"
-            android:exported="false"
+            android:exported="true"
             android:resizeableActivity="true"
             android:configChanges="layoutDirection|locale|orientation|uiMode|screenLayout|screenSize|smallestScreenSize|density|keyboard|keyboardHidden|navigation"
             android:theme="@android:style/Theme.NoTitleBar.Fullscreen" />

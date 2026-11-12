@@ -95,6 +95,26 @@ static void mSM_setup_view(Submenu* submenu, GRAPH* graph, int init_flag) {
         gSPViewport(POLY_OPA_DISP++, &view->viewport);
 #endif
         gDPSetScissor(POLY_OPA_DISP++, G_SC_NON_INTERLACE, 0, 0, 640, 480);
+    } else {
+#ifdef TARGET_PC
+        /* On PC, setupViewer ran before PC_NOOP_WIDESCREEN_STRETCH_OFF (stretch=2), so
+         * glViewport may still point to the full-window Vert+/Hor+ rect. Re-emit the
+         * 640x480 viewport now so the 2D submenu frame, items, and mail render in
+         * pc_layout_box(2) from the start instead of waiting for mIV_set_player. */
+        Vp* vp_copy = (Vp*)GRAPH_ALLOC_TYPE(graph, Vp, 1);
+        if (vp_copy != NULL) {
+            vp_copy->vp.vscale[0] = 640 * 2;
+            vp_copy->vp.vscale[1] = 480 * 2;
+            vp_copy->vp.vscale[2] = 511;
+            vp_copy->vp.vscale[3] = 0;
+            vp_copy->vp.vtrans[0] = 640 * 2;
+            vp_copy->vp.vtrans[1] = 480 * 2;
+            vp_copy->vp.vtrans[2] = 511;
+            vp_copy->vp.vtrans[3] = 0;
+            gSPViewport(POLY_OPA_DISP++, vp_copy);
+        }
+#endif
+        gDPSetScissor(POLY_OPA_DISP++, G_SC_NON_INTERLACE, 0, 0, 640, 480);
     }
 
     gSPMatrix(POLY_OPA_DISP++, mtx, G_MTX_NOPUSH | G_MTX_LOAD | G_MTX_PROJECTION);

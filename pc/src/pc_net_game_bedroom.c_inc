@@ -1,0 +1,234 @@
+/* pc_net_game_bedroom.c_inc - Multi-resident housing bedroom wire sync (Phase 2).
+ * Message 106 (PC_NETGAME_MSG_BEDROOM): Reliable claim requests, acknowledgments, and state sync.
+ */
+#ifndef PC_NET_GAME_BEDROOM_C_INC
+#define PC_NET_GAME_BEDROOM_C_INC
+
+#include "pc_bedroom.h"
+#include <time.h>
+
+/* ---- Client / Solo Claim Request API ---- */
+void pc_net_game_bedroom_send_claim(int house_id, int floor, int wing) {
+    const char* my_uuid = (pc_session()->storage == PC_CHARACTER_STORAGE_STORE) ?
+                          pc_session()->character.uuid : "local_resident";
+    const uint8_t* my_name = Common_Get(now_private)->player_ID.player_name;
+
+    printf("[NET][BEDROOM] Player initiating claim for House %d, Floor %d, Wing %d (UUID: %s)\n",
+           house_id, floor, wing, my_uuid);
+
+    if (s_role != PC_NETGAME_ROLE_CLIENT) {
+        /* Solo / Host local authoritative commit */
+        uint32_t now = (uint32_t)time(NULL);
+        int rc = pc_bedroom_store_claim(NULL, house_id, floor, wing, my_uuid, my_name, now);
+        if (rc) {
+            printf("[NET][BEDROOM] Authoritative claim committed locally for House %d, Floor %d, Wing %d\n",
+                   house_id, floor, wing);
+            Common_Set(field_type, mFI_FIELDTYPE2_PLAYER_ROOM);
+
+            /* If host in multiplayer, broadcast to all ready peers */
+            if (s_role == PC_NETGAME_ROLE_HOST) {
+                PCBedroomMsg msg;
+                memset(&msg, 0, sizeof(msg));
+                msg.msg_type = (uint8_t)PC_NETGAME_MSG_BEDROOM;
+                msg.op = (uint8_t)PC_BEDROOM_OP_INFO;
+                msg.result = (uint8_t)PC_BEDROOM_R_OK;
+                msg.house_id = (uint8_t)house_id;
+                msg.floor = (uint8_t)floor;
+                msg.wing = (uint8_t)wing;
+                msg.claimed = 1;
+                msg.claimed_timestamp = now;
+                snprintf(msg.owner_uuid, sizeof(msg.owner_uuid), "%s", my_uuid);
+                memcpy(msg.owner_name, my_name, 8);
+
+                for (int p = 0; p < pcnetgame_peer_span(); p++) {
+                    if (s_host_peer_link[p] == PC_NETGAME_LINK_READY) {
+                        pc_net_send((PCNetPeerId)p, PC_NET_RELIABLE, &msg, sizeof(msg));
+                    }
+                }
+            }
+        } else {
+            printf("[NET][BEDROOM] Failed to commit local claim for House %d, Floor %d, Wing %d\n",
+                   house_id, floor, wing);
+        }
+        return;
+    }
+
+    /* Client: Send reliable CLAIM_REQ to Host */
+    PCBedroomMsg req;
+    memset(&req, 0, sizeof(req));
+    req.msg_type = (uint8_t)PC_NETGAME_MSG_BEDROOM;
+    req.op = (uint8_t)PC_BEDROOM_OP_CLAIM_REQ;
+    req.house_id = (uint8_t)house_id;
+    req.floor = (uint8_t)floor;
+    req.wing = (uint8_t)wing;
+    snprintf(req.owner_uuid, sizeof(req.owner_uuid), "%s", my_uuid);
+    memcpy(req.owner_name, my_name, 8);
+
+    if (pc_net_send(0, PC_NET_RELIABLE, &req, sizeof(req))) {
+        printf("[NET][BEDROOM] Sent CLAIM_REQ to host for House %d, Floor %d, Wing %d\n",
+               house_id, floor, wing);
+    } else {
+        printf("[NET][BEDROOM] Failed to send CLAIM_REQ to host!\n");
+    }
+}
+
+/* ---- Host Message Handler ---- */
+static void pcnetgame_handle_host_bedroom(PCNetPeerId peer, const uint8_t* data, uint16_t size) {
+    if (size != sizeof(PCBedroomMsg)) {
+        printf("[NET][BEDROOM] Host dropped malformed message (size %u != %u)\n",
+               (unsigned)size, (unsigned)sizeof(PCBedroomMsg));
+        return;
+    }
+
+    const PCBedroomMsg* req = (const PCBedroomMsg*)data;
+    int h = req->house_id;
+    int f = req->floor;
+    int w = req->wing;
+
+    if (h < 0 || h >= PC_HOUSE_COUNT || f < 0 || f >= PC_HOUSE_FLOORS_PER_HS ||
+        w < 1 || w > PC_HOUSE_WINGS_PER_FLR) {
+        printf("[NET][BEDROOM] Host: coordinates (%d,%d,%d) out of bounds from peer %d\n",
+               h, f, w, (int)peer);
+        return;
+    }
+
+    if (req->op == PC_BEDROOM_OP_CLAIM_REQ) {
+        printf("[NET][BEDROOM] Host received CLAIM_REQ from peer %d for House %d, Floor %d, Wing %d (UUID: %s)\n",
+               (int)peer, h, f, w, req->owner_uuid);
+
+        PCBedroomRecord* existing = pc_bedroom_store_get(h, f, w);
+        PCBedroomMsg ack;
+        memset(&ack, 0, sizeof(ack));
+        ack.msg_type = (uint8_t)PC_NETGAME_MSG_BEDROOM;
+        ack.op = (uint8_t)PC_BEDROOM_OP_CLAIM_ACK;
+        ack.house_id = (uint8_t)h;
+        ack.floor = (uint8_t)f;
+        ack.wing = (uint8_t)w;
+
+        if (existing != NULL && existing->claimed && strcmp(existing->owner_uuid, req->owner_uuid) != 0) {
+            /* Room already claimed by someone else */
+            printf("[NET][BEDROOM] Host REJECTED claim: room already claimed by %s\n", existing->owner_uuid);
+            ack.result = (uint8_t)PC_BEDROOM_R_OCCUPIED;
+            pc_net_send(peer, PC_NET_RELIABLE, &ack, sizeof(ack));
+            return;
+        }
+
+        /* Check if player already owns another bedroom in town */
+        int oh = -1, of = -1, ow = -1;
+        if (pc_bedroom_find_by_owner(req->owner_uuid, &oh, &of, &ow) && (oh != h || of != f || ow != w)) {
+            printf("[NET][BEDROOM] Host REJECTED claim: player already owns House %d, Floor %d, Wing %d\n",
+                   oh, of, ow);
+            ack.result = (uint8_t)PC_BEDROOM_R_ALREADY_HAVE;
+            pc_net_send(peer, PC_NET_RELIABLE, &ack, sizeof(ack));
+            return;
+        }
+
+        /* Commit authoritative claim */
+        uint32_t now = (uint32_t)time(NULL);
+        int rc = pc_bedroom_store_claim(NULL, h, f, w, req->owner_uuid, req->owner_name, now);
+        if (rc) {
+            printf("[NET][BEDROOM] Host COMMITTED claim for House %d, Floor %d, Wing %d to %s\n",
+                   h, f, w, req->owner_uuid);
+            ack.result = (uint8_t)PC_BEDROOM_R_OK;
+            ack.claimed = 1;
+            ack.claimed_timestamp = now;
+            snprintf(ack.owner_uuid, sizeof(ack.owner_uuid), "%s", req->owner_uuid);
+            memcpy(ack.owner_name, req->owner_name, 8);
+
+            /* Reply to claimant */
+            pc_net_send(peer, PC_NET_RELIABLE, &ack, sizeof(ack));
+
+            /* Broadcast INFO to all other ready peers */
+            PCBedroomMsg info = ack;
+            info.op = (uint8_t)PC_BEDROOM_OP_INFO;
+            for (int p = 0; p < pcnetgame_peer_span(); p++) {
+                if (p != (int)peer && s_host_peer_link[p] == PC_NETGAME_LINK_READY) {
+                    pc_net_send((PCNetPeerId)p, PC_NET_RELIABLE, &info, sizeof(info));
+                }
+            }
+        } else {
+            printf("[NET][BEDROOM] Host claim failed during disk write\n");
+            ack.result = (uint8_t)PC_BEDROOM_R_ERROR;
+            pc_net_send(peer, PC_NET_RELIABLE, &ack, sizeof(ack));
+        }
+    } else if (req->op == PC_BEDROOM_OP_QUERY) {
+        PCBedroomRecord* r = pc_bedroom_store_get(h, f, w);
+        PCBedroomMsg info;
+        memset(&info, 0, sizeof(info));
+        info.msg_type = (uint8_t)PC_NETGAME_MSG_BEDROOM;
+        info.op = (uint8_t)PC_BEDROOM_OP_INFO;
+        info.house_id = (uint8_t)h;
+        info.floor = (uint8_t)f;
+        info.wing = (uint8_t)w;
+        if (r != NULL && r->claimed) {
+            info.claimed = 1;
+            info.claimed_timestamp = r->claimed_timestamp;
+            snprintf(info.owner_uuid, sizeof(info.owner_uuid), "%s", r->owner_uuid);
+            memcpy(info.owner_name, r->owner_name, 8);
+        }
+        pc_net_send(peer, PC_NET_RELIABLE, &info, sizeof(info));
+    }
+}
+
+/* ---- Client Message Handler ---- */
+static void pcnetgame_handle_client_bedroom(const uint8_t* data, uint16_t size) {
+    if (size != sizeof(PCBedroomMsg)) return;
+
+    const PCBedroomMsg* msg = (const PCBedroomMsg*)data;
+    int h = msg->house_id;
+    int f = msg->floor;
+    int w = msg->wing;
+
+    if (msg->op == PC_BEDROOM_OP_CLAIM_ACK) {
+        if (msg->result == PC_BEDROOM_R_OK) {
+            printf("[NET][BEDROOM] Server CONFIRMED claim for House %d, Floor %d, Wing %d!\n",
+                   h, f, w);
+            pc_bedroom_store_claim(NULL, h, f, w, msg->owner_uuid, msg->owner_name, msg->claimed_timestamp);
+
+            /* If currently inside this bedroom, grant owner permissions immediately */
+            int ah = -1, af = -1, aw = -1;
+            pc_bedroom_get_active_location(&ah, &af, &aw);
+            if (ah == h && af == f && aw == w) {
+                Common_Set(field_type, mFI_FIELDTYPE2_PLAYER_ROOM);
+                printf("[NET][BEDROOM] Granted mFI_FIELDTYPE2_PLAYER_ROOM owner editing rights.\n");
+            }
+        } else {
+            printf("[NET][BEDROOM] Server REJECTED claim: result code %u\n", (unsigned)msg->result);
+        }
+    } else if (msg->op == PC_BEDROOM_OP_INFO) {
+        printf("[NET][BEDROOM] Sync INFO: House %d, Floor %d, Wing %d is %s (UUID: %s)\n",
+               h, f, w, msg->claimed ? "CLAIMED" : "VACANT", msg->claimed ? msg->owner_uuid : "-");
+        if (msg->claimed) {
+            pc_bedroom_store_claim(NULL, h, f, w, msg->owner_uuid, msg->owner_name, msg->claimed_timestamp);
+        } else {
+            pc_bedroom_store_unclaim(NULL, h, f, w);
+        }
+    }
+}
+
+/* ---- Host Peer Ready Sync ---- */
+static void pcnetgame_bedroom_host_on_ready(PCNetPeerId peer) {
+    for (int h = 0; h < PC_HOUSE_COUNT; h++) {
+        for (int f = 0; f < PC_HOUSE_FLOORS_PER_HS; f++) {
+            for (int w = 1; w <= PC_HOUSE_WINGS_PER_FLR; w++) {
+                PCBedroomRecord* r = pc_bedroom_store_get(h, f, w);
+                if (r != NULL && r->claimed) {
+                    PCBedroomMsg info;
+                    memset(&info, 0, sizeof(info));
+                    info.msg_type = (uint8_t)PC_NETGAME_MSG_BEDROOM;
+                    info.op = (uint8_t)PC_BEDROOM_OP_INFO;
+                    info.house_id = (uint8_t)h;
+                    info.floor = (uint8_t)f;
+                    info.wing = (uint8_t)w;
+                    info.claimed = 1;
+                    info.claimed_timestamp = r->claimed_timestamp;
+                    snprintf(info.owner_uuid, sizeof(info.owner_uuid), "%s", r->owner_uuid);
+                    memcpy(info.owner_name, r->owner_name, 8);
+                    pc_net_send(peer, PC_NET_RELIABLE, &info, sizeof(info));
+                }
+            }
+        }
+    }
+}
+
+#endif /* PC_NET_GAME_BEDROOM_C_INC */

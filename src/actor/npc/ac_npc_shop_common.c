@@ -3897,6 +3897,13 @@ static void aNSC_order_check(NPC_SHOP_COMMON_ACTOR* shop_common, GAME_PLAY* play
                         aNSC_set_ftr_order(shop_common);
                         aNSC_get_sell_price(price);
                         mSP_PlusSales(price);
+#ifdef TARGET_PC
+                        if (shop_common->order_item == FTR_SUM_LOG_BED01) {
+                            if (mPr_GetPossessionItemSum(Now_Private, EMPTY_NO) > 0) {
+                                mPr_SetFreePossessionItem(Now_Private, FTR_SUM_LOG_BED01, mPr_ITEM_COND_NORMAL);
+                            }
+                        }
+#endif
                     }
                     break;
                 case mChoice_CHOICE1:

@@ -7,7 +7,12 @@
 #include "m_common_data.h"
 #include "m_rcp.h"
 #include "m_mark_room.h"
+#ifdef TARGET_PC
+#include "pc_bedroom.h"
+#endif
 #include "sys_matrix.h"
+#include "m_actor.h"
+#include "m_play.h"
 
 enum {
     aMI_ROOM_KIND_S,
@@ -353,6 +358,17 @@ static void aMI_InitActorMember(ACTOR* actorx, GAME* game) {
         my_indoor->house_floor_no = 0;
     }
 
+#ifdef TARGET_PC
+    if (pc_bedroom_is_in_bedroom()) {
+        PCBedroomRecord* br = pc_bedroom_get_active_record();
+        if (br != NULL) {
+            my_indoor->floor_num = br->flr.wall_floor.flooring_idx;
+            my_indoor->wall_num = br->flr.wall_floor.wallpaper_idx;
+            my_indoor->wall_is_original_design = FALSE;
+            my_indoor->floor_is_original_design = FALSE;
+        }
+    } else
+#endif
     if (Save_Get(scene_no) == SCENE_COTTAGE_MY) {
         my_indoor->floor_num = Save_Get(island).cottage.room.wall_floor.flooring_idx;
         my_indoor->wall_num = Save_Get(island).cottage.room.wall_floor.wallpaper_idx;
@@ -378,6 +394,26 @@ static void My_Indoor_Actor_ct(ACTOR* actorx, GAME* game) {
     aMI_GetMyIndoorBank(actorx, game);
     aMI_MyIndoorDma(actorx, game);
     aMI_SetClipProc(actorx, TRUE);
+#ifdef TARGET_PC
+    if (Save_Get(scene_no) == SCENE_MY_ROOM_LL1) {
+        int h = 0, f = 0, w = 0;
+        pc_bedroom_get_active_location(&h, &f, &w);
+        s16 haniwa_id = ACTOR_PROP_HANIWA0 + (h & 3);
+        Actor_info_make_actor(
+            &((GAME_PLAY*)game)->actor_info,
+            game,
+            mAc_PROFILE_HANIWA,
+            120.0f, 0.0f, 320.0f,
+            0, 0, 0,
+            -1, -1,
+            -1,
+            haniwa_id,
+            haniwa_id,
+            -1,
+            -1
+        );
+    }
+#endif
 }
 
 static void My_Indoor_Actor_dt(ACTOR* actorx, GAME* game) {
@@ -731,6 +767,15 @@ static void aMI_Change2ReservedWall(ACTOR* actorx, GAME* game) {
 
             aMI_CopyWallTexture(actorx, my_indoor->wall_num, my_indoor->wall_bank_idx);
 
+#ifdef TARGET_PC
+            if (pc_bedroom_is_in_bedroom()) {
+                PCBedroomRecord* br = pc_bedroom_get_active_record();
+                if (br != NULL) {
+                    br->flr.wall_floor.wallpaper_idx = my_indoor->wall_num;
+                    pc_bedroom_save_active();
+                }
+            } else
+#endif
             if (Save_Get(scene_no) == SCENE_COTTAGE_MY) {
                 Save_Get(island).cottage.room.wall_floor.wallpaper_idx = my_indoor->wall_num;
             } else {
@@ -762,6 +807,15 @@ static void aMI_Change2ReservedFloor(ACTOR* actorx, GAME* game) {
 
             aMI_CopyFloorTexture(actorx, my_indoor->floor_num, my_indoor->floor_bank_idx);
 
+#ifdef TARGET_PC
+            if (pc_bedroom_is_in_bedroom()) {
+                PCBedroomRecord* br = pc_bedroom_get_active_record();
+                if (br != NULL) {
+                    br->flr.wall_floor.flooring_idx = my_indoor->floor_num;
+                    pc_bedroom_save_active();
+                }
+            } else
+#endif
             if (Save_Get(scene_no) == SCENE_COTTAGE_MY) {
                 Save_Get(island).cottage.room.wall_floor.flooring_idx = my_indoor->floor_num;
             } else {

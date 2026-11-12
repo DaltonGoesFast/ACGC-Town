@@ -25,6 +25,7 @@ enum {
 };
 
 int pc_dresser_item_class(unsigned item); /* PC_DRESSER_ITEM_* */
+int pc_dresser_item_is_critter(unsigned item); /* 1 if fish or insect */
 int pc_dresser_item_extra_ok(unsigned item);   /* the 24 extra slots */
 int pc_dresser_item_vanilla_ok(unsigned item); /* the 3 vanilla keep slots (the vanilla filter) */
 

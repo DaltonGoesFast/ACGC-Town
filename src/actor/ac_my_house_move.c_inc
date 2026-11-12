@@ -29,38 +29,21 @@ static void aMHS_set_door_SE(STRUCTURE_ACTOR* my_house) {
 }
 
 static void aMHS_goto_next_pl_scene(GAME_PLAY* play, STRUCTURE_ACTOR* my_house) {
-    static int next_scene_no[mHm_HOMESIZE_NUM - 1] = {
-        SCENE_MY_ROOM_S,
-        SCENE_MY_ROOM_M,
-        SCENE_MY_ROOM_L,
-        SCENE_MY_ROOM_LL1,
-    };
-
-    static s16 startX[mHm_HOMESIZE_NUM - 1] = {
-        120,
-        160,
-        200,
-        200,
-    };
-
-    static s16 startZ[mHm_HOMESIZE_NUM - 1] = {
-        220,
-        300,
-        380,
-        380,
-    };
-
     Door_data_c door_data;
 
-    door_data.next_scene_id = next_scene_no[my_house->arg0];
+    door_data.next_scene_id = SCENE_MY_ROOM_LL1;
     door_data.exit_orientation = mSc_DIRECT_NORTH;
     door_data.exit_type = 0;
     door_data.extra_data = 0;
-    door_data.exit_position.x = startX[my_house->arg0];
+    door_data.exit_position.x = 200;
     door_data.exit_position.y = 0;
-    door_data.exit_position.z = startZ[my_house->arg0];
+    door_data.exit_position.z = 380;
     door_data.door_actor_name = EMPTY_NO;
     door_data.wipe_type = WIPE_TYPE_TRIFORCE;
+
+#ifdef TARGET_PC
+    pc_bedroom_set_active_location(my_house->action, PC_HOUSE_FLOOR_MIDDLE, PC_HOUSE_WING_COMMON);
+#endif
 
     goto_other_scene(play, &door_data, 0);
     play->fb_fade_type = FADE_TYPE_DEMO;

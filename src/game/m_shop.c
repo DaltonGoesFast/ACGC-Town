@@ -574,9 +574,37 @@ static int mSP_CountPriceTableElement(u16* price_table) {
     return n;
 }
 
+#ifdef TARGET_PC
+static int mSP_IsEssentialGood(mActor_name_t item) {
+    if (item == FTR_SUM_LOG_BED01) {
+        return TRUE; /* Starter Wooden Bed never sells out */
+    }
+    if (ITEM_NAME_GET_TYPE(item) == NAME_TYPE_ITEM1) {
+        int cat = ITEM_NAME_GET_CAT(item);
+        if (cat == ITEM1_CAT_TOOL) {
+            return TRUE; /* Starter tools (Rod, Net, Shovel) never sell out */
+        }
+        if (cat == ITEM1_CAT_PLANT) {
+            return TRUE; /* Flower seeds and tree saplings never sell out */
+        }
+        if (cat == ITEM1_CAT_PAPER) {
+            return TRUE; /* Stationery never sells out */
+        }
+    }
+    return FALSE;
+}
+#endif
+
 extern int mSP_ShopSaleReport(mActor_name_t sold_item, mActor_name_t* goods_table, int goods_count,
                               mActor_name_t rsv_item) {
     int i;
+
+#ifdef TARGET_PC
+    /* Phase 3: Hybrid Stock Model - Essentials have infinite stock per-player and never sell out */
+    if (mSP_IsEssentialGood(sold_item)) {
+        return FALSE;
+    }
+#endif
 
     if (sold_item == ITM_HUKUBUKURO_BAG) {
         Save_Get(shop).flowers_candy_grab_bag_count--;
@@ -672,6 +700,10 @@ extern u32 mSP_ItemNo2ItemPrice(mActor_name_t item_no) {
 
     if (item_no == ITM_SIGNBOARD) {
         return mSP_SIGNBOARD_PRICE;
+    }
+
+    if (item_no == FTR_SUM_LOG_BED01) {
+        return 28000;
     }
 
     switch (ITEM_NAME_GET_TYPE(item_no)) {
@@ -1874,11 +1906,8 @@ extern int mSP_ShopOpen() {
     }
 
 #ifdef TARGET_PC
-    /* PC: Nook's shop is open 24/7 regardless of the in-game clock. Kept: the shop-upgrade construction (RENEW above), the first-job chores (forced open above), the
-     * restock (above) and the end-of-month raffle day, whose door / raffle flow is built on the clock. */
-    if (mSP_CheckFukubikiDay() == FALSE) {
-        return mSP_SHOP_STATUS_OPEN;
-    }
+    /* Phase 3: Tom Nook's shop is open 24/7/365 across all real-world timezones for drop-in players */
+    return mSP_SHOP_STATUS_OPEN;
 #endif
 
     if (now_hour >= mSP_GetShopOpenTime() && now_hour < mSP_GetShopCloseTime()) {

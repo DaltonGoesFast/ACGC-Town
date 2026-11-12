@@ -510,17 +510,40 @@ void pc_layout_box(int stretch, int* x, int* y, int* w, int* h) {
         ah = H - it - ib;
         aspect = 4.0f / 3.0f;
         if (g_pc_layout_portrait) {
-            /* Portrait menu UI: scale up and position in the top window (0.05f)
-             * so Dalton's 3D model stands clear above the mobile touch sheet */
-            float scale = 1.355f;
-            cw = (int)((float)aw * scale);
+            int sheet_top = pc_touch_sheet_top_y();
+            if (sheet_top > 0) {
+                /* Portrait menu UI with mobile touch sheet:
+                 * fit the OG 4:3 menu cleanly in the top region above the touch sheet. */
+                int avail_h = sheet_top - it - 8;
+                float scale = 1.20f;
+                if (avail_h < 2) avail_h = 2;
+                cw = (int)((float)aw * scale);
+                ch = (int)((float)cw / aspect);
+                if (ch > avail_h) {
+                    ch = avail_h;
+                    cw = (int)((float)ch * aspect);
+                }
+                if (cw < 2) cw = 2;
+                if (ch < 2) ch = 2;
+                *w = cw;
+                *h = ch;
+                *x = il + (aw - cw) / 2;
+                *y = it + (avail_h - ch) / 2;
+                return;
+            }
+            /* Other stretch==2 UI in portrait (title logos, pause menu): keep centered 4:3 */
+            cw = aw;
             ch = (int)((float)cw / aspect);
+            if (ch > ah) {
+                ch = ah;
+                cw = (int)((float)ch * aspect);
+            }
             if (cw < 2) cw = 2;
             if (ch < 2) ch = 2;
             *w = cw;
             *h = ch;
             *x = il + (aw - cw) / 2;
-            *y = it + (int)((float)(ah - ch) * 0.05f);
+            *y = it + (ah - ch) / 2;
             return;
         }
         if ((float)aw / (float)ah > aspect) {
