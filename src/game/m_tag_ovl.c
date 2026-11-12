@@ -32,6 +32,7 @@
                            * pc_net_game_is_droppable_item() -- see mTG_field_put_proc's seam. */
 #include <stdio.h>
 #include "pc_dresser_ui.h"
+#include "pc_cloud_storage.h"
 extern int g_pc_verbose; /* the dresser-mode cursor diagnostic prints only with --verbose */ /* dresser storage: the DRESSER MODE of the gyroid overlay (never the save's gyroid) */
 #include "pc_guest_mail.h" /* guest mailbox: pc_ui_mailbox() = THE mailbox of the overlay (the guest copy for a guest, else now_home's; NULL-guarded) */
 #include "pc_outdoor_furniture.h" /* outdoor furniture C1: the "Place" tag (mTG_TYPE_76 on PC) and the leaf-drop policy */
@@ -8571,9 +8572,19 @@ static void mTG_move_base(Submenu* submenu, mSM_MenuInfo_c* menu_info, mTG_tag_c
         sAdo_SysTrgStart(NA_SE_3);
         return;
     }
-    /* dresser mode: L / R do nothing (one page; vanilla L = catch into the hand, R = change window: neither applies to the dresser grid) */
+    /* dresser mode: L / R page flip for Cloud Storage */
     if (pc_dresser_ui_active() && menu_info->menu_type == mSM_OVL_HANIWA && (trigger & (BUTTON_B | BUTTON_START | BUTTON_Y | BUTTON_A)) == 0 &&
         (trigger & (BUTTON_L | BUTTON_R)) != 0) {
+        if (pc_cloud_storage_client_is_open()) {
+            if (trigger & BUTTON_L) {
+                pc_cloud_storage_client_prev_page();
+                sAdo_SysTrgStart(NA_SE_33);
+            } else if (trigger & BUTTON_R) {
+                pc_cloud_storage_client_next_page();
+                sAdo_SysTrgStart(NA_SE_33);
+            }
+            pc_dresser_ui_note_input();
+        }
         return;
     }
     /* Nook bulk sell basket: A on the "Sell" button (cursor column 5) or Start (Enter) = CONFIRM: the screen closes through the SAME path as B (mTG_move_cancel)

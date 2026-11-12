@@ -7,7 +7,12 @@
 #include "pc_net_game.h"
 #include "pc_dresser_layout.h"
 #include "pc_dresser_items.h"
-#include "pc_sell_ui.h" /* Nook bulk sell basket: BASKET mode of this screen delegates the grid contents / take / put to the local staging */
+#include "pc_sell_ui.h"
+#include "pc_cloud_storage.h"
+#include "pc_bedroom.h"
+#include "pc_touch.h"
+#include "m_common_data.h"
+#include "m_private.h" /* Nook bulk sell basket: BASKET mode of this screen delegates the grid contents / take / put to the local staging */
 
 static int s_active = 0;
 static int s_basket = 0; /* Nook bulk sell basket: the screen shows the sell basket (see pc_dresser_ui.h) */
@@ -32,6 +37,9 @@ void pc_dresser_ui_begin(const unsigned short vanilla[PC_DRESSER_UI_VANILLA]) {
     s_basket = 0;
     memset(&s_carry, 0, sizeof(s_carry));
     pc_dresser_ui_set_vanilla(vanilla);
+    if (pc_bedroom_is_in_bedroom() || pc_bedroom_is_in_lounge()) {
+        pc_cloud_storage_client_open(NULL);
+    }
 }
 
 void pc_dresser_ui_begin_basket(void) {
@@ -51,6 +59,9 @@ void pc_dresser_ui_end(void) {
     (void)pc_dresser_layout_end(); /* the enlarged gyroid window back to its pristine vertices (no-op when not remapped) */
     s_active = 0; /* a transaction still in flight resolves in the transaction layer (the pockets follow the host post-image) */
     s_basket = 0;
+    if (pc_cloud_storage_client_is_open()) {
+        pc_cloud_storage_client_close();
+    }
     if (s_carry.active) { /* 6r: closing while carrying = cancel (nothing was changed by the grab) */
         printf("[NET][DRESSER] gyroid overlay: closed while carrying 0x%04X: grab cancelled (nothing moved)\n", (unsigned)s_carry.item);
     }
@@ -99,6 +110,17 @@ int pc_dresser_ui_slot_item(int col) {
     int index = 0;
     if (s_basket) {
         return s_active ? pc_sell_ui_index_item(col) : 0; /* `col` = the 6 x 3 cursor table index: the staged pocket of that basket cell (0 = empty / the Sell button / beyond) */
+    }
+    if (pc_cloud_storage_client_is_open()) {
+        const PCCloudStorage* s = pc_cloud_storage_client_get();
+        int page = pc_cloud_storage_client_page();
+        if (s != NULL && col >= 0 && col < PC_CLOUD_STORAGE_PAGE_SIZE) {
+            int slot = page * PC_CLOUD_STORAGE_PAGE_SIZE + col;
+            if (slot >= 0 && slot < PC_CLOUD_STORAGE_MAX_ITEMS) {
+                return (int)s->items[slot];
+            }
+        }
+        return 0;
     }
     return pc_dresser_ui_slot(col, &index) == PC_DRESSER_UI_SLOT_EXTRA ? pc_net_game_dresser_item(index) : 0;
 }
@@ -159,6 +181,25 @@ int pc_dresser_ui_take(int col) {
     if (s_basket) {
         return s_active ? pc_sell_ui_take(pc_sell_ui_table_cell(col)) : PC_DRESSER_UI_ACT_REFUSED; /* "Take back": local staging only (cursor table index -> cell) */
     }
+    if (pc_cloud_storage_client_is_open()) {
+        PCCloudStorage* s = pc_cloud_storage_client_get();
+        if (s == NULL) return PC_DRESSER_UI_ACT_REFUSED;
+        int page = pc_cloud_storage_client_page();
+        int slot = page * PC_CLOUD_STORAGE_PAGE_SIZE + col;
+        pocket = pc_net_game_dresser_free_pocket();
+        if (pocket < 0) return PC_DRESSER_UI_ACT_NO_ROOM;
+        uint16_t out_item = 0;
+        int res = pc_cloud_storage_withdraw(s, slot, &out_item);
+        if (res == PC_CLOUD_STORAGE_OK && out_item != 0) {
+            if (Now_Private != NULL) {
+                Now_Private->inventory.pockets[pocket] = (mActor_name_t)out_item;
+                Now_Private->inventory.item_conditions = mPr_SET_ITEM_COND(Now_Private->inventory.item_conditions, pocket, mPr_ITEM_COND_NORMAL);
+            }
+            pc_cloud_storage_save(NULL, NULL, s);
+            return PC_DRESSER_UI_ACT_DONE;
+        }
+        return PC_DRESSER_UI_ACT_REFUSED;
+    }
     if (!s_active || s_pending || pc_dresser_ui_slot(col, &index) != PC_DRESSER_UI_SLOT_EXTRA || (item = pc_net_game_dresser_item(index)) == 0) {
         return PC_DRESSER_UI_ACT_REFUSED;
     }
@@ -175,6 +216,29 @@ int pc_dresser_ui_put(int pocket_slot) {
     char what[96];
     if (s_basket) {
         return s_active ? pc_sell_ui_put(pocket_slot) : PC_DRESSER_UI_ACT_REFUSED; /* "Add to Basket": local staging only */
+    }
+    /* Anti-hoarding rule: live critters (fish / bugs) cannot be stored in Cloud Storage! */
+    if (pc_cloud_storage_is_critter((uint16_t)item)) {
+        pc_touch_show_toast_ex("Live critters must be kept in pockets!", "Donate them to the Museum, sell to Tom Nook, or give them to a neighbor.", 4500);
+        return PC_DRESSER_UI_ACT_REFUSED;
+    }
+    if (pc_cloud_storage_client_is_open()) {
+        PCCloudStorage* s = pc_cloud_storage_client_get();
+        if (s == NULL || item == 0) return PC_DRESSER_UI_ACT_REFUSED;
+        int res = pc_cloud_storage_deposit(s, (uint16_t)item);
+        if (res == PC_CLOUD_STORAGE_CRITTER_BLOCKED) {
+            pc_touch_show_toast_ex("Live critters must be kept in pockets!", "Donate them to the Museum, sell to Tom Nook, or give them to a neighbor.", 4500);
+            return PC_DRESSER_UI_ACT_REFUSED;
+        }
+        if (res == PC_CLOUD_STORAGE_OK) {
+            if (Now_Private != NULL && pocket_slot >= 0 && pocket_slot < mPr_POCKETS_SLOT_COUNT) {
+                Now_Private->inventory.pockets[pocket_slot] = EMPTY_NO;
+                Now_Private->inventory.item_conditions = mPr_SET_ITEM_COND(Now_Private->inventory.item_conditions, pocket_slot, mPr_ITEM_COND_NORMAL);
+            }
+            pc_cloud_storage_save(NULL, NULL, s);
+            return PC_DRESSER_UI_ACT_DONE;
+        }
+        return PC_DRESSER_UI_ACT_FULL;
     }
     if (!s_active || s_pending || item == 0 || !pc_net_game_dresser_item_storable(item)) {
         return PC_DRESSER_UI_ACT_REFUSED;
@@ -242,6 +306,63 @@ int pc_dresser_ui_place(int to_pocket, int index) {
         return PC_DRESSER_UI_ACT_REFUSED;
     }
     target = to_pocket ? pc_net_game_dresser_pocket_item(index) : pc_dresser_ui_slot_item(index);
+    /* Anti-hoarding check: prevent putting critters into storage */
+    if (from_pocket && !to_pocket && pc_cloud_storage_is_critter((uint16_t)item)) {
+        pc_touch_show_toast_ex("Live critters must be kept in pockets!", "Donate them to the Museum, sell to Tom Nook, or give them to a neighbor.", 4500);
+        return PC_DRESSER_UI_ACT_REFUSED;
+    }
+    if (!from_pocket && to_pocket && target != 0 && pc_cloud_storage_is_critter((uint16_t)target)) {
+        pc_touch_show_toast_ex("Live critters must be kept in pockets!", "Donate them to the Museum, sell to Tom Nook, or give them to a neighbor.", 4500);
+        return PC_DRESSER_UI_ACT_REFUSED;
+    }
+    if (pc_cloud_storage_client_is_open()) {
+        PCCloudStorage* cs = pc_cloud_storage_client_get();
+        if (cs == NULL) return PC_DRESSER_UI_ACT_REFUSED;
+        int page = pc_cloud_storage_client_page();
+        if (!from_pocket && !to_pocket) {
+            int s_idx = page * PC_CLOUD_STORAGE_PAGE_SIZE + src;
+            int d_idx = page * PC_CLOUD_STORAGE_PAGE_SIZE + index;
+            uint16_t tmp = cs->items[d_idx];
+            cs->items[d_idx] = cs->items[s_idx];
+            cs->items[s_idx] = tmp;
+            pc_cloud_storage_save(NULL, NULL, cs);
+            return PC_DRESSER_UI_ACT_DONE;
+        }
+        if (!from_pocket && to_pocket) {
+            int s_idx = page * PC_CLOUD_STORAGE_PAGE_SIZE + src;
+            if (target == 0) {
+                uint16_t taken = cs->items[s_idx];
+                cs->items[s_idx] = 0;
+                if (cs->count > 0 && taken != 0) cs->count--;
+                if (Now_Private != NULL) {
+                    Now_Private->inventory.pockets[index] = (mActor_name_t)taken;
+                    Now_Private->inventory.item_conditions = mPr_SET_ITEM_COND(Now_Private->inventory.item_conditions, index, mPr_ITEM_COND_NORMAL);
+                }
+                pc_cloud_storage_save(NULL, NULL, cs);
+                return PC_DRESSER_UI_ACT_DONE;
+            } else {
+                cs->items[s_idx] = (uint16_t)target;
+                if (Now_Private != NULL) {
+                    Now_Private->inventory.pockets[index] = (mActor_name_t)item;
+                    Now_Private->inventory.item_conditions = mPr_SET_ITEM_COND(Now_Private->inventory.item_conditions, index, mPr_ITEM_COND_NORMAL);
+                }
+                pc_cloud_storage_save(NULL, NULL, cs);
+                return PC_DRESSER_UI_ACT_DONE;
+            }
+        }
+        if (from_pocket && !to_pocket) {
+            int d_idx = page * PC_CLOUD_STORAGE_PAGE_SIZE + index;
+            uint16_t existing = cs->items[d_idx];
+            cs->items[d_idx] = (uint16_t)item;
+            if (existing == 0 && item != 0) cs->count++;
+            if (Now_Private != NULL) {
+                Now_Private->inventory.pockets[src] = (existing != 0) ? (mActor_name_t)existing : EMPTY_NO;
+                Now_Private->inventory.item_conditions = mPr_SET_ITEM_COND(Now_Private->inventory.item_conditions, src, mPr_ITEM_COND_NORMAL);
+            }
+            pc_cloud_storage_save(NULL, NULL, cs);
+            return PC_DRESSER_UI_ACT_DONE;
+        }
+    }
     if (!from_pocket && !to_pocket) { /* cell -> cell: MOVE (an occupied target = swap inside the pool) */
         snprintf(what, sizeof(what), "GRAB place: grid %d -> grid %d (%s)", src, index, target != 0 ? "SWAP" : "MOVE");
         return pc_dresser_ui_send(3, src | (index << 8), 0, item, what);

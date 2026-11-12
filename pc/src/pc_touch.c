@@ -12,6 +12,8 @@
 #include "pc_typing.h"
 #include "pc_chat.h"
 #include "pc_bedroom.h"
+#include "pc_cloud_storage.h"
+#include "pc_dresser_ui.h"
 
 extern int pc_creator_menu_active(void);
 extern void pc_creator_menu_pointer(float fx, float fy);
@@ -54,7 +56,8 @@ extern void pc_creator_menu_pointer(float fx, float fy);
 #define HUD_KEYS 4
 
 enum { HIT_NONE = 0, HIT_PICTURE, HIT_STICK, HIT_NUB, HIT_ACTION, HIT_BACK, HIT_MENU, HIT_KEY, HIT_BAG, HIT_MAP, HIT_CLOSE, HIT_CONTEXT, HIT_CHOICE, HIT_SUB_TAB,
-       HIT_SHEET_CLOSE, HIT_SHEET_BELLS, HIT_SHEET_TAB, HIT_SHEET_CARD, HIT_SHEET_ACT, HIT_SHEET_BODY, HIT_CAM };
+       HIT_SHEET_CLOSE, HIT_SHEET_BELLS, HIT_SHEET_TAB, HIT_SHEET_CARD, HIT_SHEET_ACT, HIT_SHEET_BODY, HIT_CAM,
+       HIT_STORAGE, HIT_STOR_PREV, HIT_STOR_NEXT };
 
 typedef struct {
     int active;            /* 1 if drawer is visible */
@@ -159,6 +162,10 @@ typedef struct {
     float bag_x, bag_y, map_x, map_y, cam_x, cam_y, cam_r, qr;
     float close_x, close_y, close_r, ctx_x, ctx_y, ctx_r;
     float choice_x, choice_r, choice_y[6];
+    int show_storage;
+    float storage_x, storage_y;
+    int show_stor_pages;
+    float stor_prev_x, stor_prev_y, stor_next_x, stor_next_y, stor_page_r;
     float sub_tab_x[4], sub_tab_y[4], sub_tab_r;
     int sub_tab_id[4];
     int key_n;
@@ -518,11 +525,37 @@ static void hud_build(Hud* h) {
         h->bx = W - h->bx; h->mx = W - h->mx;
         h->bag_x = W - h->bag_x; h->map_x = W - h->map_x; h->cam_x = W - h->cam_x;
         h->close_x = W - h->close_x;
+        h->storage_x = W - h->storage_x;
+        h->stor_prev_x = W - h->stor_prev_x;
+        h->stor_next_x = W - h->stor_next_x;
         h->ctx_x = W - h->ctx_x;
         for (int i = 0; i < h->key_n; i++) h->kx[i] = W - h->kx[i];
         for (int i = 0; i < h->sub_tab_n; i++) h->sub_tab_x[i] = W - h->sub_tab_x[i];
     }
     if (!h->show_stick) { h->sx = -1000.0f; }
+
+    h->show_storage = 0;
+    if (!h->show_keys && (pc_bedroom_is_in_bedroom() || pc_bedroom_is_in_lounge()) && !submenu_open()) {
+        h->show_storage = 1;
+        if (g_pc_layout_portrait) {
+            h->storage_x = h->bag_x;
+            h->storage_y = h->cam_y - h->qr * 2.35f;
+        } else {
+            h->storage_x = h->bag_x + h->qr * 2.3f;
+            h->storage_y = h->bag_y;
+        }
+    }
+    h->show_stor_pages = 0;
+    if (submenu_open() && pc_dresser_ui_active() && pc_cloud_storage_client_is_open()) {
+        h->show_stor_pages = 1;
+        float page_btn_r = 26.0f * ((float)H / 720.0f);
+        if (page_btn_r < 20.0f) page_btn_r = 20.0f;
+        h->stor_page_r = page_btn_r;
+        h->stor_prev_x = W * 0.5f - 120.0f * ((float)H / 720.0f);
+        h->stor_prev_y = H * 0.88f;
+        h->stor_next_x = W * 0.5f + 120.0f * ((float)H / 720.0f);
+        h->stor_next_y = H * 0.88f;
+    }
 
     mobile_sheet_layout();
     if (s_sheet.active) {
@@ -571,6 +604,11 @@ static int classify(float x, float y, Hud* h, int* key) {
     }
     if (h->show_close && hit_disc(x, y, h->close_x, h->close_y, h->close_r)) return HIT_CLOSE;
     if (h->show_context && hit_disc(x, y, h->ctx_x, h->ctx_y, h->ctx_r)) return HIT_CONTEXT;
+    if (h->show_storage && hit_disc(x, y, h->storage_x, h->storage_y, h->qr)) return HIT_STORAGE;
+    if (h->show_stor_pages) {
+        if (hit_disc(x, y, h->stor_prev_x, h->stor_prev_y, h->stor_page_r)) return HIT_STOR_PREV;
+        if (hit_disc(x, y, h->stor_next_x, h->stor_next_y, h->stor_page_r)) return HIT_STOR_NEXT;
+    }
     if (h->show_quick && hit_disc(x, y, h->bag_x, h->bag_y, h->qr)) return HIT_BAG;
     if (h->show_quick && hit_disc(x, y, h->map_x, h->map_y, h->qr)) return HIT_MAP;
     if (h->show_cam && hit_disc(x, y, h->cam_x, h->cam_y, h->cam_r)) return HIT_CAM;
@@ -1548,6 +1586,24 @@ void pc_touch_apply(unsigned short* buttons, signed char* stick_x, signed char* 
             } else if (th == HIT_CHOICE) {
                 pick_choice(tk);
                 pc_touch_buzz();
+            } else if (th == HIT_STORAGE) {
+                pc_touch_buzz();
+                pc_diag_milestone("touch storage");
+                if (!submenu_open() && get_game_play() != NULL) {
+                    pc_cloud_storage_client_open(NULL);
+                    pc_dresser_ui_begin(NULL);
+                    mSM_open_submenu(&get_game_play()->submenu, mSM_OVL_INVENTORY, mSM_IV_OPEN_HANIWA_ENTRUST, 0);
+                }
+            } else if (th == HIT_STOR_PREV) {
+                pc_touch_buzz();
+                pc_cloud_storage_client_prev_page();
+                pc_dresser_ui_note_input();
+                sAdo_SysTrgStart(NA_SE_CURSOL);
+            } else if (th == HIT_STOR_NEXT) {
+                pc_touch_buzz();
+                pc_cloud_storage_client_next_page();
+                pc_dresser_ui_note_input();
+                sAdo_SysTrgStart(NA_SE_CURSOL);
             } else if (th == HIT_BAG) {
                 latch_button(PAD_BUTTON_Y, "Y");
                 pc_touch_buzz();
@@ -3112,6 +3168,66 @@ static const char* action_word(void) {
     return "Action";
 }
 
+static char s_toast_title[128] = {0};
+static char s_toast_sub[160] = {0};
+static Uint32 s_toast_expire_ms = 0;
+static Uint32 s_toast_start_ms = 0;
+
+void pc_touch_show_toast(const char* text) {
+    pc_touch_show_toast_ex(text, NULL, 3500);
+}
+
+void pc_touch_show_toast_ex(const char* title, const char* subtitle, uint32_t duration_ms) {
+    if (title != NULL) {
+        snprintf(s_toast_title, sizeof(s_toast_title), "%s", title);
+    } else {
+        s_toast_title[0] = 0;
+    }
+    if (subtitle != NULL) {
+        snprintf(s_toast_sub, sizeof(s_toast_sub), "%s", subtitle);
+    } else {
+        s_toast_sub[0] = 0;
+    }
+    s_toast_start_ms = SDL_GetTicks();
+    s_toast_expire_ms = s_toast_start_ms + (duration_ms > 0 ? duration_ms : 3500);
+}
+
+static void draw_toast_banner(void) {
+    Uint32 now = SDL_GetTicks();
+    if (now >= s_toast_expire_ms || s_toast_title[0] == 0) {
+        return;
+    }
+    float elapsed = (float)(now - s_toast_start_ms);
+    float remain = (float)(s_toast_expire_ms - now);
+    float alpha = 1.0f;
+    if (elapsed < 200.0f) {
+        alpha = elapsed / 200.0f;
+    } else if (remain < 350.0f) {
+        alpha = remain / 350.0f;
+    }
+    if (alpha <= 0.01f) return;
+
+    float W = (float)g_pc_window_w, H = (float)g_pc_window_h;
+    float ui = fmaxf(1.0f, H / 720.0f);
+    int has_sub = (s_toast_sub[0] != 0);
+    float bw = fminf(560.0f * ui, W * 0.94f);
+    float bh = has_sub ? (62.0f * ui) : (42.0f * ui);
+    float cx = W * 0.5f;
+    float cy = H * 0.12f;
+    float x0 = cx - bw * 0.5f, y0 = cy - bh * 0.5f;
+    float x1 = cx + bw * 0.5f, y1 = cy + bh * 0.5f;
+
+    round_rect(x0 + 2.0f * ui, y0 + 3.0f * ui, x1 + 2.0f * ui, y1 + 3.0f * ui, 16.0f * ui, 0.02f, 0.04f, 0.02f, 0.35f * alpha);
+    round_rect(x0, y0, x1, y1, 16.0f * ui, 0.12f, 0.14f, 0.12f, 0.92f * alpha);
+
+    if (has_sub) {
+        draw_text_ac(s_toast_title, cx, cy - 11.0f * ui, 2.3f * ui, 1.0f, 0.95f, 0.75f, 1.0f * alpha, 1, 64);
+        draw_text_ac(s_toast_sub, cx, cy + 13.0f * ui, 1.5f * ui, 0.90f, 0.92f, 0.88f, 0.95f * alpha, 1, 96);
+    } else {
+        draw_text_ac(s_toast_title, cx, cy, 2.3f * ui, 1.0f, 0.95f, 0.75f, 1.0f * alpha, 1, 64);
+    }
+}
+
 static void pc_bedroom_draw_claim_modal(void) {
     if (!pc_bedroom_claim_prompt_active()) return;
     float W = (float)g_pc_window_w, H = (float)g_pc_window_h;
@@ -3190,6 +3306,22 @@ void pc_touch_present(void) {
         /* Floating mint knob */
         disc(kx, ky, 24.0f, 0.36f, 0.65f, 0.45f, 0.92f);
         disc(kx, ky - 4.0f, 15.0f, 0.95f, 0.98f, 0.94f, 0.35f);
+    }
+    if (h.show_storage) {
+        button(h.storage_x, h.storage_y, h.qr, 0.72f, 0.84f, 0.96f);
+        draw_word("Store", h.storage_x, h.storage_y, h.qr * 0.13f);
+    }
+    if (h.show_stor_pages) {
+        int cur_p = pc_cloud_storage_client_page() + 1;
+        int max_p = (PC_CLOUD_STORAGE_MAX_ITEMS / PC_CLOUD_STORAGE_PAGE_SIZE);
+        char pbuf[32];
+        snprintf(pbuf, sizeof(pbuf), "PAGE %d/%d", cur_p, max_p);
+        float ui = fmaxf(1.0f, (float)g_pc_window_h / 720.0f);
+        button(h.stor_prev_x, h.stor_prev_y, h.stor_page_r, 0.88f, 0.90f, 0.88f);
+        draw_word("<", h.stor_prev_x, h.stor_prev_y, h.stor_page_r * 0.18f);
+        button(h.stor_next_x, h.stor_next_y, h.stor_page_r, 0.88f, 0.90f, 0.88f);
+        draw_word(">", h.stor_next_x, h.stor_next_y, h.stor_page_r * 0.18f);
+        draw_str_raw(pbuf, (h.stor_prev_x + h.stor_next_x) * 0.5f, h.stor_prev_y, 2.5f * ui, 0.20f, 0.22f, 0.20f, 1.0f, 16);
     }
     if (h.show_quick) {
         button(h.bag_x, h.bag_y, h.qr, 0.95f, 0.92f, 0.82f);
@@ -3298,6 +3430,7 @@ void pc_touch_present(void) {
     if (pc_bedroom_claim_prompt_active()) {
         pc_bedroom_draw_claim_modal();
     }
+    draw_toast_banner();
     if (s_nvert < 3) { pc_gx_external_gl_done(); return; }
     glDisable(GL_DEPTH_TEST);
     glDisable(GL_CULL_FACE);
