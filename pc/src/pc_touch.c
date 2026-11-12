@@ -71,6 +71,9 @@ typedef struct {
     /* Card grid layout (15 slots: 5 cols x 3 rows) */
     float card_x0[15], card_y0[15], card_x1[15], card_y1[15];
 
+    /* Detail banner layout */
+    float detail_x0, detail_y0, detail_x1, detail_y1;
+
     /* Action bar buttons */
     int num_actions;
     const char* action_labels[4];
@@ -1645,12 +1648,12 @@ static void gl_init(void) {
     s_gl_ready = 1;
 }
 
-static float s_vert[8 * 16000];
+static float s_vert[8 * 32000];
 static int s_nvert = 0;
 
 static void vert(float x, float y, float u, float v, float r, float g, float b, float a) {
     float* p;
-    if (s_nvert >= 16000) return;
+    if (s_nvert >= 32000) return;
     p = s_vert + s_nvert * 8;
     p[0] = x; p[1] = y; p[2] = r; p[3] = g; p[4] = b; p[5] = a; p[6] = u; p[7] = v;
     s_nvert++;
@@ -1758,7 +1761,7 @@ static const unsigned char k_glyph[48][7] = {
 };
 
 static void glyph_raw(char ch, float cx, float cy, float s, float r, float g, float b, float a) {
-    int idx = -1, row, col;
+    int idx = -1, row;
     if (ch >= 'a' && ch <= 'z') ch = ch - 'a' + 'A';
     if (ch >= 'A' && ch <= 'Z') idx = ch - 'A';
     else if (ch == '<') idx = 26;
@@ -1777,11 +1780,20 @@ static void glyph_raw(char ch, float cx, float cy, float s, float r, float g, fl
     if (idx < 0 || idx >= 48) return;
     for (row = 0; row < 7; row++) {
         unsigned bits = k_glyph[idx][row];
-        for (col = 0; col < 5; col++) {
+        int col = 0;
+        while (col < 5) {
             if (bits & (1u << (4 - col))) {
-                float px = cx + ((float)col - 2.0f) * s;
-                float py = cy + ((float)row - 3.0f) * s;
-                disc_raw(px, py, s * 0.55f, r, g, b, a);
+                int start_col = col;
+                while (col < 5 && (bits & (1u << (4 - col)))) {
+                    col++;
+                }
+                float x0 = cx + ((float)start_col - 2.0f - 0.48f) * s;
+                float x1 = cx + ((float)(col - 1) - 2.0f + 0.48f) * s;
+                float y0 = cy + ((float)row - 3.0f - 0.48f) * s;
+                float y1 = cy + ((float)row - 3.0f + 0.48f) * s;
+                rect_raw(x0, y0, x1, y1, r, g, b, a);
+            } else {
+                col++;
             }
         }
     }
@@ -1904,10 +1916,46 @@ static void get_item_category_color(mActor_name_t item, float* r, float* g, floa
     }
 }
 
+static void get_clean_string(const u8* src, int max_src, char* dst, int max_dst) {
+    int i, len = 0;
+    if (dst == NULL || max_dst <= 0) return;
+    dst[0] = 0;
+    if (src == NULL) return;
+    for (i = 0; i < max_src && len + 1 < max_dst; i++) {
+        u8 c = src[i];
+        if (c >= 32 && c <= 126) {
+            dst[len++] = (char)c;
+        } else if (c == 0) {
+            break;
+        }
+    }
+    while (len > 0 && dst[len - 1] == ' ') {
+        len--;
+    }
+    dst[len] = 0;
+}
+
+static const char* get_item_category_name(mActor_name_t item) {
+    if (item == EMPTY_NO || item == 0) return "EMPTY";
+    if (ITEM_IS_TOOL(item) || (item >= ITM_MY_ORG_UMBRELLA0 && item <= ITM_MY_ORG_UMBRELLA7)) return "TOOL";
+    if (ITEM_IS_CLOTH(item) || item == RSV_CLOTH) return "CLOTHES";
+    if (ITEM_IS_FTR(item)) return "FURNITURE";
+    if (ITEM_IS_CARPET(item)) return "CARPET";
+    if (ITEM_IS_WALL(item)) return "WALLPAPER";
+    if (ITEM_IS_FISH(item)) return "FISH";
+    if (ITEM_IS_INSECT(item)) return "INSECT";
+    if (ITEM_IS_PAPER(item)) return "PAPER";
+    if (ITEM_NAME_GET_CAT(item) == ITEM1_CAT_FRUIT) return "FRUIT";
+    if (ITEM_NAME_GET_CAT(item) == ITEM1_CAT_PLANT) return "PLANT";
+    if (ITEM_NAME_GET_CAT(item) == ITEM1_CAT_KABU) return "TURNIP";
+    if (item >= ITM_MONEY_START && item <= ITM_MONEY_END) return "BELLS";
+    return "ITEM";
+}
+
 static void mobile_sheet_layout(void) {
     float W = (float)g_pc_window_w, H = (float)g_pc_window_h;
-    float sheet_y0, tab_y, tab_w, tab_h, tab_start_x, tab_step;
-    float margin_x, gap_x, gap_y, grid_top, card_w, card_h;
+    float sheet_y0, tab_h, header_h, act_h, detail_h;
+    float margin_x, gap_x, gap_y, card_w, card_h, cur_y;
     int c, r, i;
 
     if (!g_pc_layout_portrait) {
@@ -1924,70 +1972,97 @@ static void mobile_sheet_layout(void) {
         s_sheet.sel_slot = 0;
     }
 
-    /* Bottom ~62% of portrait screen */
-    sheet_y0 = H * 0.38f;
+    margin_x = 12.0f;
+    gap_x = 8.0f;
+    gap_y = 10.0f;
+    card_w = (W - 2.0f * margin_x - 4.0f * gap_x) / 5.0f;
+
+    /* Responsive card height based on screen height */
+    card_h = (H * 0.65f - 350.0f) / 3.0f;
+    if (card_h > 230.0f) card_h = 230.0f;
+    if (card_h < 130.0f) card_h = 130.0f;
+
+    act_h = 58.0f;
+    detail_h = (card_h > 180.0f) ? 92.0f : 78.0f;
+    tab_h = 46.0f;
+    header_h = 44.0f;
+
+    /* Total sheet height from top handle to bottom */
+    float sheet_content_h = 24.0f /* top handle */
+                          + header_h + 12.0f
+                          + tab_h + 12.0f
+                          + (3.0f * card_h + 2.0f * gap_y) + 12.0f
+                          + detail_h + 12.0f
+                          + act_h + 22.0f /* bottom margin */;
+
+    sheet_y0 = H - sheet_content_h;
+    if (sheet_y0 < H * 0.28f) sheet_y0 = H * 0.28f;
+
     s_sheet.sheet_x0 = 0.0f;
     s_sheet.sheet_y0 = sheet_y0;
     s_sheet.sheet_x1 = W;
     s_sheet.sheet_y1 = H;
 
-    /* Header controls */
-    s_sheet.close_w = 72.0f;
-    s_sheet.close_h = 32.0f;
-    s_sheet.close_cx = W - 18.0f - s_sheet.close_w * 0.5f;
-    s_sheet.close_cy = sheet_y0 + 36.0f;
+    /* Lay out elements from top to bottom */
+    cur_y = sheet_y0 + 18.0f;
 
-    s_sheet.bells_w = 114.0f;
-    s_sheet.bells_h = 32.0f;
+    /* Header */
+    s_sheet.close_w = 92.0f;
+    s_sheet.close_h = header_h;
+    s_sheet.close_cx = W - margin_x - s_sheet.close_w * 0.5f;
+    s_sheet.close_cy = cur_y + header_h * 0.5f;
+
+    s_sheet.bells_w = 140.0f;
+    s_sheet.bells_h = header_h;
     s_sheet.bells_cx = s_sheet.close_cx - s_sheet.close_w * 0.5f - 10.0f - s_sheet.bells_w * 0.5f;
-    s_sheet.bells_cy = sheet_y0 + 36.0f;
+    s_sheet.bells_cy = cur_y + header_h * 0.5f;
+
+    cur_y += header_h + 10.0f;
 
     /* Category Tabs (4 tabs) */
-    tab_y = sheet_y0 + 74.0f;
-    tab_h = 34.0f;
-    margin_x = 16.0f;
-    tab_w = (W - 2.0f * margin_x - 3.0f * 8.0f) / 4.0f;
-    tab_step = tab_w + 8.0f;
-    tab_start_x = margin_x + tab_w * 0.5f;
-    for (i = 0; i < 4; i++) {
-        s_sheet.tab_cx[i] = tab_start_x + (float)i * tab_step;
-        s_sheet.tab_cy[i] = tab_y;
-        s_sheet.tab_w[i] = tab_w;
-        s_sheet.tab_h[i] = tab_h;
+    {
+        float tab_margin = 12.0f;
+        float tab_gap = 8.0f;
+        float tab_w = (W - 2.0f * tab_margin - 3.0f * tab_gap) / 4.0f;
+        float tab_cy = cur_y + tab_h * 0.5f;
+        for (i = 0; i < 4; i++) {
+            s_sheet.tab_cx[i] = tab_margin + tab_w * 0.5f + (float)i * (tab_w + tab_gap);
+            s_sheet.tab_cy[i] = tab_cy;
+            s_sheet.tab_w[i] = tab_w;
+            s_sheet.tab_h[i] = tab_h;
+        }
     }
+    cur_y += tab_h + 10.0f;
 
-    /* 15 Pocket Cards (5 cols x 3 rows) */
-    gap_x = 8.0f;
-    gap_y = 8.0f;
-    margin_x = 14.0f;
-    grid_top = sheet_y0 + 104.0f;
-    card_w = (W - 2.0f * margin_x - 4.0f * gap_x) / 5.0f;
-
-    card_h = (H - grid_top - 95.0f) / 3.4f;
-    if (card_h > 140.0f) card_h = 140.0f;
-    if (card_h < 65.0f) card_h = 65.0f;
-
+    /* 15 Pocket Cards Grid */
     for (r = 0; r < 3; r++) {
         for (c = 0; c < 5; c++) {
             int slot = r * 5 + c;
             float x0 = margin_x + (float)c * (card_w + gap_x);
-            float y0 = grid_top + (float)r * (card_h + gap_y);
+            float y0 = cur_y + (float)r * (card_h + gap_y);
             s_sheet.card_x0[slot] = x0;
             s_sheet.card_y0[slot] = y0;
             s_sheet.card_x1[slot] = x0 + card_w;
             s_sheet.card_y1[slot] = y0 + card_h;
         }
     }
+    cur_y += 3.0f * card_h + 2.0f * gap_y + 10.0f;
+
+    /* Detail Banner */
+    s_sheet.detail_x0 = margin_x;
+    s_sheet.detail_x1 = W - margin_x;
+    s_sheet.detail_y0 = cur_y;
+    s_sheet.detail_y1 = cur_y + detail_h;
+    cur_y += detail_h + 10.0f;
 
     /* Action bar */
     {
-        float act_cy = grid_top + 3.0f * (card_h + gap_y) + 38.0f;
-        float act_w, act_h, act_margin, act_step;
+        float act_cy = cur_y + act_h * 0.5f;
+        float act_w, act_margin, act_step;
         Private_c* priv = Now_Private;
         mActor_name_t item = EMPTY_NO;
 
-        if (act_cy + 25.0f > H - 10.0f) act_cy = H - 35.0f;
-        act_h = 44.0f;
+        if (act_cy + act_h * 0.5f > H - 8.0f) act_cy = H - 8.0f - act_h * 0.5f;
 
         s_sheet.num_actions = 0;
         if (priv != NULL && s_sheet.sel_slot >= 0 && s_sheet.sel_slot < 15) {
@@ -2039,9 +2114,9 @@ static void mobile_sheet_layout(void) {
             s_sheet.num_actions = 1;
         }
 
-        act_margin = 16.0f;
-        act_w = (W - 2.0f * act_margin - (float)(s_sheet.num_actions - 1) * 8.0f) / (float)s_sheet.num_actions;
-        act_step = act_w + 8.0f;
+        act_margin = 14.0f;
+        act_w = (W - 2.0f * act_margin - (float)(s_sheet.num_actions - 1) * 10.0f) / (float)s_sheet.num_actions;
+        act_step = act_w + 10.0f;
         for (i = 0; i < s_sheet.num_actions; i++) {
             s_sheet.act_cx[i] = act_margin + act_w * 0.5f + (float)i * act_step;
             s_sheet.act_cy[i] = act_cy;
@@ -2360,20 +2435,30 @@ static void mobile_sheet_draw(void) {
     round_rect(0.0f, s_sheet.sheet_y0, W, H + 40.0f, 26.0f, 0.96f, 0.95f, 0.92f, 0.99f);
 
     /* Mobile drawer top handle pill */
-    pill(W * 0.5f, s_sheet.sheet_y0 + 10.0f, 42.0f, 4.5f, 0.68f, 0.66f, 0.62f, 0.85f);
+    pill(W * 0.5f, s_sheet.sheet_y0 + 10.0f, 48.0f, 5.0f, 0.68f, 0.66f, 0.62f, 0.85f);
 
-    /* Header: Player Name & Land */
-    snprintf(buf, sizeof(buf), "%s * %s", priv->player_ID.player_name, priv->player_ID.land_name);
-    draw_str_left_raw(buf, 20.0f, s_sheet.sheet_y0 + 36.0f, 2.7f, 0.22f, 0.26f, 0.24f, 1.0f, 26);
+    /* Header: Player Name & Land (clean string without non-ASCII garbage) */
+    {
+        char pname[16], lname[16];
+        get_clean_string(priv->player_ID.player_name, 8, pname, sizeof(pname));
+        get_clean_string(priv->player_ID.land_name, 8, lname, sizeof(lname));
+        if (pname[0] == 0) snprintf(pname, sizeof(pname), "PLAYER");
+        if (lname[0] != 0) {
+            snprintf(buf, sizeof(buf), "%s * %s", pname, lname);
+        } else {
+            snprintf(buf, sizeof(buf), "%s", pname);
+        }
+        draw_str_left_raw(buf, 18.0f, s_sheet.close_cy, 3.2f, 0.22f, 0.26f, 0.24f, 1.0f, 22);
+    }
 
     /* Bells button */
     pill_button_shadow(s_sheet.bells_cx, s_sheet.bells_cy, s_sheet.bells_w, s_sheet.bells_h, 0.98f, 0.82f, 0.20f, 1.0f);
     snprintf(buf, sizeof(buf), "$ %u", (unsigned int)priv->inventory.wallet);
-    draw_str_raw(buf, s_sheet.bells_cx, s_sheet.bells_cy, 2.3f, 0.18f, 0.16f, 0.05f, 1.0f, 14);
+    draw_str_raw(buf, s_sheet.bells_cx, s_sheet.bells_cy, 2.7f, 0.18f, 0.16f, 0.05f, 1.0f, 14);
 
     /* Close button */
     pill_button_shadow(s_sheet.close_cx, s_sheet.close_cy, s_sheet.close_w, s_sheet.close_h, 0.92f, 0.40f, 0.35f, 1.0f);
-    draw_str_raw("CLOSE", s_sheet.close_cx, s_sheet.close_cy, 2.3f, 1.0f, 1.0f, 1.0f, 1.0f, 6);
+    draw_str_raw("CLOSE", s_sheet.close_cx, s_sheet.close_cy, 2.7f, 1.0f, 1.0f, 1.0f, 1.0f, 6);
 
     /* Category Tabs */
     {
@@ -2383,11 +2468,11 @@ static void mobile_sheet_draw(void) {
             float cx = s_sheet.tab_cx[i], cy = s_sheet.tab_cy[i];
             float tw = s_sheet.tab_w[i], th = s_sheet.tab_h[i];
             if (active) {
-                pill_button_shadow(cx, cy, tw, th, 0.30f, 0.68f, 0.48f, 1.0f);
-                draw_str_raw(tab_names[i], cx, cy, 2.2f, 1.0f, 1.0f, 1.0f, 1.0f, 8);
+                pill_button_shadow(cx, cy, tw, th, 0.28f, 0.70f, 0.46f, 1.0f);
+                draw_str_raw(tab_names[i], cx, cy, 2.8f, 1.0f, 1.0f, 1.0f, 1.0f, 8);
             } else {
-                pill_button_shadow(cx, cy, tw, th, 0.90f, 0.88f, 0.84f, 0.95f);
-                draw_str_raw(tab_names[i], cx, cy, 2.0f, 0.45f, 0.43f, 0.40f, 1.0f, 8);
+                pill_button_shadow(cx, cy, tw, th, 0.89f, 0.87f, 0.83f, 0.95f);
+                draw_str_raw(tab_names[i], cx, cy, 2.6f, 0.42f, 0.40f, 0.38f, 1.0f, 8);
             }
         }
     }
@@ -2405,23 +2490,23 @@ static void mobile_sheet_draw(void) {
 
             /* Selection / Swap highlight ring */
             if (s_sheet.swap_mode && s_sheet.swap_source == i) {
-                round_rect(x0 - 3.5f, y0 - 3.5f, x1 + 3.5f, y1 + 3.5f, 15.0f, 0.96f, 0.62f, 0.12f, 0.95f);
+                round_rect(x0 - 4.0f, y0 - 4.0f, x1 + 4.0f, y1 + 4.0f, 16.0f, 0.98f, 0.60f, 0.12f, 0.95f);
             } else if (s_sheet.sel_slot == i) {
-                round_rect(x0 - 3.5f, y0 - 3.5f, x1 + 3.5f, y1 + 3.5f, 15.0f, 0.22f, 0.55f, 0.95f, 0.90f);
+                round_rect(x0 - 4.0f, y0 - 4.0f, x1 + 4.0f, y1 + 4.0f, 16.0f, 0.20f, 0.55f, 0.98f, 0.95f);
             }
 
             if (item == EMPTY_NO || item == 0) {
                 /* Empty card */
-                round_rect(x0, y0, x1, y1, 12.0f, 0.92f, 0.91f, 0.88f, 0.75f);
-                draw_str_raw("EMPTY", cx, cy, 2.1f, 0.60f, 0.58f, 0.55f, 0.90f, 6);
+                round_rect(x0, y0, x1, y1, 14.0f, 0.92f, 0.91f, 0.88f, 0.75f);
+                draw_str_raw("EMPTY", cx, cy, 2.6f, 0.60f, 0.58f, 0.55f, 0.90f, 6);
             } else {
                 /* Filled card */
-                round_rect(x0 + 1.5f, y0 + 2.0f, x1 + 1.5f, y1 + 2.0f, 12.0f, 0.05f, 0.08f, 0.05f, 0.14f);
-                round_rect(x0, y0, x1, y1, 12.0f, 1.0f, 1.0f, 1.0f, 0.99f);
+                round_rect(x0 + 1.5f, y0 + 2.0f, x1 + 1.5f, y1 + 2.0f, 14.0f, 0.05f, 0.08f, 0.05f, 0.14f);
+                round_rect(x0, y0, x1, y1, 14.0f, 1.0f, 1.0f, 1.0f, 0.99f);
 
                 /* Category top bar */
                 get_item_category_color(item, &cr, &cg, &cb);
-                round_rect(x0 + 4.0f, y0 + 4.0f, x1 - 4.0f, y0 + 13.0f, 4.0f, cr, cg, cb, 0.95f);
+                round_rect(x0 + 4.0f, y0 + 4.0f, x1 - 4.0f, y0 + 16.0f, 4.0f, cr, cg, cb, 0.95f);
 
                 /* Item name */
                 get_item_name(item, iname, sizeof(iname));
@@ -2433,20 +2518,64 @@ static void mobile_sheet_draw(void) {
                         memcpy(w1, iname, l1);
                         w1[l1] = 0;
                         snprintf(w2, sizeof(w2), "%s", sp + 1);
-                        draw_str_raw(w1, cx, cy - 8.0f, 2.1f, 0.16f, 0.18f, 0.16f, 1.0f, 12);
-                        draw_str_raw(w2, cx, cy + 9.0f, 2.1f, 0.16f, 0.18f, 0.16f, 1.0f, 12);
+                        draw_str_raw(w1, cx, cy - 13.0f, 2.8f, 0.16f, 0.18f, 0.16f, 1.0f, 12);
+                        draw_str_raw(w2, cx, cy + 13.0f, 2.8f, 0.16f, 0.18f, 0.16f, 1.0f, 12);
                     } else {
-                        draw_str_raw(iname, cx, cy, 2.2f, 0.16f, 0.18f, 0.16f, 1.0f, 13);
+                        draw_str_raw(iname, cx, cy, 2.9f, 0.16f, 0.18f, 0.16f, 1.0f, 13);
                     }
                 }
 
                 /* Badges */
                 if (priv->equipment == item) {
-                    pill_button_shadow(x1 - 25.0f, y1 - 10.0f, 42.0f, 16.0f, 0.28f, 0.75f, 0.45f, 1.0f);
-                    draw_str_raw("HELD", x1 - 25.0f, y1 - 10.0f, 1.5f, 1.0f, 1.0f, 1.0f, 1.0f, 4);
+                    pill_button_shadow(cx, y1 - 18.0f, 62.0f, 22.0f, 0.28f, 0.75f, 0.45f, 1.0f);
+                    draw_str_raw("HELD", cx, y1 - 18.0f, 2.0f, 1.0f, 1.0f, 1.0f, 1.0f, 4);
                 } else if (priv->cloth.item == item) {
-                    pill_button_shadow(x1 - 25.0f, y1 - 10.0f, 42.0f, 16.0f, 0.96f, 0.52f, 0.30f, 1.0f);
-                    draw_str_raw("WORN", x1 - 25.0f, y1 - 10.0f, 1.5f, 1.0f, 1.0f, 1.0f, 1.0f, 4);
+                    pill_button_shadow(cx, y1 - 18.0f, 62.0f, 22.0f, 0.96f, 0.52f, 0.30f, 1.0f);
+                    draw_str_raw("WORN", cx, y1 - 18.0f, 2.0f, 1.0f, 1.0f, 1.0f, 1.0f, 4);
+                }
+            }
+        }
+
+        /* Detail Banner */
+        {
+            float dx0 = s_sheet.detail_x0, dy0 = s_sheet.detail_y0;
+            float dx1 = s_sheet.detail_x1, dy1 = s_sheet.detail_y1;
+            float dcx = (dx0 + dx1) * 0.5f, dcy = (dy0 + dy1) * 0.5f;
+
+            if (s_sheet.swap_mode) {
+                round_rect(dx0 + 1.5f, dy0 + 2.0f, dx1 + 1.5f, dy1 + 2.0f, 14.0f, 0.05f, 0.08f, 0.05f, 0.15f);
+                round_rect(dx0, dy0, dx1, dy1, 14.0f, 0.98f, 0.78f, 0.20f, 0.98f);
+                draw_str_raw("SWAP MODE ACTIVE", dcx, dcy - 12.0f, 3.2f, 0.18f, 0.16f, 0.05f, 1.0f, 20);
+                draw_str_raw("TAP A SECOND SLOT TO SWAP ITEMS", dcx, dcy + 14.0f, 2.4f, 0.25f, 0.20f, 0.08f, 1.0f, 32);
+            } else {
+                mActor_name_t sel_item = EMPTY_NO;
+                if (s_sheet.sel_slot >= 0 && s_sheet.sel_slot < 15) {
+                    sel_item = priv->inventory.pockets[s_sheet.sel_slot];
+                }
+                round_rect(dx0 + 1.5f, dy0 + 2.0f, dx1 + 1.5f, dy1 + 2.0f, 14.0f, 0.05f, 0.08f, 0.05f, 0.12f);
+                round_rect(dx0, dy0, dx1, dy1, 14.0f, 1.0f, 1.0f, 1.0f, 0.98f);
+
+                if (sel_item == EMPTY_NO || sel_item == 0) {
+                    pill(dx0 + 54.0f, dcy, 76.0f, 28.0f, 0.78f, 0.78f, 0.78f, 1.0f);
+                    snprintf(buf, sizeof(buf), "SLOT %d", s_sheet.sel_slot + 1);
+                    draw_str_raw(buf, dx0 + 54.0f, dcy, 2.2f, 1.0f, 1.0f, 1.0f, 1.0f, 8);
+                    draw_str_left_raw("EMPTY POCKET SLOT", dx0 + 106.0f, dcy, 3.0f, 0.50f, 0.50f, 0.50f, 1.0f, 20);
+                } else {
+                    float cr, cg, cb;
+                    char iname[32];
+                    get_item_category_color(sel_item, &cr, &cg, &cb);
+                    pill(dx0 + 56.0f, dcy, 80.0f, 28.0f, cr, cg, cb, 1.0f);
+                    draw_str_raw(get_item_category_name(sel_item), dx0 + 56.0f, dcy, 2.2f, 1.0f, 1.0f, 1.0f, 1.0f, 10);
+                    get_item_name(sel_item, iname, sizeof(iname));
+                    draw_str_left_raw(iname, dx0 + 110.0f, dcy, 3.2f, 0.16f, 0.18f, 0.16f, 1.0f, 18);
+
+                    if (priv->equipment == sel_item) {
+                        pill_button_shadow(dx1 - 56.0f, dcy, 86.0f, 26.0f, 0.28f, 0.75f, 0.45f, 1.0f);
+                        draw_str_raw("EQUIPPED", dx1 - 56.0f, dcy, 2.0f, 1.0f, 1.0f, 1.0f, 1.0f, 9);
+                    } else if (priv->cloth.item == sel_item) {
+                        pill_button_shadow(dx1 - 56.0f, dcy, 86.0f, 26.0f, 0.96f, 0.52f, 0.30f, 1.0f);
+                        draw_str_raw("WORN", dx1 - 56.0f, dcy, 2.0f, 1.0f, 1.0f, 1.0f, 1.0f, 5);
+                    }
                 }
             }
         }
@@ -2454,50 +2583,41 @@ static void mobile_sheet_draw(void) {
         /* Letters Tab (10 letter slots) */
         for (i = 0; i < 10; i++) {
             int c = i % 2, r = i / 2;
-            float margin_x = 24.0f, gap_x = 12.0f, gap_y = 10.0f;
-            float grid_top = s_sheet.sheet_y0 + 115.0f;
+            float margin_x = 16.0f, gap_x = 10.0f, gap_y = 10.0f;
+            float grid_top = s_sheet.card_y0[0];
             float lw = (W - 2.0f * margin_x - gap_x) / 2.0f;
-            float lh = 52.0f;
+            float lh = (s_sheet.card_y1[14] - grid_top - 4.0f * gap_y) / 5.0f;
             float x0 = margin_x + (float)c * (lw + gap_x);
             float y0 = grid_top + (float)r * (lh + gap_y);
             float x1 = x0 + lw, y1 = y0 + lh;
             float cx = (x0 + x1) * 0.5f, cy = (y0 + y1) * 0.5f;
             Mail_c* m = &priv->mail[i];
 
-            round_rect(x0 + 1.5f, y0 + 2.0f, x1 + 1.5f, y1 + 2.0f, 10.0f, 0.05f, 0.08f, 0.05f, 0.14f);
-            round_rect(x0, y0, x1, y1, 10.0f, 1.0f, 1.0f, 1.0f, 0.98f);
-            round_rect(x0 + 3.0f, y0 + 3.0f, x1 - 3.0f, y0 + 10.0f, 3.0f, 0.95f, 0.50f, 0.45f, 0.95f);
+            round_rect(x0 + 1.5f, y0 + 2.0f, x1 + 1.5f, y1 + 2.0f, 12.0f, 0.05f, 0.08f, 0.05f, 0.14f);
+            round_rect(x0, y0, x1, y1, 12.0f, 1.0f, 1.0f, 1.0f, 0.98f);
+            round_rect(x0 + 3.0f, y0 + 3.0f, x1 - 3.0f, y0 + 12.0f, 3.0f, 0.95f, 0.50f, 0.45f, 0.95f);
 
-            const u8* sender_name = m->header.sender.personalID.player_name;
-            if (sender_name[0] != 0 && sender_name[0] != ' ') {
-                char sname[16];
-                int sl;
-                for (sl = 0; sl < 8 && sender_name[sl] >= 32; sl++) sname[sl] = (char)sender_name[sl];
-                sname[sl] = 0;
+            char sname[16];
+            get_clean_string(m->header.sender.personalID.player_name, 8, sname, sizeof(sname));
+            if (sname[0] != 0) {
                 snprintf(buf, sizeof(buf), "FROM: %s", sname);
-                draw_str_raw(buf, cx, cy, 2.2f, 0.16f, 0.18f, 0.16f, 1.0f, 16);
+                draw_str_raw(buf, cx, cy, 2.6f, 0.16f, 0.18f, 0.16f, 1.0f, 18);
                 if (m->present != EMPTY_NO) {
-                    pill_button_shadow(x1 - 25.0f, y1 - 10.0f, 42.0f, 16.0f, 0.96f, 0.78f, 0.18f, 1.0f);
-                    draw_str_raw("GIFT", x1 - 25.0f, y1 - 10.0f, 1.5f, 0.20f, 0.18f, 0.05f, 1.0f, 4);
+                    pill_button_shadow(x1 - 32.0f, cy, 54.0f, 22.0f, 0.96f, 0.78f, 0.18f, 1.0f);
+                    draw_str_raw("GIFT", x1 - 32.0f, cy, 2.0f, 0.20f, 0.18f, 0.05f, 1.0f, 4);
                 }
             } else {
-                draw_str_raw("EMPTY LETTER", cx, cy, 2.1f, 0.60f, 0.58f, 0.55f, 0.85f, 13);
+                draw_str_raw("EMPTY LETTER", cx, cy, 2.4f, 0.60f, 0.58f, 0.55f, 0.85f, 14);
             }
         }
     } else {
         /* Fish / Bugs Tab Info */
-        float cx = W * 0.5f, cy = s_sheet.sheet_y0 + 200.0f;
-        draw_str_raw(s_sheet.current_tab == 2 ? "FISH COLLECTION" : "INSECT COLLECTION", cx, cy - 20.0f, 3.0f, 0.20f, 0.24f, 0.20f, 1.0f, 20);
-        draw_str_raw("BROWSE COLLECTION ABOVE", cx, cy + 20.0f, 2.3f, 0.45f, 0.45f, 0.45f, 1.0f, 24);
+        float cx = W * 0.5f, cy = (s_sheet.card_y0[0] + s_sheet.card_y1[14]) * 0.5f;
+        draw_str_raw(s_sheet.current_tab == 2 ? "FISH COLLECTION" : "INSECT COLLECTION", cx, cy - 24.0f, 3.4f, 0.20f, 0.24f, 0.20f, 1.0f, 20);
+        draw_str_raw("BROWSE COLLECTION IN VIEWPORT ABOVE", cx, cy + 24.0f, 2.6f, 0.45f, 0.45f, 0.45f, 1.0f, 36);
     }
 
-    /* Action Bar */
-    if (s_sheet.swap_mode) {
-        float act_cy = s_sheet.act_cy[0];
-        pill_button_shadow(W * 0.5f, act_cy - 48.0f, W - 36.0f, 36.0f, 0.96f, 0.72f, 0.15f, 1.0f);
-        draw_str_raw("TAP DESTINATION SLOT TO SWAP", W * 0.5f, act_cy - 48.0f, 2.3f, 0.18f, 0.16f, 0.05f, 1.0f, 28);
-    }
-
+    /* Action Bar Buttons */
     for (i = 0; i < s_sheet.num_actions; i++) {
         float cx = s_sheet.act_cx[i], cy = s_sheet.act_cy[i];
         float aw = s_sheet.act_w[i], ah = s_sheet.act_h[i];
@@ -2518,7 +2638,7 @@ static void mobile_sheet_draw(void) {
         }
 
         pill_button_shadow(cx, cy, aw, ah, br, bg, bb, 1.0f);
-        draw_str_raw(s_sheet.action_labels[i], cx, cy, 2.4f, tr, tg, tb, 1.0f, 12);
+        draw_str_raw(s_sheet.action_labels[i], cx, cy, 3.0f, tr, tg, tb, 1.0f, 12);
     }
 }
 

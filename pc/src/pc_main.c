@@ -510,7 +510,7 @@ void pc_layout_box(int stretch, int* x, int* y, int* w, int* h) {
         ah = H - it - ib;
         aspect = 4.0f / 3.0f;
         if (g_pc_layout_portrait) {
-            /* Portrait menu UI: scale up and position in the top window (0.16f)
+            /* Portrait menu UI: scale up and position in the top window (0.05f)
              * so Dalton's 3D model stands clear above the mobile touch sheet */
             float scale = 1.355f;
             cw = (int)((float)aw * scale);
@@ -520,7 +520,7 @@ void pc_layout_box(int stretch, int* x, int* y, int* w, int* h) {
             *w = cw;
             *h = ch;
             *x = il + (aw - cw) / 2;
-            *y = it + (int)((float)(ah - ch) * 0.16f);
+            *y = it + (int)((float)(ah - ch) * 0.05f);
             return;
         }
         if ((float)aw / (float)ah > aspect) {
