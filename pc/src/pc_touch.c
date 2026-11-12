@@ -1762,7 +1762,6 @@ void pc_touch_apply(unsigned short* buttons, signed char* stick_x, signed char* 
             }
             if (hit == HIT_BAG) *buttons |= PAD_BUTTON_Y;
             if (hit == HIT_MAP) *buttons |= PAD_BUTTON_X;
-            if (hit == HIT_CAM) pc_touch_cam_cycle();
             if (hit == HIT_ACTION || hit == HIT_CONTEXT) *buttons |= PAD_BUTTON_A;
             if ((hit == HIT_BACK || hit == HIT_CLOSE) && !g_pc_paused) *buttons |= PAD_BUTTON_B;
         } else if (s_down_hit == HIT_PICTURE && can_steer() && s_drag_active) {

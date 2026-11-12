@@ -142,6 +142,7 @@ static void aAL_actor_dt(ACTOR* actor, GAME* game) {
   /* Stop blocking pause once the title actor is gone. */
   { extern int g_pc_title_main_menu_visible;
     g_pc_title_main_menu_visible = 0; }
+  pc_play_offline_menu_close();
 #endif
 
   if (Common_Get(clip.animal_logo_clip) != NULL) {

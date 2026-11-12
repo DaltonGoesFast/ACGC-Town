@@ -95,6 +95,10 @@ void pc_play_offline_menu_enter(void) {
 }
 
 int pc_play_offline_menu_active(void) {
+    if (s_active && s_launched && Save_Get(scene_no) != SCENE_TITLE_DEMO) {
+        s_active = 0;
+        s_launched = 0;
+    }
     return s_active;
 }
 
@@ -148,6 +152,7 @@ static int start_resident(int slot) {
     if (gamePT == NULL || gamePT->exec != play_main) return 0;
     play = (GAME_PLAY*)gamePT;
     if (get_player_actor_withoutCheck(play) == NULL) return 0;
+    if (play->fb_wipe_mode != WIPE_MODE_NONE) return 0;
 
     /* Reload save from disk; the title demo may have mutated RAM */
     if (pc_save_loaded) {
@@ -192,6 +197,7 @@ static int start_new_character(void) {
     if (gamePT == NULL || gamePT->exec != play_main) return 0;
     play = (GAME_PLAY*)gamePT;
     if (get_player_actor_withoutCheck(play) == NULL) return 0;
+    if (play->fb_wipe_mode != WIPE_MODE_NONE) return 0;
 
     if (pc_save_loaded) {
         pc_save_reload();
