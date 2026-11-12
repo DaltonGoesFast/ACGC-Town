@@ -1102,6 +1102,10 @@ static int makeBumpTexture(GAME_PLAY* play, GRAPH* graph1, GRAPH* graph2) {
         fbdemo_fade_draw(&play->color_fade, &polydisp);
         fade_rgba8888_draw(&polydisp, play->fade_color_value.rgba8888);
 
+#ifdef TARGET_PC
+        gDPNoOpTag(polydisp++, PC_NOOP_WIDESCREEN_STRETCH_OFF);
+#endif
+
         gSPEndDisplayList(polydisp++);
 
         gfxclose(newdisp, polydisp);
@@ -1111,7 +1115,13 @@ static int makeBumpTexture(GAME_PLAY* play, GRAPH* graph1, GRAPH* graph2) {
 
     if (play->fb_mode == FBDEMO_MODE_MOVE) {
         fbdemo_disp = NOW_POLY_OPA_DISP;
+#ifdef TARGET_PC
+        gDPNoOpTag(fbdemo_disp++, PC_NOOP_WIDESCREEN_STRETCH);
+#endif
         fbdemo_draw(&fbdemo, &fbdemo_disp);
+#ifdef TARGET_PC
+        gDPNoOpTag(fbdemo_disp++, PC_NOOP_WIDESCREEN_STRETCH_OFF);
+#endif
         SET_POLY_OPA_DISP(fbdemo_disp);
         return 1;
     }

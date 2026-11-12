@@ -540,37 +540,18 @@ void pc_layout_box(int stretch, int* x, int* y, int* w, int* h) {
         if (*y < 0) *y = 0;
         return;
     }
-    if (stretch != 1) {
-        *x = g_pc_content_x;
-        *y = g_pc_content_y;
-        *w = g_pc_content_w;
-        *h = g_pc_content_h;
+    if (stretch == 1) {
+        /* Full-window stretch (transitions, wipes, fades, menu dimming, inventory BG) */
+        *x = 0;
+        *y = 0;
+        *w = (g_pc_window_w > 0) ? g_pc_window_w : PC_SCREEN_WIDTH;
+        *h = (g_pc_window_h > 0) ? g_pc_window_h : PC_SCREEN_HEIGHT;
         return;
     }
-    /* Widescreen hack: 16:9 letterbox, still not stretched to the window. */
-    W = g_pc_window_w;
-    H = g_pc_window_h;
-    pc_layout_insets(&il, &it, &ir, &ib);
-    if (il + ir > W / 2) { il = 0; ir = 0; }
-    if (it + ib > H / 2) { it = 0; ib = 0; }
-    aw = W - il - ir;
-    ah = H - it - ib;
-    aspect = 16.0f / 9.0f;
-    if ((float)aw / (float)ah > aspect) {
-        ch = ah;
-        cw = (int)((float)ch * aspect);
-    } else {
-        cw = aw;
-        ch = (int)((float)cw / aspect);
-    }
-    if (cw < 2) cw = 2;
-    if (ch < 2) ch = 2;
-    *w = cw;
-    *h = ch;
-    *x = il + (aw - cw) / 2;
-    *y = g_pc_layout_portrait ? it : it + (ah - ch) / 2;
-    if (*x < 0) *x = 0;
-    if (*y < 0) *y = 0;
+    *x = g_pc_content_x;
+    *y = g_pc_content_y;
+    *w = g_pc_content_w;
+    *h = g_pc_content_h;
 }
 
 void pc_cull_get_edges(float* out_x_edge, float* out_y_edge) {

@@ -1319,29 +1319,22 @@ void GXSetProjection(const void* mtx, u32 type) {
 
 #ifdef PC_ENHANCEMENTS
     if (type == GX_PERSPECTIVE) {
-        if (g_aspect_active == 2 && g_pc_widescreen_stretch != 2) {
+        if (g_aspect_active == 2 && g_pc_widescreen_stretch == 0) {
             /* Portrait Vert+: scale row 1 col 1 so vertical FOV expands and 3D aspect is 1:1.
-             * (When g_pc_widescreen_stretch == 2, mSM_change_view uses pc_layout_box viewport). */
+             * (When g_pc_widescreen_stretch == 2, mSM_change_view uses pc_layout_box viewport.
+             *  When g_pc_widescreen_stretch == 1, skip correction so transitions stretch full-window). */
             g_gx.projection_mtx[1][1] *= g_aspect_factor;
-        } else if (g_aspect_active == 1 && g_pc_widescreen_stretch != 2) {
+        } else if (g_aspect_active == 1 && g_pc_widescreen_stretch == 0) {
             /* Widescreen Hor+: scale row 0 col 0 */
             g_gx.projection_mtx[0][0] *= g_aspect_factor;
         }
     } else if (type == GX_ORTHOGRAPHIC) {
         if (g_aspect_active == 2 && g_pc_widescreen_stretch == 2) {
-            /* Portrait submenu UI: match pc_layout_box(2) exactly! */
-            int bx, by, bw, bh;
-            pc_layout_box(2, &bx, &by, &bw, &bh);
-            float scale_x = (float)bw / (float)g_pc_window_w;
-            float scale_y = (float)bh / (float)g_pc_window_h;
-            float center_y = (float)by + (float)bh * 0.5f;
-            float offset_y = 1.0f - (2.0f * center_y / (float)g_pc_window_h);
-
-            g_gx.projection_mtx[0][0] *= scale_x;
-            g_gx.projection_mtx[1][1] *= scale_y;
-            g_gx.projection_mtx[1][3] = offset_y;
-        } else if (g_aspect_active == 2 && g_pc_widescreen_stretch != 1) {
-            /* Portrait 4:3 aspect correction for 2D UI (dialogue, etc.) */
+            /* Portrait submenu UI: gc_to_gl already sets glViewport to pc_layout_box(2)
+             * which has an exact 4:3 aspect ratio (sx == sy) and is positioned above the sheet.
+             * Do NOT modify projection_mtx here: any extra scaling squashes the Y axis! */
+        } else if (g_aspect_active == 2 && g_pc_widescreen_stretch == 0) {
+            /* Portrait 4:3 aspect correction for 2D UI when viewport is full-window (stretch == 0) */
             g_gx.projection_mtx[1][1] *= g_aspect_factor;
             g_gx.projection_mtx[1][3] *= g_aspect_factor;
         }

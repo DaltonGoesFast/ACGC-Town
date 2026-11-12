@@ -31,6 +31,9 @@
 #include "libc64/qrand.h"
 #include "m_common_data.h"
 #include "m_play.h"
+#ifdef TARGET_PC
+#include "pc_platform.h"
+#endif
 
 static int mTR_first_flag = TRUE;
 
@@ -287,7 +290,13 @@ static void trademark_draw(GAME_TRADEMARK* trademark) {
         }
 
         gfx = NOW_POLY_XLU_DISP;
+#ifdef TARGET_PC
+        gDPNoOpTag(gfx++, PC_NOOP_WIDESCREEN_STRETCH);
+#endif
         fade_black_draw(&gfx, (int)trademark->alpha >> 8);
+#ifdef TARGET_PC
+        gDPNoOpTag(gfx++, PC_NOOP_WIDESCREEN_STRETCH_OFF);
+#endif
         SET_POLY_XLU_DISP(gfx);
     }
 

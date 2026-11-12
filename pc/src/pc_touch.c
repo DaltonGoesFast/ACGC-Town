@@ -7,6 +7,7 @@
 #include "pc_pause_menu.h"
 #include "pc_settings_menu.h"
 #include "pc_play_online_menu.h"
+#include "pc_play_offline_menu.h"
 #include "pc_crash.h"
 #include "pc_typing.h"
 #include "pc_chat.h"
@@ -31,8 +32,11 @@ extern void pc_creator_menu_pointer(float fx, float fy);
 #include "m_mail.h"
 #include "m_inventory_ovl.h"
 #include "m_item_name.h"
+#include "m_font.h"
+#include "dataobject.h"
 #include "audio.h"
 #include "audio_defs.h"
+#include "m_collision_bg.h"
 #include <dolphin/pad.h>
 
 #include <math.h>
@@ -49,7 +53,7 @@ extern void pc_creator_menu_pointer(float fx, float fy);
 #define HUD_KEYS 4
 
 enum { HIT_NONE = 0, HIT_PICTURE, HIT_STICK, HIT_NUB, HIT_ACTION, HIT_BACK, HIT_MENU, HIT_KEY, HIT_BAG, HIT_MAP, HIT_CLOSE, HIT_CONTEXT, HIT_CHOICE, HIT_SUB_TAB,
-       HIT_SHEET_CLOSE, HIT_SHEET_BELLS, HIT_SHEET_TAB, HIT_SHEET_CARD, HIT_SHEET_ACT, HIT_SHEET_BODY };
+       HIT_SHEET_CLOSE, HIT_SHEET_BELLS, HIT_SHEET_TAB, HIT_SHEET_CARD, HIT_SHEET_ACT, HIT_SHEET_BODY, HIT_CAM };
 
 typedef struct {
     int active;            /* 1 if drawer is visible */
@@ -133,16 +137,25 @@ static float s_drag_cx = 0.0f, s_drag_cy = 0.0f;
 static Uint32 s_drag_t0 = 0;
 static int s_drag_moved = 0;
 
+static float s_cam_prev_dist = 0.0f;
+static float s_cam_prev_mid_x = 0.0f, s_cam_prev_mid_y = 0.0f;
+static float s_cam_accum_pinch = 0.0f;
+static float s_cam_accum_dx = 0.0f, s_cam_accum_dy = 0.0f;
+static int s_cam_two_finger_was = 0;
+static int s_cam_pulse_x = 0, s_cam_pulse_y = 0;
+static int s_cam_pulse_timer = 0;
+static int s_cam_cooldown = 0;
+
 enum { FINGERS = 4 };
 typedef struct { SDL_FingerID id; float x, y; int down; } Finger;
 static Finger s_fin[FINGERS];
 
 typedef struct {
-    int show_stick, show_nub, show_action, show_back, show_menu, show_keys, show_quick;
+    int show_stick, show_nub, show_action, show_back, show_menu, show_keys, show_quick, show_cam;
     int show_close, show_context, choice_n;
     int show_sub_tabs, sub_tab_n;
     float sx, sy, sr, nx, ny, nr, ax, ay, ar, bx, by, br, mx, my, mr;
-    float bag_x, bag_y, map_x, map_y, qr;
+    float bag_x, bag_y, map_x, map_y, cam_x, cam_y, cam_r, qr;
     float close_x, close_y, close_r, ctx_x, ctx_y, ctx_r;
     float choice_x, choice_r, choice_y[6];
     float sub_tab_x[4], sub_tab_y[4], sub_tab_r;
@@ -339,10 +352,10 @@ static void hud_build(Hud* h) {
         fclose(f);
     }
     town = !g_pc_paused && !g_pc_title_main_menu_visible && !pc_settings_menu_active() &&
-           !pc_play_online_menu_active() && !pc_creator_menu_active() &&
+           !pc_play_online_menu_active() && !pc_play_offline_menu_active() && !pc_creator_menu_active() &&
            !message_open() && !submenu_open() && !keys_up();
     menu = g_pc_paused || g_pc_title_main_menu_visible || pc_settings_menu_active() ||
-           pc_play_online_menu_active() || pc_creator_menu_active();
+           pc_play_online_menu_active() || pc_play_offline_menu_active() || pc_creator_menu_active();
     dialog = !menu && (message_open() || submenu_open());
     if (keys_up()) s_hud = HUD_KEYS;
     else if (dialog) s_hud = HUD_DIALOG;
@@ -361,16 +374,17 @@ static void hud_build(Hud* h) {
     h->show_keys = keys_up();
     h->show_nub = 0;
     h->show_stick = 0;
-    /* Pocket Camp controls: Action, Back, Menu, Bag, Map are always available */
+    /* Pocket Camp controls: Action, Back, Menu, Bag, Map, Cam are available in town */
     h->show_action = !h->show_keys;
     h->show_back = !h->show_keys;
     h->show_menu = !h->show_keys;
     h->show_quick = !h->show_keys && (town || menu);
+    h->show_cam = !h->show_keys && town;
     h->show_close = !h->show_keys && (menu || dialog);
     h->show_context = 0;
 
     if (g_pc_layout_portrait) {
-        /* Portrait HUD: Action and Back in bottom-right; Pockets & Map in bottom-left; Menu in top-right */
+        /* Portrait HUD: Action and Back in bottom-right; Pockets, Map & Cam in bottom-left; Menu in top-right */
         h->ar = rad * 1.20f;
         h->ax = W - ir - h->ar - 24.0f;
         h->ay = H - ib - h->ar - 28.0f;
@@ -385,6 +399,10 @@ static void hud_build(Hud* h) {
 
         h->map_x = h->bag_x;
         h->map_y = h->bag_y - h->qr * 2.35f;
+
+        h->cam_r = h->qr;
+        h->cam_x = h->bag_x;
+        h->cam_y = h->map_y - h->qr * 2.35f;
 
         h->mr = rad * 0.85f;
         h->mx = W - ir - h->mr - 24.0f;
@@ -413,6 +431,10 @@ static void hud_build(Hud* h) {
 
         h->map_x = h->bag_x;
         h->map_y = h->bag_y - h->qr * 2.3f;
+
+        h->cam_r = h->qr;
+        h->cam_x = h->bag_x;
+        h->cam_y = h->map_y - h->qr * 2.3f;
 
         h->mr = rad * 0.80f;
         h->mx = W - ir - h->mr - 20.0f;
@@ -493,7 +515,7 @@ static void hud_build(Hud* h) {
     if (g_pc_settings.touch_left_hand) {
         h->sx = W - h->sx; h->nx = W - h->nx; h->ax = W - h->ax;
         h->bx = W - h->bx; h->mx = W - h->mx;
-        h->bag_x = W - h->bag_x; h->map_x = W - h->map_x;
+        h->bag_x = W - h->bag_x; h->map_x = W - h->map_x; h->cam_x = W - h->cam_x;
         h->close_x = W - h->close_x;
         h->ctx_x = W - h->ctx_x;
         for (int i = 0; i < h->key_n; i++) h->kx[i] = W - h->kx[i];
@@ -506,6 +528,7 @@ static void hud_build(Hud* h) {
         h->show_action = 0;
         h->show_back = 0;
         h->show_quick = 0;
+        h->show_cam = 0;
         h->show_close = 0;
         h->show_sub_tabs = 0;
         h->show_context = 0;
@@ -549,6 +572,7 @@ static int classify(float x, float y, Hud* h, int* key) {
     if (h->show_context && hit_disc(x, y, h->ctx_x, h->ctx_y, h->ctx_r)) return HIT_CONTEXT;
     if (h->show_quick && hit_disc(x, y, h->bag_x, h->bag_y, h->qr)) return HIT_BAG;
     if (h->show_quick && hit_disc(x, y, h->map_x, h->map_y, h->qr)) return HIT_MAP;
+    if (h->show_cam && hit_disc(x, y, h->cam_x, h->cam_y, h->cam_r)) return HIT_CAM;
     if (h->show_stick && hit_disc(x, y, h->sx, h->sy, h->sr)) return HIT_STICK;
     if (h->show_nub && hit_disc(x, y, h->nx, h->ny, h->nr)) return HIT_NUB;
     if (h->show_action && hit_disc(x, y, h->ax, h->ay, h->ar)) return HIT_ACTION;
@@ -561,7 +585,7 @@ static int classify(float x, float y, Hud* h, int* key) {
 static int can_steer(void) {
     GAME_PLAY* play = get_game_play();
     if (play == NULL || message_open() || g_pc_paused || g_pc_title_main_menu_visible) return 0;
-    if (pc_settings_menu_active() || pc_play_online_menu_active() || pc_creator_menu_active()) return 0;
+    if (pc_settings_menu_active() || pc_play_online_menu_active() || pc_play_offline_menu_active() || pc_creator_menu_active()) return 0;
     if (play->submenu.menu_type != 0 || play->submenu.start_refuse) return 0;
     return 1;
 }
@@ -569,7 +593,7 @@ static int can_steer(void) {
 static int steer_toward(float tx, float tz, signed char* stick_x, signed char* stick_y) {
     GAME_PLAY* play = get_game_play();
     PLAYER_ACTOR* player;
-    float px, pz, dx, dz, dist, fx, fz, fl, rx, rz, sx, sy, mag;
+    float px, pz, dx, dz, dist, fx, fz, fl, rx, rz, sx, sy, mag, arrive_dist;
     if (!can_steer() || play == NULL) return 0;
     player = get_player_actor_withoutCheck(play);
     if (player == NULL) return 0;
@@ -578,15 +602,16 @@ static int steer_toward(float tx, float tz, signed char* stick_x, signed char* s
     dx = tx - px;
     dz = tz - pz;
     dist = sqrtf(dx * dx + dz * dz);
-    if (s_best_dist < 0.0f || dist < s_best_dist - 1.5f) {
+    arrive_dist = s_interact ? 36.0f : TOUCH_ARRIVE;
+    if (s_best_dist < 0.0f || dist < s_best_dist - 0.2f) {
         s_best_dist = dist;
         s_stall = 0;
         if (s_slide != 0) s_slide = 0; /* moving again: straight at the tap */
-    } else if (++s_stall == 20 || s_stall == 45) {
-        s_slide = (s_stall == 20) ? 1 : -1; /* slide off the obstacle */
-    } else if (s_stall == 70) {
-        s_slide = 0; /* give up the slide and walk straight */
-    } else if (s_stall > 95) {
+    } else if (++s_stall == 45 || s_stall == 85) {
+        s_slide = (s_stall == 45) ? 1 : -1; /* gentle detour around obstacle */
+    } else if (s_stall == 120) {
+        s_slide = 0; /* retry direct path */
+    } else if (s_stall > 150) {
         s_have_target = 0;
         s_interact = 0;
         s_stall = 0;
@@ -594,7 +619,7 @@ static int steer_toward(float tx, float tz, signed char* stick_x, signed char* s
         s_best_dist = -1.0f;
         return 0;
     }
-    if (dist < TOUCH_ARRIVE) {
+    if (dist < arrive_dist) {
         s_have_target = 0;
         s_stall = 0;
         s_slide = 0;
@@ -607,7 +632,8 @@ static int steer_toward(float tx, float tz, signed char* stick_x, signed char* s
     fl = sqrtf(fx * fx + fz * fz);
     if (fl < 1.0f) return 0;
     fx /= fl; fz /= fl;
-    rx = fz; rz = -fx;
+    /* Camera right = cross(F, Up) */
+    rx = -fz; rz = fx;
     dx /= dist; dz /= dist;
     sx = dx * rx + dz * rz;
     sy = dx * fx + dz * fz;
@@ -617,8 +643,8 @@ static int steer_toward(float tx, float tz, signed char* stick_x, signed char* s
     sy = sy / mag * (float)TOUCH_STICK;
     if (s_slide != 0) {
         float ox = sx, oy = sy;
-        sx = ox * 0.55f - oy * 0.45f * (float)s_slide;
-        sy = oy * 0.55f + ox * 0.45f * (float)s_slide;
+        sx = ox * 0.85f - oy * 0.35f * (float)s_slide;
+        sy = oy * 0.85f + ox * 0.35f * (float)s_slide;
     }
     if (sx > 127.0f) sx = 127.0f;
     if (sx < -128.0f) sx = -128.0f;
@@ -632,36 +658,81 @@ static int steer_toward(float tx, float tz, signed char* stick_x, signed char* s
 static int tap_to_world(float wx, float wy, float* out_x, float* out_z) {
     GAME_PLAY* play = get_game_play();
     PLAYER_ACTOR* player;
-    float fov, aspect, nx, ny, tan_y, fx, fy, fz, fl, rx, rz, ux, uy, uz, dx, dy, dz, dl, t, py;
+    float fov, base_aspect, cur_aspect, nx, ny, base_tan_y, tan_x, tan_y;
+    float fx, fy, fz, fl, rx, rz, rl, ux, uy, uz, ul, dx, dy, dz, dl, t, py;
+    xyz_t test_pos;
+    float bg_y, t2;
+
     if (!in_picture(wx, wy) || play == NULL) return 0;
     player = get_player_actor_withoutCheck(play);
     if (player == NULL) return 0;
+
     fov = play->camera.perspective.fov_y;
     if (fov < 5.0f || fov > 170.0f) fov = 45.0f;
-    aspect = (float)g_pc_content_w / (float)g_pc_content_h;
+
+    base_aspect = 4.0f / 3.0f;
+    cur_aspect = (float)g_pc_content_w / (float)g_pc_content_h;
+    base_tan_y = tanf(fov * 0.5f * 3.14159265f / 180.0f);
+
+    if (cur_aspect < base_aspect - 0.001f) {
+        /* Portrait / Vert+: horizontal FOV is fixed to 4:3 base, vertical FOV expands */
+        tan_x = base_tan_y * base_aspect;
+        tan_y = tan_x / cur_aspect;
+    } else {
+        /* Landscape / Hor+: vertical FOV is fixed, horizontal FOV expands */
+        tan_y = base_tan_y;
+        tan_x = base_tan_y * cur_aspect;
+    }
+
     nx = ((wx - (float)g_pc_content_x) / (float)g_pc_content_w) * 2.0f - 1.0f;
     ny = 1.0f - ((wy - (float)g_pc_content_y) / (float)g_pc_content_h) * 2.0f;
-    tan_y = tanf(fov * 0.5f * 3.14159265f / 180.0f);
+
     fx = play->camera.lookat.center.x - play->camera.lookat.eye.x;
     fy = play->camera.lookat.center.y - play->camera.lookat.eye.y;
     fz = play->camera.lookat.center.z - play->camera.lookat.eye.z;
     fl = sqrtf(fx * fx + fy * fy + fz * fz);
     if (fl < 1.0f) return 0;
     fx /= fl; fy /= fl; fz /= fl;
-    rx = fz; rz = -fx;
-    { float rl = sqrtf(rx * rx + rz * rz); if (rl < 0.01f) return 0; rx /= rl; rz /= rl; }
-    ux = fy * rz; uy = fz * rx - fx * rz; uz = -fy * rx;
-    { float ul = sqrtf(ux * ux + uy * uy + uz * uz); if (ul < 0.01f) return 0; ux /= ul; uy /= ul; uz /= ul; }
-    dx = fx + rx * (nx * tan_y * aspect) + ux * (ny * tan_y);
+
+    /* Camera right = cross(F, Up) where Up is (0, 1, 0) */
+    rx = -fz; rz = fx;
+    rl = sqrtf(rx * rx + rz * rz);
+    if (rl < 0.01f) return 0;
+    rx /= rl; rz /= rl;
+
+    /* Camera true up = cross(R, F) */
+    ux = -rz * fy;
+    uy = rz * fx - rx * fz;
+    uz = rx * fy;
+    ul = sqrtf(ux * ux + uy * uy + uz * uz);
+    if (ul < 0.01f) return 0;
+    ux /= ul; uy /= ul; uz /= ul;
+
+    dx = fx + rx * (nx * tan_x) + ux * (ny * tan_y);
     dy = fy + uy * (ny * tan_y);
-    dz = fz + rz * (nx * tan_y * aspect) + uz * (ny * tan_y);
+    dz = fz + rz * (nx * tan_x) + uz * (ny * tan_y);
     dl = sqrtf(dx * dx + dy * dy + dz * dz);
     if (dl < 0.001f) return 0;
     dx /= dl; dy /= dl; dz /= dl;
+
+    if (dy >= -0.01f) return 0; /* Ray pointing horizontal or up */
+
     py = player->actor_class.world.position.y;
-    if (fabsf(dy) < 0.02f) return 0;
     t = (py - play->camera.lookat.eye.y) / dy;
     if (t < 1.0f || t > 8000.0f) return 0;
+
+    /* Refine intersection with terrain height from collision BG */
+    test_pos.x = play->camera.lookat.eye.x + dx * t;
+    test_pos.y = py;
+    test_pos.z = play->camera.lookat.eye.z + dz * t;
+    bg_y = mCoBG_GetBgY_OnlyCenter_FromWpos2(test_pos, 0.0f);
+    if (fabsf(bg_y - py) > 1.0f && fabsf(bg_y - py) < 800.0f) {
+        t2 = (bg_y - play->camera.lookat.eye.y) / dy;
+        if (t2 >= 1.0f && t2 <= 8000.0f) {
+            t = t2;
+        }
+    }
+
     *out_x = play->camera.lookat.eye.x + dx * t;
     *out_z = play->camera.lookat.eye.z + dz * t;
     return 1;
@@ -709,9 +780,35 @@ static void pc_touch_buzz(void) {
     if (s_haptic != NULL) SDL_HapticRumblePlay(s_haptic, 0.45f, 28);
 }
 
+static void pc_touch_cam_cycle(void) {
+    GAME_PLAY* play = get_game_play();
+    Camera2* cam;
+    int next_dist = 1;
+    if (play == NULL) return;
+    cam = &play->camera;
+    if (cam->indoor_distance_addition_idx == 1) {
+        next_dist = 0; /* Normal -> Close */
+    } else if (cam->indoor_distance_addition_idx == 0) {
+        next_dist = 2; /* Close -> Wide */
+    } else {
+        next_dist = 1; /* Wide -> Normal */
+    }
+    cam->indoor_distance_addition_idx = next_dist;
+    cam->indoor_direction_addition_idx = 1; /* reset angle to center */
+    if (next_dist == 2) {
+        sAdo_SysTrgStart(NA_SE_CAMERA_MOVE2);
+    } else {
+        sAdo_SysTrgStart(NA_SE_CAMERA_MOVE1);
+    }
+    pc_touch_buzz();
+    pc_diag_milestone("cam cycle");
+}
+
 static void begin_move(float x, float y, int fresh) {
-    float wx, wz;
+    float wx, wz, dist_from_player;
     const char* kind;
+    GAME_PLAY* play;
+    PLAYER_ACTOR* player;
     if (!g_pc_settings.touch_move || !can_steer()) return;
     if (!tap_to_world(x, y, &wx, &wz)) return;
     s_target_x = wx;
@@ -725,6 +822,18 @@ static void begin_move(float x, float y, int fresh) {
     s_mark_t = 1.0f;
     kind = ground_kind(wx, wz);
     s_interact = (kind[0] != 'g');
+
+    play = get_game_play();
+    player = (play != NULL) ? get_player_actor_withoutCheck(play) : NULL;
+    if (player != NULL) {
+        dist_from_player = hypotf(wx - player->actor_class.world.position.x, wz - player->actor_class.world.position.z);
+        if (dist_from_player > 260.0f) {
+            s_running = 1;
+        } else {
+            s_running = 0;
+        }
+    }
+
     if (fresh) {
         Uint32 now = SDL_GetTicks();
         char line[32];
@@ -1186,6 +1295,10 @@ static void on_picture_release(float x, float y) {
         if (!pc_play_online_menu_text_active()) pc_play_online_menu_pointer(fx, fy);
         return;
     }
+    if (pc_play_offline_menu_active()) {
+        pc_play_offline_menu_pointer(fx, fy);
+        return;
+    }
     if (pc_settings_menu_active()) { pc_settings_menu_pointer(fx, fy); return; }
     if (pc_creator_menu_active()) { pc_creator_menu_pointer(fx, fy); note_tap("creator"); return; }
     if (g_pc_title_main_menu_visible) {
@@ -1307,6 +1420,18 @@ void pc_touch_apply(unsigned short* buttons, signed char* stick_x, signed char* 
     refresh_action_label();
     if (!pc_touch_enabled() || buttons == NULL || g_pc_window_w < 2) return;
     hud_build(&hud);
+    if (s_cam_pulse_timer > 0) {
+        if (cstick_x) *cstick_x = (signed char)s_cam_pulse_x;
+        if (cstick_y) *cstick_y = (signed char)s_cam_pulse_y;
+        s_cam_pulse_timer--;
+        if (s_cam_pulse_timer == 0) {
+            s_cam_pulse_x = 0;
+            s_cam_pulse_y = 0;
+        }
+    }
+    if (s_cam_cooldown > 0) {
+        s_cam_cooldown--;
+    }
     if (s_pending_drop && submenu_open()) {
         GAME_PLAY* play = get_game_play();
         if (play != NULL && play->submenu.overlay != NULL && play->submenu.overlay->tag_ovl != NULL) {
@@ -1356,9 +1481,9 @@ void pc_touch_apply(unsigned short* buttons, signed char* stick_x, signed char* 
             } else if (th == HIT_MENU) {
                 pc_touch_buzz();
                 pc_diag_milestone("touch menu");
-                if (g_pc_title_main_menu_visible && !pc_settings_menu_active() && !pc_play_online_menu_active())
+                if (g_pc_title_main_menu_visible && !pc_settings_menu_active() && !pc_play_online_menu_active() && !pc_play_offline_menu_active())
                     latch_button(PAD_BUTTON_START, "Start");
-                else if (message_open() || submenu_open() || pc_settings_menu_active() || pc_play_online_menu_active())
+                else if (message_open() || submenu_open() || pc_settings_menu_active() || pc_play_online_menu_active() || pc_play_offline_menu_active())
                     latch_button(PAD_BUTTON_B, "B");
                 else if (g_pc_paused) pause_key(SDLK_ESCAPE);
                 else pc_pause_menu_toggle();
@@ -1388,6 +1513,8 @@ void pc_touch_apply(unsigned short* buttons, signed char* stick_x, signed char* 
                 latch_button(PAD_BUTTON_X, "X");
                 pc_touch_buzz();
                 pc_diag_milestone("touch map");
+            } else if (th == HIT_CAM) {
+                pc_touch_cam_cycle();
             } else if (th == HIT_SUB_TAB) {
                 handle_sub_tab_tap(tk);
                 pc_touch_buzz();
@@ -1405,19 +1532,92 @@ void pc_touch_apply(unsigned short* buttons, signed char* stick_x, signed char* 
     latch_consume(buttons);
     down = read_point(&x, &y, &x2, &y2, &n);
     rising = down && !s_pointer_was;
-    if (n >= 2 && g_pc_settings.touch_camera && cstick_x && cstick_y) {
-        int sx = (int)((x2 - x) * 0.15f);
-        int sy = (int)(-(y2 - y) * 0.15f);
-        if (sx > 80) sx = 80;
-        if (sx < -80) sx = -80;
-        if (sy > 80) sy = 80;
-        if (sy < -80) sy = -80;
-        *cstick_x = (signed char)sx;
-        *cstick_y = (signed char)sy;
+    if (n >= 2 && g_pc_settings.touch_camera) {
+        float cur_dist = hypotf(x2 - x, y2 - y);
+        float mid_x = (x + x2) * 0.5f;
+        float mid_y = (y + y2) * 0.5f;
+
+        if (!s_cam_two_finger_was || s_cam_prev_dist <= 0.0f) {
+            s_cam_two_finger_was = 1;
+            s_cam_prev_dist = cur_dist;
+            s_cam_prev_mid_x = mid_x;
+            s_cam_prev_mid_y = mid_y;
+            s_cam_accum_pinch = 0.0f;
+            s_cam_accum_dx = 0.0f;
+            s_cam_accum_dy = 0.0f;
+        } else {
+            float d_dist = cur_dist - s_cam_prev_dist;
+            float d_mid_x = mid_x - s_cam_prev_mid_x;
+            float d_mid_y = mid_y - s_cam_prev_mid_y;
+
+            s_cam_prev_dist = cur_dist;
+            s_cam_prev_mid_x = mid_x;
+            s_cam_prev_mid_y = mid_y;
+
+            s_cam_accum_pinch += d_dist;
+            s_cam_accum_dx += d_mid_x;
+            s_cam_accum_dy += d_mid_y;
+
+            if (s_cam_cooldown == 0) {
+                if (s_cam_accum_pinch > 35.0f) {
+                    /* Pinch out (spread fingers) -> Zoom in */
+                    s_cam_pulse_y = 80;
+                    s_cam_pulse_x = 0;
+                    s_cam_pulse_timer = 3;
+                    s_cam_cooldown = 14;
+                    s_cam_accum_pinch = 0.0f;
+                    s_cam_accum_dx = 0.0f;
+                    s_cam_accum_dy = 0.0f;
+                    pc_touch_buzz();
+                    pc_diag_milestone("pinch zoom in");
+                } else if (s_cam_accum_pinch < -35.0f) {
+                    /* Pinch in (contract fingers) -> Zoom out */
+                    s_cam_pulse_y = -80;
+                    s_cam_pulse_x = 0;
+                    s_cam_pulse_timer = 3;
+                    s_cam_cooldown = 14;
+                    s_cam_accum_pinch = 0.0f;
+                    s_cam_accum_dx = 0.0f;
+                    s_cam_accum_dy = 0.0f;
+                    pc_touch_buzz();
+                    pc_diag_milestone("pinch zoom out");
+                } else if (fabsf(s_cam_accum_dx) > 38.0f && fabsf(s_cam_accum_dx) > fabsf(s_cam_accum_dy) * 1.2f) {
+                    /* Two-finger swipe horizontal -> Rotate camera */
+                    s_cam_pulse_x = (s_cam_accum_dx > 0.0f) ? 80 : -80;
+                    s_cam_pulse_y = 0;
+                    s_cam_pulse_timer = 3;
+                    s_cam_cooldown = 14;
+                    s_cam_accum_pinch = 0.0f;
+                    s_cam_accum_dx = 0.0f;
+                    s_cam_accum_dy = 0.0f;
+                    pc_touch_buzz();
+                    pc_diag_milestone(s_cam_pulse_x > 0 ? "swipe rotate right" : "swipe rotate left");
+                } else if (fabsf(s_cam_accum_dy) > 38.0f && fabsf(s_cam_accum_dy) > fabsf(s_cam_accum_dx) * 1.2f) {
+                    /* Two-finger swipe vertical -> Zoom / tilt */
+                    s_cam_pulse_y = (s_cam_accum_dy < 0.0f) ? 80 : -80;
+                    s_cam_pulse_x = 0;
+                    s_cam_pulse_timer = 3;
+                    s_cam_cooldown = 14;
+                    s_cam_accum_pinch = 0.0f;
+                    s_cam_accum_dx = 0.0f;
+                    s_cam_accum_dy = 0.0f;
+                    pc_touch_buzz();
+                    pc_diag_milestone(s_cam_pulse_y > 0 ? "swipe zoom in" : "swipe zoom out");
+                }
+            }
+        }
+        if (s_cam_pulse_timer > 0) {
+            if (cstick_x) *cstick_x = (signed char)s_cam_pulse_x;
+            if (cstick_y) *cstick_y = (signed char)s_cam_pulse_y;
+        }
         s_have_target = 0;
+        s_drag_active = 0;
         s_pointer_was = 1;
         latch_consume(buttons);
         return;
+    } else {
+        s_cam_two_finger_was = 0;
+        s_cam_prev_dist = 0.0f;
     }
     if (!down) {
         if (s_drag_active) {
@@ -1456,10 +1656,31 @@ void pc_touch_apply(unsigned short* buttons, signed char* stick_x, signed char* 
             } else if (s_down_hit == HIT_MENU) {
                 pc_touch_buzz();
                 pc_diag_milestone("touch menu");
-                if (message_open() || submenu_open() || pc_settings_menu_active() || pc_play_online_menu_active())
+                if (message_open() || submenu_open() || pc_settings_menu_active() || pc_play_online_menu_active() || pc_play_offline_menu_active())
                     s_pulse_b = 1;
                 else if (g_pc_paused) pause_key(SDLK_ESCAPE);
                 else pc_pause_menu_toggle();
+            } else if (s_down_hit == HIT_CAM) {
+                float cdx = s_last_x - s_down_x;
+                if (cdx > 25.0f) {
+                    GAME_PLAY* play = get_game_play();
+                    if (play != NULL) {
+                        play->camera.indoor_direction_addition_idx = 2;
+                        sAdo_SysTrgStart(NA_SE_CAMERA_MOVE1);
+                        pc_touch_buzz();
+                        pc_diag_milestone("cam rotate right");
+                    }
+                } else if (cdx < -25.0f) {
+                    GAME_PLAY* play = get_game_play();
+                    if (play != NULL) {
+                        play->camera.indoor_direction_addition_idx = 0;
+                        sAdo_SysTrgStart(NA_SE_CAMERA_MOVE1);
+                        pc_touch_buzz();
+                        pc_diag_milestone("cam rotate left");
+                    }
+                } else {
+                    pc_touch_cam_cycle();
+                }
             } else if (s_down_hit == HIT_KEY) {
                 Hud now;
                 hud_build(&now);
@@ -1541,6 +1762,7 @@ void pc_touch_apply(unsigned short* buttons, signed char* stick_x, signed char* 
             }
             if (hit == HIT_BAG) *buttons |= PAD_BUTTON_Y;
             if (hit == HIT_MAP) *buttons |= PAD_BUTTON_X;
+            if (hit == HIT_CAM) pc_touch_cam_cycle();
             if (hit == HIT_ACTION || hit == HIT_CONTEXT) *buttons |= PAD_BUTTON_A;
             if ((hit == HIT_BACK || hit == HIT_CLOSE) && !g_pc_paused) *buttons |= PAD_BUTTON_B;
         } else if (s_down_hit == HIT_PICTURE && can_steer() && s_drag_active) {
@@ -1605,28 +1827,133 @@ void pc_touch_apply(unsigned short* buttons, signed char* stick_x, signed char* 
 
 void pc_touch_draw(struct game_s* game) { (void)game; }
 
-/* Soft disc. uv is -1..1 in the quad; the fragment keeps a circle. */
-static GLuint s_prog = 0, s_vao = 0, s_vbo = 0;
+/* Soft disc & authentic AC font texture. uv is -1..1 for circles, 0 for rects, >=2.0 for font glyphs. */
+static GLuint s_prog = 0, s_vao = 0, s_vbo = 0, s_font_tex = 0;
 static int s_gl_ready = 0, s_gl_failed = 0;
+
+static void init_font_texture(void) {
+    if (s_font_tex != 0 && glIsTexture(s_font_tex)) return;
+    s_font_tex = 0;
+    static u8 font_rgba[192 * 256 * 4];
+    const u8* src = FONT_nes_tex_font1;
+    int bw = 192 / 8; /* 24 blocks */
+    int bh = 256 / 8; /* 32 blocks */
+    for (int by = 0; by < bh; by++) {
+        for (int bx = 0; bx < bw; bx++) {
+            for (int y = 0; y < 8; y++) {
+                for (int x = 0; x < 8; x += 2) {
+                    u8 val = *src++;
+                    int px0 = bx * 8 + x;
+                    int px1 = px0 + 1;
+                    int py = by * 8 + y;
+                    u8 i0 = (val >> 4) | (val & 0xF0);
+                    u8 i1 = (val & 0x0F) | ((val & 0x0F) << 4);
+                    int idx0 = (py * 192 + px0) * 4;
+                    int idx1 = (py * 192 + px1) * 4;
+                    font_rgba[idx0] = font_rgba[idx0 + 1] = font_rgba[idx0 + 2] = 255;
+                    font_rgba[idx0 + 3] = i0;
+                    font_rgba[idx1] = font_rgba[idx1 + 1] = font_rgba[idx1 + 2] = 255;
+                    font_rgba[idx1 + 3] = i1;
+                }
+            }
+        }
+    }
+    glGenTextures(1, &s_font_tex);
+    glBindTexture(GL_TEXTURE_2D, s_font_tex);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, 192, 256, 0, GL_RGBA, GL_UNSIGNED_BYTE, font_rgba);
+    glBindTexture(GL_TEXTURE_2D, 0);
+}
 
 static GLuint compile_one(GLenum type, const char* src) {
     GLuint s = glCreateShader(type);
+    GLint ok = 0;
     glShaderSource(s, 1, &src, NULL);
     glCompileShader(s);
+    glGetShaderiv(s, GL_COMPILE_STATUS, &ok);
+    if (!ok) {
+        char log[512];
+        glGetShaderInfoLog(s, sizeof(log), NULL, log);
+        pc_diag_milestone(log);
+    }
     return s;
 }
 
 static void gl_init(void) {
 #ifdef PC_GLES
-    const char* vs = "#version 300 es\nprecision mediump float;\nlayout(location=0) in vec2 aPos;\nlayout(location=1) in vec4 aColor;\nlayout(location=2) in vec2 aUv;\nout vec4 vColor;\nout vec2 vUv;\nvoid main(){ gl_Position=vec4(aPos,0.0,1.0); vColor=aColor; vUv=aUv; }\n";
-    const char* fs = "#version 300 es\nprecision mediump float;\nin vec4 vColor;\nin vec2 vUv;\nout vec4 frag;\nvoid main(){ float d=length(vUv); float a=smoothstep(1.0,0.82,d); if(a<0.02) discard; frag=vec4(vColor.rgb, vColor.a*a); }\n";
+    const char* vs =
+        "#version 300 es\n"
+        "precision mediump float;\n"
+        "layout(location=0) in vec2 aPos;\n"
+        "layout(location=1) in vec4 aColor;\n"
+        "layout(location=2) in vec2 aUv;\n"
+        "out vec4 vColor;\n"
+        "out vec2 vUv;\n"
+        "void main() {\n"
+        "    gl_Position = vec4(aPos, 0.0, 1.0);\n"
+        "    vColor = aColor;\n"
+        "    vUv = aUv;\n"
+        "}\n";
+    const char* fs =
+        "#version 300 es\n"
+        "precision mediump float;\n"
+        "uniform sampler2D uFont;\n"
+        "in vec4 vColor;\n"
+        "in vec2 vUv;\n"
+        "out vec4 frag;\n"
+        "void main() {\n"
+        "    if (vUv.x >= 2.0) {\n"
+        "        float a = texture(uFont, vec2(vUv.x - 2.0, vUv.y)).a;\n"
+        "        if (a < 0.03) discard;\n"
+        "        frag = vec4(vColor.rgb, vColor.a * a);\n"
+        "    } else {\n"
+        "        float d = length(vUv);\n"
+        "        float a = smoothstep(1.0, 0.82, d);\n"
+        "        if (a < 0.02) discard;\n"
+        "        frag = vec4(vColor.rgb, vColor.a * a);\n"
+        "    }\n"
+        "}\n";
 #else
-    const char* vs = "#version 330 core\nlayout(location=0) in vec2 aPos;\nlayout(location=1) in vec4 aColor;\nlayout(location=2) in vec2 aUv;\nout vec4 vColor;\nout vec2 vUv;\nvoid main(){ gl_Position=vec4(aPos,0.0,1.0); vColor=aColor; vUv=aUv; }\n";
-    const char* fs = "#version 330 core\nin vec4 vColor;\nin vec2 vUv;\nout vec4 frag;\nvoid main(){ float d=length(vUv); float a=smoothstep(1.0,0.82,d); if(a<0.02) discard; frag=vec4(vColor.rgb, vColor.a*a); }\n";
+    const char* vs =
+        "#version 330 core\n"
+        "layout(location=0) in vec2 aPos;\n"
+        "layout(location=1) in vec4 aColor;\n"
+        "layout(location=2) in vec2 aUv;\n"
+        "out vec4 vColor;\n"
+        "out vec2 vUv;\n"
+        "void main() {\n"
+        "    gl_Position = vec4(aPos, 0.0, 1.0);\n"
+        "    vColor = aColor;\n"
+        "    vUv = aUv;\n"
+        "}\n";
+    const char* fs =
+        "#version 330 core\n"
+        "uniform sampler2D uFont;\n"
+        "in vec4 vColor;\n"
+        "in vec2 vUv;\n"
+        "out vec4 frag;\n"
+        "void main() {\n"
+        "    if (vUv.x >= 2.0) {\n"
+        "        float a = texture(uFont, vec2(vUv.x - 2.0, vUv.y)).a;\n"
+        "        if (a < 0.03) discard;\n"
+        "        frag = vec4(vColor.rgb, vColor.a * a);\n"
+        "    } else {\n"
+        "        float d = length(vUv);\n"
+        "        float a = smoothstep(1.0, 0.82, d);\n"
+        "        if (a < 0.02) discard;\n"
+        "        frag = vec4(vColor.rgb, vColor.a * a);\n"
+        "    }\n"
+        "}\n";
 #endif
     GLuint v, f, p;
     GLint ok = 0;
-    if (s_gl_ready || s_gl_failed) return;
+    if (s_gl_ready || s_gl_failed) {
+        init_font_texture();
+        return;
+    }
     v = compile_one(GL_VERTEX_SHADER, vs);
     f = compile_one(GL_FRAGMENT_SHADER, fs);
     p = glCreateProgram();
@@ -1645,6 +1972,7 @@ static void gl_init(void) {
     s_prog = p;
     glGenVertexArrays(1, &s_vao);
     glGenBuffers(1, &s_vbo);
+    init_font_texture();
     s_gl_ready = 1;
 }
 
@@ -1726,151 +2054,123 @@ static void button(float cx, float cy, float rad, float r, float g, float b) {
     disc(cx, cy - rad * 0.18f, rad * 0.72f, 1.0f, 0.98f, 0.94f, 0.18f);
 }
 
-/* 5-wide marks so a key is readable without a texture. Rows are top to bottom. */
-static const unsigned char k_glyph[48][7] = {
-    {0x0E,0x11,0x11,0x1F,0x11,0x11,0x11}, {0x1E,0x11,0x11,0x1E,0x11,0x11,0x1E},
-    {0x0E,0x11,0x10,0x10,0x10,0x11,0x0E}, {0x1E,0x11,0x11,0x11,0x11,0x11,0x1E},
-    {0x1F,0x10,0x10,0x1E,0x10,0x10,0x1F}, {0x1F,0x10,0x10,0x1E,0x10,0x10,0x10},
-    {0x0E,0x11,0x10,0x17,0x11,0x11,0x0E}, {0x11,0x11,0x11,0x1F,0x11,0x11,0x11},
-    {0x0E,0x04,0x04,0x04,0x04,0x04,0x0E}, {0x07,0x02,0x02,0x02,0x12,0x12,0x0C},
-    {0x11,0x12,0x14,0x18,0x14,0x12,0x11}, {0x10,0x10,0x10,0x10,0x10,0x10,0x1F},
-    {0x11,0x1B,0x15,0x15,0x11,0x11,0x11}, {0x11,0x19,0x15,0x13,0x11,0x11,0x11},
-    {0x0E,0x11,0x11,0x11,0x11,0x11,0x0E}, {0x1E,0x11,0x11,0x1E,0x10,0x10,0x10},
-    {0x0E,0x11,0x11,0x11,0x15,0x12,0x0D}, {0x1E,0x11,0x11,0x1E,0x14,0x12,0x11},
-    {0x0F,0x10,0x10,0x0E,0x01,0x01,0x1E}, {0x1F,0x04,0x04,0x04,0x04,0x04,0x04},
-    {0x11,0x11,0x11,0x11,0x11,0x11,0x0E}, {0x11,0x11,0x11,0x11,0x11,0x0A,0x04},
-    {0x11,0x11,0x11,0x15,0x15,0x15,0x0A}, {0x11,0x11,0x0A,0x04,0x0A,0x11,0x11},
-    {0x11,0x11,0x0A,0x04,0x04,0x04,0x04}, {0x1F,0x01,0x02,0x04,0x08,0x10,0x1F},
-    {0x08,0x10,0x10,0x10,0x10,0x10,0x08},
-    {0x0E,0x11,0x13,0x15,0x19,0x11,0x0E}, {0x04,0x0C,0x04,0x04,0x04,0x04,0x0E},
-    {0x0E,0x11,0x01,0x06,0x08,0x10,0x1F}, {0x0E,0x11,0x01,0x06,0x01,0x11,0x0E},
-    {0x02,0x06,0x0A,0x12,0x1F,0x02,0x02}, {0x1F,0x10,0x1E,0x01,0x01,0x11,0x0E},
-    {0x06,0x08,0x10,0x1E,0x11,0x11,0x0E}, {0x1F,0x01,0x02,0x04,0x08,0x08,0x08},
-    {0x0E,0x11,0x11,0x0E,0x11,0x11,0x0E}, {0x0E,0x11,0x11,0x0F,0x01,0x02,0x0C},
-    /* 37: '-' */ {0x00,0x00,0x00,0x1F,0x00,0x00,0x00},
-    /* 38: '.' */ {0x00,0x00,0x00,0x00,0x00,0x06,0x06},
-    /* 39: '!' */ {0x04,0x04,0x04,0x04,0x00,0x04,0x00},
-    /* 40: '\''*/ {0x04,0x04,0x08,0x00,0x00,0x00,0x00},
-    /* 41: '+' */ {0x00,0x04,0x04,0x1F,0x04,0x04,0x00},
-    /* 42: '/' */ {0x01,0x02,0x04,0x08,0x10,0x00,0x00},
-    /* 43: '*' */ {0x00,0x15,0x0E,0x15,0x00,0x00,0x00},
-    /* 44: ':' */ {0x00,0x0C,0x0C,0x00,0x0C,0x0C,0x00},
-    /* 45: '(' */ {0x02,0x04,0x08,0x08,0x08,0x04,0x02},
-    /* 46: ')' */ {0x08,0x04,0x02,0x02,0x02,0x04,0x08},
-    /* 47: '$' */ {0x04,0x0F,0x14,0x0E,0x05,0x1E,0x04}
-};
+static u8 ascii_to_ac_char(char c) {
+    if (c == '$') return CHAR_SYMBOL_MONEY;
+    if (c == '*') return CHAR_SYMBOL_STAR;
+    if (c == '/') return CHAR_FORWARD_SLASH;
+    if (c == ';') return CHAR_SEMICOLON;
+    if (c == '#') return CHAR_HASHTAG;
+    if (c == '+') return CHAR_PLUS;
+    return (u8)c;
+}
 
-static void glyph_raw(char ch, float cx, float cy, float s, float r, float g, float b, float a) {
-    int idx = -1, row;
-    if (ch >= 'a' && ch <= 'z') ch = ch - 'a' + 'A';
-    if (ch >= 'A' && ch <= 'Z') idx = ch - 'A';
-    else if (ch == '<') idx = 26;
-    else if (ch >= '0' && ch <= '9') idx = 27 + (ch - '0');
-    else if (ch == '-') idx = 37;
-    else if (ch == '.') idx = 38;
-    else if (ch == '!') idx = 39;
-    else if (ch == '\'') idx = 40;
-    else if (ch == '+') idx = 41;
-    else if (ch == '/') idx = 42;
-    else if (ch == '*') idx = 43;
-    else if (ch == ':') idx = 44;
-    else if (ch == '(') idx = 45;
-    else if (ch == ')') idx = 46;
-    else if (ch == '$') idx = 47;
-    if (idx < 0 || idx >= 48) return;
-    for (row = 0; row < 7; row++) {
-        unsigned bits = k_glyph[idx][row];
-        int col = 0;
-        while (col < 5) {
-            if (bits & (1u << (4 - col))) {
-                int start_col = col;
-                while (col < 5 && (bits & (1u << (4 - col)))) {
-                    col++;
-                }
-                float x0 = cx + ((float)start_col - 2.0f - 0.48f) * s;
-                float x1 = cx + ((float)(col - 1) - 2.0f + 0.48f) * s;
-                float y0 = cy + ((float)row - 3.0f - 0.48f) * s;
-                float y1 = cy + ((float)row - 3.0f + 0.48f) * s;
-                rect_raw(x0, y0, x1, y1, r, g, b, a);
-            } else {
-                col++;
-            }
+static void to_title_case(const char* src, char* dst, int max_len) {
+    int i = 0, j = 0;
+    int capitalize_next = 1;
+    if (dst == NULL || max_len <= 0) return;
+    dst[0] = 0;
+    if (src == NULL) return;
+    while (src[i] != 0 && j < max_len - 1) {
+        char c = src[i];
+        if (c >= 'A' && c <= 'Z') {
+            if (!capitalize_next) c = c - 'A' + 'a';
+            capitalize_next = 0;
+        } else if (c >= 'a' && c <= 'z') {
+            if (capitalize_next) c = c - 'a' + 'A';
+            capitalize_next = 0;
+        } else if (c == ' ' || c == '-' || c == '/' || c == '(' || c == '[' || c == '.') {
+            capitalize_next = 1;
+        } else {
+            capitalize_next = 0;
         }
+        dst[j++] = c;
+        i++;
+    }
+    dst[j] = 0;
+}
+
+static void draw_text_ac(const char* s, float cx, float cy, float pix, float r, float g, float b, float a, int center, int max_chars) {
+    if (s == NULL || s[0] == 0 || pix <= 0.001f) return;
+    init_font_texture();
+    if (s_font_tex == 0) return;
+
+    float scale = pix * 0.54f;
+    float tracking = 0.8f * scale;
+    int n = 0;
+    float total_w = 0.0f;
+    while (s[n] != 0 && n < max_chars) {
+        u8 ac = ascii_to_ac_char(s[n]);
+        int cw = mFont_GetCodeWidth(ac, 1);
+        if (cw <= 0) cw = 6;
+        total_w += (float)cw * scale + tracking;
+        n++;
+    }
+    if (n == 0) return;
+    if (total_w > tracking) total_w -= tracking;
+
+    float cur_x = center ? (cx - total_w * 0.5f) : cx;
+    float gh = 16.0f * scale;
+    float qy0 = cy - gh * 0.5f;
+    float qy1 = cy + gh * 0.5f;
+    float W = (float)g_pc_window_w, H = (float)g_pc_window_h;
+    float ry0 = 1.0f - qy1 / H * 2.0f;
+    float ry1 = 1.0f - qy0 / H * 2.0f;
+
+    for (int i = 0; i < n; i++) {
+        u8 ac = ascii_to_ac_char(s[i]);
+        int cw = mFont_GetCodeWidth(ac, 1);
+        if (cw <= 0) cw = 6;
+        float gw = (float)cw * scale;
+
+        if (s[i] != ' ') {
+            int row = ac >> 4;
+            int col = ac & 0x0F;
+            float u0 = (float)(col * 12) / 192.0f;
+            float u1 = (float)(col * 12 + cw) / 192.0f;
+            float v0 = (float)(row * 16) / 256.0f;
+            float v1 = (float)(row * 16 + 16) / 256.0f;
+
+            float qx0 = cur_x;
+            float qx1 = cur_x + gw;
+            float rx0 = qx0 / W * 2.0f - 1.0f;
+            float rx1 = qx1 / W * 2.0f - 1.0f;
+
+            vert(rx0, ry0, 2.0f + u0, v1, r, g, b, a);
+            vert(rx1, ry0, 2.0f + u1, v1, r, g, b, a);
+            vert(rx1, ry1, 2.0f + u1, v0, r, g, b, a);
+            vert(rx0, ry0, 2.0f + u0, v1, r, g, b, a);
+            vert(rx1, ry1, 2.0f + u1, v0, r, g, b, a);
+            vert(rx0, ry1, 2.0f + u0, v0, r, g, b, a);
+        }
+        cur_x += gw + tracking;
     }
 }
 
 static void draw_str_raw(const char* s, float cx, float cy, float pix, float r, float g, float b, float a, int max_chars) {
-    int n = 0, i;
-    float w;
-    if (s == NULL) return;
-    while (s[n] != 0 && n < max_chars) n++;
-    if (n == 0) return;
-    w = (float)n * 5.2f * pix;
-    for (i = 0; i < n; i++) {
-        if (s[i] == ' ') continue;
-        glyph_raw(s[i], cx - w * 0.5f + ((float)i + 0.5f) * 5.2f * pix, cy, pix, r, g, b, a);
-    }
+    char title[64];
+    to_title_case(s, title, sizeof(title));
+    draw_text_ac(title, cx, cy, pix, r, g, b, a, 1, max_chars);
 }
 
 static void draw_str_left_raw(const char* s, float x, float cy, float pix, float r, float g, float b, float a, int max_chars) {
-    int n = 0, i;
-    if (s == NULL) return;
-    while (s[n] != 0 && n < max_chars) n++;
-    for (i = 0; i < n; i++) {
-        if (s[i] == ' ') continue;
-        glyph_raw(s[i], x + ((float)i + 0.5f) * 5.2f * pix, cy, pix, r, g, b, a);
-    }
+    char title[64];
+    to_title_case(s, title, sizeof(title));
+    draw_text_ac(title, x, cy, pix, r, g, b, a, 0, max_chars);
 }
 
 static void draw_word_raw(const char* s, float cx, float cy, float pix, float r, float g, float b, float a) {
-    int n = 0, i;
-    float w, max_w;
-    if (s == NULL) return;
-    while (s[n] != 0 && n < 12) n++;
-    if (n == 0) return;
-    max_w = (pix / 0.13f) * 1.55f;
-    if (pix > 0.0f && (float)n * 5.0f * pix > max_w) {
-        pix = max_w / ((float)n * 5.0f);
-    }
-    w = (float)n * 5.0f * pix;
-    for (i = 0; i < n; i++) {
-        if (s[i] == ' ') continue;
-        glyph_raw(s[i], cx - w * 0.5f + ((float)i + 0.5f) * 5.0f * pix, cy, pix, r, g, b, a);
-    }
+    draw_str_raw(s, cx, cy, pix * 1.05f, r, g, b, a, 12);
 }
 
 static void glyph(char ch, float cx, float cy, float s) {
-    int idx = -1, row, col;
-    if (ch >= 'a' && ch <= 'z') idx = ch - 'a';
-    else if (ch >= 'A' && ch <= 'Z') idx = ch - 'A';
-    else if (ch == '<') idx = 26;
-    else if (ch >= '0' && ch <= '9') idx = 27 + (ch - '0');
-    if (idx < 0) return;
-    for (row = 0; row < 7; row++) {
-        unsigned bits = k_glyph[idx][row];
-        for (col = 0; col < 5; col++) {
-            if (bits & (1u << (4 - col))) {
-                float px = cx + ((float)col - 2.0f) * s;
-                float py = cy + ((float)row - 3.0f) * s;
-                disc(px, py, s * 0.55f, 0.16f, 0.18f, 0.15f, 0.95f);
-            }
-        }
-    }
+    char str[2];
+    str[0] = ch;
+    str[1] = 0;
+    draw_text_ac(str, cx, cy, s * 2.3f, 0.16f, 0.18f, 0.15f, 0.95f, 1, 1);
 }
 
 static void draw_left(const char* s, float x, float cy, float pix) {
-    int i, n = 0;
-    while (s[n] != 0 && n < 28) n++;
-    for (i = 0; i < n; i++) {
-        float cx = x + ((float)i + 0.5f) * 5.0f * pix;
-        if (s[i] == ' ') continue;
-        if (s[i] == ':') {
-            disc(cx, cy - pix, pix * 0.35f, 0.16f, 0.18f, 0.15f, 0.95f);
-            disc(cx, cy + pix, pix * 0.35f, 0.16f, 0.18f, 0.15f, 0.95f);
-            continue;
-        }
-        glyph(s[i], cx, cy, pix);
-    }
+    draw_str_left_raw(s, x, cy, pix, 0.16f, 0.18f, 0.15f, 0.95f, 32);
 }
 
 static void get_item_name(mActor_name_t item, char* out, int max_len) {
@@ -2664,21 +2964,7 @@ static void info_line(char* buf, size_t n) {
 }
 
 static void draw_word(const char* s, float cx, float cy, float pix) {
-    int n = 0, i;
-    float w, max_w;
-    if (s == NULL) return;
-    while (s[n] != 0 && n < 12) n++;
-    if (n == 0) return;
-    /* Scale down font if word is wide so it fits cleanly inside button radius */
-    max_w = (pix / 0.13f) * 1.55f;
-    if (pix > 0.0f && (float)n * 5.0f * pix > max_w) {
-        pix = max_w / ((float)n * 5.0f);
-    }
-    w = (float)n * 5.0f * pix;
-    for (i = 0; i < n; i++) {
-        if (s[i] == ' ') continue;
-        glyph(s[i], cx - w * 0.5f + ((float)i + 0.5f) * 5.0f * pix, cy, pix);
-    }
+    draw_word_raw(s, cx, cy, pix, 0.16f, 0.18f, 0.15f, 0.95f);
 }
 
 static const char* action_word(void) {
@@ -2749,6 +3035,10 @@ void pc_touch_present(void) {
         button(h.map_x, h.map_y, h.qr, 0.86f, 0.92f, 0.96f);
         draw_word("Items", h.bag_x, h.bag_y, h.qr * 0.13f);
         draw_word("Map", h.map_x, h.map_y, h.qr * 0.14f);
+    }
+    if (h.show_cam) {
+        button(h.cam_x, h.cam_y, h.cam_r, 0.92f, 0.88f, 0.96f);
+        draw_word("Cam", h.cam_x, h.cam_y, h.cam_r * 0.14f);
     }
     if (h.show_back) {
         button(h.bx, h.by, h.br, 0.86f, 0.50f, 0.44f);
@@ -2852,6 +3142,12 @@ void pc_touch_present(void) {
     glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
     glViewport(0, 0, g_pc_window_w, g_pc_window_h);
     glUseProgram(s_prog);
+    glActiveTexture(GL_TEXTURE0);
+    glBindTexture(GL_TEXTURE_2D, s_font_tex);
+    {
+        GLint uloc = glGetUniformLocation(s_prog, "uFont");
+        if (uloc >= 0) glUniform1i(uloc, 0);
+    }
     glBindVertexArray(s_vao);
     glBindBuffer(GL_ARRAY_BUFFER, s_vbo);
     glBufferData(GL_ARRAY_BUFFER, (GLsizeiptr)(s_nvert * 8 * (int)sizeof(float)), s_vert, GL_STREAM_DRAW);
@@ -2862,6 +3158,7 @@ void pc_touch_present(void) {
     glVertexAttribPointer(1, 4, GL_FLOAT, GL_FALSE, 8 * (GLsizei)sizeof(float), (void*)(2 * sizeof(float)));
     glVertexAttribPointer(2, 2, GL_FLOAT, GL_FALSE, 8 * (GLsizei)sizeof(float), (void*)(6 * sizeof(float)));
     glDrawArrays(GL_TRIANGLES, 0, s_nvert);
+    glBindTexture(GL_TEXTURE_2D, 0);
     glBindVertexArray(0);
     glUseProgram(0);
     pc_gx_external_gl_done();

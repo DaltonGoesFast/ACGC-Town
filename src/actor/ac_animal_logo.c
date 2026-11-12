@@ -25,6 +25,7 @@
 #include "pc_settings.h"
 #include "pc_settings_menu.h"
 #include "pc_play_online_menu.h"
+#include "pc_play_offline_menu.h"
 #include "pc_menu_util.h"
 #include "pc_pause_menu.h" /* pc_version_corner_draw: the version in the title screen's bottom-right corner */
 #include "pc_touch.h"
@@ -461,6 +462,23 @@ static void aAL_pc_game_start_wait(ANIMAL_LOGO_ACTOR* actor, GAME* game) {
     return;
   }
 
+  if (pc_play_offline_menu_active()) {
+    if (actor->pc_cursor_cooldown <= 0.0f) {
+      if (on_btn & (BUTTON_A | BUTTON_START)) {
+        pc_play_offline_menu_confirm();
+        actor->pc_cursor_cooldown = 10.0f;
+      } else if (on_btn & BUTTON_B) {
+        pc_play_offline_menu_cancel();
+        actor->pc_cursor_cooldown = 10.0f;
+      } else if (stick_y > 30 || (on_btn & BUTTON_DUP)) {
+        pc_play_offline_menu_nav_up();   actor->pc_cursor_cooldown = 8.0f;
+      } else if (stick_y < -30 || (on_btn & BUTTON_DDOWN)) {
+        pc_play_offline_menu_nav_down(); actor->pc_cursor_cooldown = 8.0f;
+      }
+    }
+    return;
+  }
+
   if (actor->pc_options_open) {
     s8 stick_x = gamePT->pads[PAD0].now.stick_x;
 
@@ -546,12 +564,16 @@ static void aAL_pc_game_start_wait(ANIMAL_LOGO_ACTOR* actor, GAME* game) {
         pc_play_online_menu_enter();
         actor->pc_cursor_cooldown = 10.0f;
         break;
-      case aAL_PC_ITEM_OFFLINE: /* Local town. Same fade as Start Game, after the save dir is save/offline. */
+      case aAL_PC_ITEM_OFFLINE: /* Local town. Character select menu if residents exist, else first-run start. */
         if (pc_offline_solo_begin() &&
             mLd_CheckStartFlag() == TRUE &&
             aAL_wipe_end_check(game) == TRUE &&
             mTD_tdemo_button_ok_check()) {
-          aAL_setupAction(actor, game, aAL_ACTION_FADE_OUT_START);
+          if (mFRm_CheckSaveData() == TRUE && pc_play_offline_menu_has_characters()) {
+            pc_play_offline_menu_enter();
+          } else {
+            aAL_setupAction(actor, game, aAL_ACTION_FADE_OUT_START);
+          }
         }
         actor->pc_cursor_cooldown = 10.0f;
         break;
@@ -946,7 +968,7 @@ static void aAL_pc_menu_draw(ANIMAL_LOGO_ACTOR* actor, GAME* game) {
 
   /* Hide the title's main menu items while the Options overlay is open, else
    * Start/Options/Quit bleed through the dimmed backdrop. */
-  if (!actor->pc_options_open && !pc_play_online_menu_active()) {
+  if (!actor->pc_options_open && !pc_play_online_menu_active() && !pc_play_offline_menu_active()) {
     for (int i = 0; i < n_items; i++) {
       int on = (sel == i);
       int item = aAL_pc_menu_item(i);
@@ -1014,6 +1036,11 @@ static void aAL_pc_menu_draw(ANIMAL_LOGO_ACTOR* actor, GAME* game) {
   if (pc_play_online_menu_active()) {
     pc_play_online_menu_tick();
     pc_play_online_menu_draw(game, /*with_dim_backdrop=*/1);
+  }
+
+  if (pc_play_offline_menu_active()) {
+    pc_play_offline_menu_tick();
+    pc_play_offline_menu_draw(game, /*with_dim_backdrop=*/1);
   }
 
   /* Options sub-menu, shared with the in-game pause menu. */

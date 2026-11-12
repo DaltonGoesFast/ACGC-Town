@@ -428,6 +428,8 @@ static void pc_net_ping_draw(struct game_s* game) {
  * drawn when the window is wide enough for the corner to lie outside 0..320. */
 void pc_version_corner_draw(struct game_s* game, int overlay_open) {
     static const char text[] = "v" PC_VERSION_STRING;
+    extern int pc_play_offline_menu_active(void);
+    if (pc_play_offline_menu_active()) overlay_open = 1;
     const f32 scale = 0.6f;
     f32 right = SCREEN_WIDTH_F, px = 1.0f, w, x, y, o;
     if (g_pc_dedicated || game == NULL || game->graph == NULL) return;
