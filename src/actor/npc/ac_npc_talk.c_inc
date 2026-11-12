@@ -621,6 +621,16 @@ static void aNPC_talk_request_normal_npc(ACTOR* actorx, GAME* game) {
 
     if (mDemo_Check(mDemo_TYPE_TALK, actorx) == TRUE) {
         nactorx->think.force_call_flag = aNPC_FORCE_CALL_NONE;
+#ifdef TARGET_PC
+        if (nactorx->npc_info.animal != NULL) {
+            extern int pc_missions_has_ready_for_villager(u16 npc_id);
+            extern int pc_missions_try_turn_in(int slot);
+            int mslot = pc_missions_has_ready_for_villager((u16)nactorx->npc_info.animal->id.npc_id);
+            if (mslot >= 0) {
+                pc_missions_try_turn_in(mslot);
+            }
+        }
+#endif
     }
 
     switch (nactorx->think.force_call_flag) {

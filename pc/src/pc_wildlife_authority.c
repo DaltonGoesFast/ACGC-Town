@@ -262,7 +262,7 @@ static PcWildlifePresentationSlot s_presentation[PCWLDP_MAX_LOCAL];
  * to the same small size as s_presentation[] -- a single trigger call can produce at most a handful
  * of records (ordinary insect/fish decisions are 0-1 each; a firefly/red-dragonfly multi-spawn batch
  * is the only case producing more than one insect record per call). */
-#define PCWLD_MAX_PENDING_PRESENTATION 8
+#define PCWLD_MAX_PENDING_PRESENTATION 16
 
 typedef struct PcWildlifePendingPresentation {
     uint32_t entity_id;
@@ -347,15 +347,34 @@ int pcwld_find_by_id(uint32_t entity_id, PcWildlifeRecord* out) {
     return 1;
 }
 
-int pcwld_acre_has_kind(int bx, int bz, int kind) {
-    int i;
+int pcwld_acre_count_kind(int bx, int bz, int kind) {
+    int i, count = 0;
     for (i = 0; i < PCWLD_MAX_ENTITIES; i++) {
         if (s_table[i].active && s_table[i].rec.kind == kind && s_table[i].rec.bx == bx &&
             s_table[i].rec.bz == bz) {
-            return 1;
+            count++;
         }
     }
-    return 0;
+    return count;
+}
+
+int pcwld_acre_has_kind(int bx, int bz, int kind) {
+    return pcwld_acre_count_kind(bx, bz, kind) > 0;
+}
+
+int pcwld_host_scaled_acre_cap(void) {
+    int n = pc_net_game_wildlife_peer_count();
+    float target;
+    int cap;
+    if (n < 1) {
+        n = 1;
+    }
+    /* Phase 4 Dynamic Wildlife Scaling: Target = Base * (1 + 0.4 * (N - 1)), Base = 1 per acre. */
+    target = 1.0f + 0.4f * (float)(n - 1);
+    cap = (int)(target + 0.5f);
+    if (cap < 1) cap = 1;
+    if (cap > 4) cap = 4;
+    return cap;
 }
 
 int pcwld_count_in_acre(int bx, int bz) {
@@ -549,9 +568,11 @@ static uint32_t pcwld_table_insert(int kind, int species, int bx, int bz, float 
  * re-entrant (enforced by s_in_progress) and s_scratch_set_manager.player_pos.next_bx/next_bz are
  * set immediately before each overlay call and never touched by anything else in between. */
 
+static int s_current_acre_cap = 1;
+
 static int pcwld_shim_chk_live_insect_proc(int bx, int bz, GAME* game) {
     (void)game;
-    return pcwld_acre_has_kind(bx, bz, PC_WILDLIFE_KIND_BUG) ? TRUE : FALSE;
+    return pcwld_acre_count_kind(bx, bz, PC_WILDLIFE_KIND_BUG) >= s_current_acre_cap ? TRUE : FALSE;
 }
 
 /* Sentinel non-NULL return -- NEVER dereferenced by aSOI_ins_make_sub()/aSOI_ins_make()
@@ -576,7 +597,7 @@ static void pcwld_shim_make_ant_proc(aINS_Init_c* init, s8 bx, s8 bz) {
 
 static int pcwld_shim_chk_live_gyoei_proc(int bx, int bz, GAME* game) {
     (void)game;
-    return pcwld_acre_has_kind(bx, bz, PC_WILDLIFE_KIND_FISH) ? TRUE : FALSE;
+    return pcwld_acre_count_kind(bx, bz, PC_WILDLIFE_KIND_FISH) >= s_current_acre_cap ? TRUE : FALSE;
 }
 
 /* Sentinel success return (1) -- aSOG_gyoei_make() (ac_set_ovl_gyoei.c) only tests truthiness. */
@@ -631,6 +652,7 @@ int pcwld_host_spawn_trigger(int bx, int bz) {
     play = (GAME_PLAY*)gamePT;
 
     s_in_progress = 1;
+    s_current_acre_cap = pcwld_host_scaled_acre_cap();
 
     s_scratch_set_manager.player_pos.next_bx = bx;
     s_scratch_set_manager.player_pos.next_bz = bz;
@@ -638,33 +660,39 @@ int pcwld_host_spawn_trigger(int bx, int bz) {
     /* ---- insects (frame N in a real wade sequence) ---- */
     saved_insect_clip = *insect_clip;
     reroll = pcwld_test_reroll_count();
-    for (tries = 0; tries < reroll; tries++) {
-        insect_clip->chk_live_insect_proc = pcwld_shim_chk_live_insect_proc;
-        insect_clip->make_insect_proc     = pcwld_shim_make_insect_proc;
-        insect_clip->make_ant_proc        = pcwld_shim_make_ant_proc;
+    {
+        int max_tries = (reroll > s_current_acre_cap) ? reroll : s_current_acre_cap;
+        for (tries = 0; tries < max_tries; tries++) {
+            if (pcwld_acre_count_kind(bx, bz, PC_WILDLIFE_KIND_BUG) >= s_current_acre_cap) {
+                break;
+            }
+            insect_clip->chk_live_insect_proc = pcwld_shim_chk_live_insect_proc;
+            insect_clip->make_insect_proc     = pcwld_shim_make_insect_proc;
+            insect_clip->make_ant_proc        = pcwld_shim_make_ant_proc;
 
-        aSOI_insect_set(&s_scratch_set_manager, play);
+            aSOI_insect_set(&s_scratch_set_manager, play);
 
-        insect_clip->chk_live_insect_proc = saved_insect_clip.chk_live_insect_proc;
-        insect_clip->make_insect_proc     = saved_insect_clip.make_insect_proc;
-        insect_clip->make_ant_proc        = saved_insect_clip.make_ant_proc;
-        if (pcwld_acre_has_kind(bx, bz, PC_WILDLIFE_KIND_BUG)) {
-            break;
+            insect_clip->chk_live_insect_proc = saved_insect_clip.chk_live_insect_proc;
+            insect_clip->make_insect_proc     = saved_insect_clip.make_insect_proc;
+            insect_clip->make_ant_proc        = saved_insect_clip.make_ant_proc;
         }
     }
 
     /* ---- fish (frame N+1 in a real wade sequence -- see this file's own deviation doc) ---- */
     saved_gyo_clip = *gyo_clip;
-    for (tries = 0; tries < reroll; tries++) {
-        gyo_clip->chk_live_gyoei_proc = pcwld_shim_chk_live_gyoei_proc;
-        gyo_clip->make_gyoei_proc     = pcwld_shim_make_gyoei_proc;
+    {
+        int max_tries = (reroll > s_current_acre_cap) ? reroll : s_current_acre_cap;
+        for (tries = 0; tries < max_tries; tries++) {
+            if (pcwld_acre_count_kind(bx, bz, PC_WILDLIFE_KIND_FISH) >= s_current_acre_cap) {
+                break;
+            }
+            gyo_clip->chk_live_gyoei_proc = pcwld_shim_chk_live_gyoei_proc;
+            gyo_clip->make_gyoei_proc     = pcwld_shim_make_gyoei_proc;
 
-        aSOG_gyoei_set(&s_scratch_set_manager, play);
+            aSOG_gyoei_set(&s_scratch_set_manager, play);
 
-        gyo_clip->chk_live_gyoei_proc = saved_gyo_clip.chk_live_gyoei_proc;
-        gyo_clip->make_gyoei_proc     = saved_gyo_clip.make_gyoei_proc;
-        if (pcwld_acre_has_kind(bx, bz, PC_WILDLIFE_KIND_FISH)) {
-            break;
+            gyo_clip->chk_live_gyoei_proc = saved_gyo_clip.chk_live_gyoei_proc;
+            gyo_clip->make_gyoei_proc     = saved_gyo_clip.make_gyoei_proc;
         }
     }
 

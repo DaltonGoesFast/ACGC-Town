@@ -14,6 +14,7 @@
 #include "pc_bedroom.h"
 #include "pc_cloud_storage.h"
 #include "pc_dresser_ui.h"
+#include "pc_missions.h"
 
 extern int pc_creator_menu_active(void);
 extern void pc_creator_menu_pointer(float fx, float fy);
@@ -61,7 +62,7 @@ enum { HIT_NONE = 0, HIT_PICTURE, HIT_STICK, HIT_NUB, HIT_ACTION, HIT_BACK, HIT_
 
 typedef struct {
     int active;            /* 1 if drawer is visible */
-    int current_tab;       /* 0: Pockets, 1: Letters, 2: Fish, 3: Bugs */
+    int current_tab;       /* 0: Pockets, 1: Letters, 2: Fish, 3: Bugs, 4: Missions */
     int sel_slot;          /* -1 = none, 0..14 = pocket slot */
     int swap_mode;         /* 1 if waiting for second slot to swap */
     int swap_source;       /* source slot index */
@@ -73,8 +74,8 @@ typedef struct {
     float close_cx, close_cy, close_w, close_h;
     float bells_cx, bells_cy, bells_w, bells_h;
 
-    /* Tabs layout (4 tabs) */
-    float tab_cx[4], tab_cy[4], tab_w[4], tab_h[4];
+    /* Tabs layout (5 tabs) */
+    float tab_cx[5], tab_cy[5], tab_w[5], tab_h[5];
 
     /* Card grid layout (15 slots: 5 cols x 3 rows) */
     float card_x0[15], card_y0[15], card_x1[15], card_y1[15];
@@ -2489,11 +2490,11 @@ static void mobile_sheet_layout(void) {
 
     cur_y += header_h + 10.0f * ui;
 
-    /* Category Tabs (4 tabs) */
+    /* Category Tabs (5 tabs) */
     {
-        float tab_w = (W - 2.0f * margin_x - 3.0f * gap_x) / 4.0f;
+        float tab_w = (W - 2.0f * margin_x - 4.0f * gap_x) / 5.0f;
         float tab_cy = cur_y + tab_h * 0.5f;
-        for (i = 0; i < 4; i++) {
+        for (i = 0; i < 5; i++) {
             s_sheet.tab_cx[i] = margin_x + tab_w * 0.5f + (float)i * (tab_w + gap_x);
             s_sheet.tab_cy[i] = tab_cy;
             s_sheet.tab_w[i] = tab_w;
@@ -2614,7 +2615,7 @@ static int mobile_sheet_hit(float x, float y, int* key) {
         y >= s_sheet.bells_cy - s_sheet.bells_h * 0.5f && y <= s_sheet.bells_cy + s_sheet.bells_h * 0.5f) {
         return HIT_SHEET_BELLS;
     }
-    for (i = 0; i < 4; i++) {
+    for (i = 0; i < 5; i++) {
         if (x >= s_sheet.tab_cx[i] - s_sheet.tab_w[i] * 0.5f && x <= s_sheet.tab_cx[i] + s_sheet.tab_w[i] * 0.5f &&
             y >= s_sheet.tab_cy[i] - s_sheet.tab_h[i] * 0.5f && y <= s_sheet.tab_cy[i] + s_sheet.tab_h[i] * 0.5f) {
             *key = i;
@@ -2891,7 +2892,9 @@ static void mobile_sheet_handle_bells(void) {
 static void mobile_sheet_handle_tab(int tab_id) {
     s_sheet.current_tab = tab_id;
     s_sheet.swap_mode = 0;
-    handle_sub_tab_tap(tab_id);
+    if (tab_id < 4) {
+        handle_sub_tab_tap(tab_id);
+    }
     sAdo_SysTrgStart(NA_SE_CURSOL);
     pc_touch_buzz();
 }
@@ -2940,17 +2943,17 @@ static void mobile_sheet_draw(void) {
 
     /* Category Tabs */
     {
-        static const char* tab_names[4] = { "POCKETS", "LETTERS", "FISH", "BUGS" };
-        for (i = 0; i < 4; i++) {
+        static const char* tab_names[5] = { "POCKETS", "LETTERS", "FISH", "BUGS", "MISSIONS" };
+        for (i = 0; i < 5; i++) {
             int active = (s_sheet.current_tab == i);
             float cx = s_sheet.tab_cx[i], cy = s_sheet.tab_cy[i];
             float tw = s_sheet.tab_w[i], th = s_sheet.tab_h[i];
             if (active) {
                 pill_button_shadow(cx, cy, tw, th, 0.28f, 0.70f, 0.46f, 1.0f);
-                draw_str_raw(tab_names[i], cx, cy, 3.0f * ui, 1.0f, 1.0f, 1.0f, 1.0f, 8);
+                draw_str_raw(tab_names[i], cx, cy, 2.7f * ui, 1.0f, 1.0f, 1.0f, 1.0f, 9);
             } else {
                 pill_button_shadow(cx, cy, tw, th, 0.89f, 0.87f, 0.83f, 0.95f);
-                draw_str_raw(tab_names[i], cx, cy, 2.8f * ui, 0.42f, 0.40f, 0.38f, 1.0f, 8);
+                draw_str_raw(tab_names[i], cx, cy, 2.5f * ui, 0.42f, 0.40f, 0.38f, 1.0f, 9);
             }
         }
     }
@@ -3090,6 +3093,54 @@ static void mobile_sheet_draw(void) {
                 }
             } else {
                 draw_str_raw("EMPTY LETTER", cx, cy + 2.0f * ui, 2.5f * ui, 0.60f, 0.58f, 0.55f, 0.85f, 14);
+            }
+        }
+    } else if (s_sheet.current_tab == 4) {
+        /* Daily Villager Missions Tab */
+        const PCMissionState* ms = pc_missions_get_state();
+        float grid_top = s_sheet.card_y0[0];
+        float grid_bot = s_sheet.detail_y1;
+        int n = (int)ms->count;
+        if (n > PC_MISSIONS_MAX) n = PC_MISSIONS_MAX;
+        if (n <= 0) {
+            float cx = W * 0.5f, cy = (grid_top + grid_bot) * 0.5f;
+            draw_str_raw("NO MISSIONS TODAY", cx, cy, 3.2f * ui, 0.45f, 0.45f, 0.45f, 1.0f, 20);
+        } else {
+            float gap = 8.0f * ui;
+            float row_h = (grid_bot - grid_top - (float)(n - 1) * gap) / (float)n;
+            for (i = 0; i < n; i++) {
+                const PCMissionDef* d = &ms->defs[i];
+                int cur = 0, tgt = 1;
+                int ready = pc_missions_get_progress(i, &cur, &tgt);
+                int done = (ms->completed_mask & (1u << i)) != 0;
+                float y0 = grid_top + (float)i * (row_h + gap);
+                float y1 = y0 + row_h;
+                float cy = (y0 + y1) * 0.5f;
+                char line[64], badge[24];
+
+                round_rect(margin_x, y0, W - margin_x, y1, 12.0f * ui,
+                           done ? 0.90f : (ready ? 0.92f : 1.0f),
+                           done ? 0.92f : (ready ? 0.98f : 1.0f),
+                           done ? 0.89f : (ready ? 0.92f : 1.0f), 0.98f);
+
+                snprintf(line, sizeof(line), "%s: %s (%uB)",
+                         d->villager_name, d->title, (unsigned)d->reward_bells);
+                draw_text_ac(line, margin_x + 14.0f * ui, cy, 2.7f * ui,
+                             done ? 0.48f : 0.18f, done ? 0.50f : 0.22f, done ? 0.48f : 0.20f, 1.0f, 0, 42);
+
+                if (done) {
+                    snprintf(badge, sizeof(badge), "DONE");
+                    pill_button_shadow(W - margin_x - 54.0f * ui, cy, 88.0f * ui, row_h * 0.68f, 0.68f, 0.72f, 0.68f, 1.0f);
+                    draw_str_raw(badge, W - margin_x - 54.0f * ui, cy, 2.4f * ui, 1.0f, 1.0f, 1.0f, 1.0f, 10);
+                } else if (ready) {
+                    snprintf(badge, sizeof(badge), "DELIVER!");
+                    pill_button_shadow(W - margin_x - 54.0f * ui, cy, 88.0f * ui, row_h * 0.68f, 0.22f, 0.72f, 0.42f, 1.0f);
+                    draw_str_raw(badge, W - margin_x - 54.0f * ui, cy, 2.4f * ui, 1.0f, 1.0f, 1.0f, 1.0f, 10);
+                } else {
+                    snprintf(badge, sizeof(badge), "%d/%d", cur, tgt);
+                    pill_button_shadow(W - margin_x - 54.0f * ui, cy, 88.0f * ui, row_h * 0.68f, 0.96f, 0.80f, 0.24f, 1.0f);
+                    draw_str_raw(badge, W - margin_x - 54.0f * ui, cy, 2.5f * ui, 0.18f, 0.16f, 0.06f, 1.0f, 10);
+                }
             }
         }
     } else {

@@ -400,6 +400,8 @@ set(PC_SOURCES
     ${CMAKE_CURRENT_SOURCE_DIR}/src/pc_sell_ui.c      # Nook bulk sell basket: screen state + Nook seam helpers (game side)
     ${CMAKE_CURRENT_SOURCE_DIR}/src/pc_bedroom_store.c
     ${CMAKE_CURRENT_SOURCE_DIR}/src/pc_cloud_storage.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/pc_missions.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/pc_daily_fallback.c
     ${CMAKE_CURRENT_SOURCE_DIR}/src/pc_mp_guest_store.c
     ${CMAKE_CURRENT_SOURCE_DIR}/src/pc_net_game.c
     ${CMAKE_CURRENT_SOURCE_DIR}/src/pc_nook_house.c

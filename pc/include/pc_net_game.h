@@ -1330,6 +1330,10 @@ void pc_net_game_gyroid_diag(const char* what, const char* reason, const void* a
 /* HOST: the connected players the wildlife AI must consider (position, heading, dash / tool use from the newest MOVE sample), in the town scene only. See pc_wildlife_authority.h. */
 int pc_net_game_wildlife_remote_players(PcWldRemotePlayer* out, int max);
 
+/* HOST: total active online players N (ready peers + local host player if not --host-observer), clamped >= 1.
+ * Used by Phase 4 dynamic wildlife scaling: Target = Base * (1 + 0.4 * (N - 1)). */
+int pc_net_game_wildlife_peer_count(void);
+
 /* Batch A (A1): the authoritative wildlife mode is decided by the HOST. A CLIENT adopts the mode from the host's TOWN_SVC_STATE service 4 (HOST_CONFIG,
  * sent at READY before the snapshot); its own --authoritative-wildlife is ignored. pc_net_game_authoritative_wildlife_enabled() therefore returns, for
  * a client, the host's announcement (0 until it arrives). pc_net_game_wildlife_mode_pending() is 1 iff this process is a CLIENT that has not received

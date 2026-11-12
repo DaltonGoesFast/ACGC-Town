@@ -1405,6 +1405,12 @@ extern void mFM_FieldInit(GAME_PLAY* play) {
 
     if (scene == SCENE_FG) {
         mNpc_SetNpcHomeYpos();
+#ifdef TARGET_PC
+        {
+            extern void pc_daily_fallback_apply_if_needed(void);
+            pc_daily_fallback_apply_if_needed();
+        }
+#endif
     }
 
     mNpc_SendRegisteredGoodbyMail();

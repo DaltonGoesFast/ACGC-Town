@@ -464,6 +464,12 @@ void pc_day_roll_play_init(void* p) {
             pc_dr_log("60-Day Inactivity Audit: reclaimed %d inactive bedroom(s)", reclaimed);
         }
     }
+
+    /* Phase 4: Roll and broadcast today's Daily Villager Missions */
+    {
+        extern void pc_net_game_missions_host_day_roll(void);
+        pc_net_game_missions_host_day_roll();
+    }
 }
 
 int pc_day_roll_save_due(void) {

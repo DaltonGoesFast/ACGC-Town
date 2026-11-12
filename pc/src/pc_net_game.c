@@ -203,6 +203,7 @@ static void pcnetgame_server_init_members(void); /* first launch of a dedicated 
 #include "pc_tabfile.h"        /* capacity phase 7: the durable file of a keyed table (work_jobs.dat v3, v2 compatible) */
 #include "pc_able_net.h"       /* worker B: Able Sisters trade journal / villager outfits */
 #include "pc_museum_net.h"     /* worker B: museum letters with a gift, guest donor names */
+#include "pc_missions.h"       /* Phase 4: Daily Villager Missions */
 #include "pc_museum_donors.h"  /* worker B: the museum_donors.dat sidecar */
 #include "pc_interest.h"     /* capacity phase 5: MOVE relay tiers */
 #include "pc_roster.h"        /* capacity phase 5: roster deltas with retry */
@@ -634,8 +635,14 @@ typedef enum PCNetGameMsgType {
                                              * REQUEST / STEPPED_OFF / WELCOMED / ABORT (sent only after the host's STATE arrived). PRESENTATION ONLY. An old peer ignores the
                                              * id. Kill switch AC_MP_TRAIN_SYNC=0. See the SYNCED ARRIVAL TRAIN block (pc_net_game_arrtrain.c_inc). */
     PC_NETGAME_MSG_BEDROOM              = 106, /* multi-resident housing bedrooms (Phase 2), RELIABLE, 64 bytes (PCBedroomMsg, pc_bedroom.h) */
+    PC_NETGAME_MSG_MISSIONS             = 107, /* daily villager missions (Phase 4), RELIABLE, 332 bytes (PCMissionMsg, pc_missions.h) */
 } PCNetGameMsgType;
 _Static_assert((int)PC_NETGAME_MSG_BEDROOM == 106, "BEDROOM msg id drifted (pc_bedroom.h)");
+_Static_assert((int)PC_NETGAME_MSG_MISSIONS == 107, "MISSIONS msg id drifted (pc_missions.h)");
+/* DAILY VILLAGER MISSIONS (pc_net_game_missions.c_inc, included at the end of this file) */
+static void pcnetgame_missions_host_on_ready(PCNetPeerId peer);
+static void pcnetgame_handle_host_missions(PCNetPeerId peer, const uint8_t* data, uint16_t size);
+static void pcnetgame_handle_client_missions(const uint8_t* data, uint16_t size);
 /* MULTI-RESIDENT BEDROOMS (pc_net_game_bedroom.c_inc, included at the end of this file) */
 static void pcnetgame_bedroom_host_on_ready(PCNetPeerId peer);
 static void pcnetgame_handle_host_bedroom(PCNetPeerId peer, const uint8_t* data, uint16_t size);
@@ -14827,6 +14834,10 @@ static void pcnetgame_handle_client_snapshot_end(const PCNetGameSnapshotEndMsg* 
      * redundantly, after every full snapshot apply is harmless and keeps fish/bug spawn-weight
      * multipliers (which read good_field) correct on this client. */
     mFAs_SetFieldRank();
+    if (Save_Get(scene_no) == SCENE_FG) {
+        extern void pc_daily_fallback_apply_if_needed(void);
+        pc_daily_fallback_apply_if_needed();
+    }
     if (s_client_snap_blocks != (int)in->acre_count) {
         printf("[NET][WORLD] client: snapshot epoch %u ended with %d/%u blocks applied\n", (unsigned)in->epoch,
                s_client_snap_blocks, (unsigned)in->acre_count);
@@ -14870,6 +14881,10 @@ static void pcnetgame_handle_client_world_meta(const PCNetGameWorldMetaMsg* in) 
          * flag's own doc above) -- the field rank derived from fg goes stale across one, so recompute
          * it on this client too (see the matching call in pcnetgame_handle_client_snapshot_end()). */
         mFAs_SetFieldRank();
+    if (Save_Get(scene_no) == SCENE_FG) {
+        extern void pc_daily_fallback_apply_if_needed(void);
+        pc_daily_fallback_apply_if_needed();
+    }
     }
     if (in->flags & PC_NETGAME_META_FLAG_WEATHER_VALID) {
         pcnetgame_client_apply_weather_state(&in->world_state);
@@ -35123,6 +35138,7 @@ static void pcnetgame_host_process_identity(PCNetPeerId peer) {
     pcnetgame_host_ts_push_hostcfg(peer); /* batch A (A1): the wildlife mode is announced BEFORE any snapshot message */
     pcnetgame_arrtrain_host_on_ready(peer); /* synced arrival train: the timeline (and the capability) BEFORE the snapshot the guest's arrival waits for */
     pcnetgame_bedroom_host_on_ready(peer);  /* multi-resident bedrooms: sync claimed bedroom status table */
+    pcnetgame_missions_host_on_ready(peer); /* Phase 4: sync daily villager missions */
     pcnetgame_host_start_snapshot(peer, "joined");
     pcnetgame_host_rec_on_ready(peer); /* D3: AWAIT_HELLO */
 }
@@ -35886,6 +35902,10 @@ static void pcnetgame_handle_host_data(PCNetPeerId peer, const uint8_t* data, ui
     }
     if (data[0] == (uint8_t)PC_NETGAME_MSG_BEDROOM) { /* MULTI-RESIDENT BEDROOMS: claim requests / queries */
         pcnetgame_handle_host_bedroom(peer, data, size);
+        return;
+    }
+    if (data[0] == (uint8_t)PC_NETGAME_MSG_MISSIONS) { /* DAILY VILLAGER MISSIONS: turn-in requests */
+        pcnetgame_handle_host_missions(peer, data, size);
         return;
     }
     if (data[0] == (uint8_t)PC_NETGAME_MSG_HANDOVER) { /* HAND-OVER ANIMATIONS: presentation only (villager: the host's held actor; shop: relayed within the sender's scene) */
@@ -36665,6 +36685,10 @@ static void pcnetgame_handle_client_data(const uint8_t* data, uint16_t size) {
     }
     if (size == sizeof(PCBedroomMsg) && data[0] == (uint8_t)PC_NETGAME_MSG_BEDROOM) {
         pcnetgame_handle_client_bedroom(data, size); /* MULTI-RESIDENT BEDROOMS: claim ACK / info sync */
+        return;
+    }
+    if (size == sizeof(PCMissionMsg) && data[0] == (uint8_t)PC_NETGAME_MSG_MISSIONS) {
+        pcnetgame_handle_client_missions(data, size); /* DAILY VILLAGER MISSIONS: daily sync / turn-in ACK */
         return;
     }
     if (size == sizeof(PCHandoverMsg) && data[0] == (uint8_t)PC_NETGAME_MSG_HANDOVER) {
@@ -40532,6 +40556,8 @@ void pc_net_game_client_relaunch_failed(const char* err) {
 
 /* ===== BATCH A END ===== */
 
+static void pcnetgame_host_orchard_regrowth_tick(void);
+
 void pc_net_game_poll(void) {
     PCNetEvent ev;
 
@@ -40570,6 +40596,7 @@ void pc_net_game_poll(void) {
                consistent with every other per-poll expiry tick in this function). */
             pcnetgame_host_check_tree_cut();
             pcnetgame_host_check_wildlife_attendance();
+            pcnetgame_host_orchard_regrowth_tick();
         }
         /* World Ecology T1 review fix: local presentation-map idle expiry -- ANY role (a client
          * maintains its own local presentation map too, see pcwld_presentation_check_idle()'s own
@@ -46188,6 +46215,94 @@ void pc_net_game_gyroid_diag(const char* what, const char* reason, const void* a
     }
     printf("[NET][GYROID] %s reason=%s actor=%p prop=0x%04X pos=(%.0f,%.0f) block=(%d,%d) fg_tile=0x%04X live_gyroids_same_prop=%d live_gyroids_all=%d other_live_same_prop=[%s ] role=%d scene_town=%d frame=%u%s", what, reason != NULL ? reason : "-", actor, npc_id, (double)x, (double)z, bx, bz, fg_tile,
            live_same, live_all, existing, (int)s_role, pcfa_scene_is_town() ? 1 : 0, (unsigned)pcnetgame_now_ms(), "\n");
+}
+
+int pc_net_game_wildlife_peer_count(void) {
+    int n = pc_net_game_host_ready_peer_count();
+    if (s_role == PC_NETGAME_ROLE_HOST && !pc_host_observer_active()) {
+        n += 1;
+    }
+    return n < 1 ? 1 : n;
+}
+
+/* Phase 4: Proportional orchard regrowth tick. Accumulates scaled time proportional to online
+ * peer activity N and periodically advances one picked fruit tree (NOFRUIT_0..2 -> FRUIT),
+ * broadcasting the updated tile via pcnetgame_host_flush_mask(). */
+static int pcnetgame_is_picked_fruit_tree(mActor_name_t item) {
+    return (item == TREE_APPLE_NOFRUIT_0 || item == TREE_APPLE_NOFRUIT_1 || item == TREE_APPLE_NOFRUIT_2 ||
+            item == TREE_ORANGE_NOFRUIT_0 || item == TREE_ORANGE_NOFRUIT_1 || item == TREE_ORANGE_NOFRUIT_2 ||
+            item == TREE_PEACH_NOFRUIT_0 || item == TREE_PEACH_NOFRUIT_1 || item == TREE_PEACH_NOFRUIT_2 ||
+            item == TREE_PEAR_NOFRUIT_0 || item == TREE_PEAR_NOFRUIT_1 || item == TREE_PEAR_NOFRUIT_2 ||
+            item == TREE_CHERRY_NOFRUIT_0 || item == TREE_CHERRY_NOFRUIT_1 || item == TREE_CHERRY_NOFRUIT_2 ||
+            item == TREE_PALM_NOFRUIT_0 || item == TREE_PALM_NOFRUIT_1 || item == TREE_PALM_NOFRUIT_2);
+}
+
+static void pcnetgame_host_orchard_regrowth_tick(void) {
+    static uint32_t s_last_ms = 0;
+    static float s_accum_ms = 0.0f;
+    uint32_t now, dt;
+    int n, az, ax, t, count, pick;
+
+    if (s_role != PC_NETGAME_ROLE_HOST || !s_host_world_ready || !pcfa_scene_is_town()) {
+        s_last_ms = 0;
+        return;
+    }
+    if (pc_net_game_host_ready_peer_count() <= 0) {
+        s_last_ms = pcnetgame_now_ms();
+        return;
+    }
+
+    now = pcnetgame_now_ms();
+    if (s_last_ms == 0) {
+        s_last_ms = now;
+        return;
+    }
+    dt = (uint32_t)(now - s_last_ms);
+    s_last_ms = now;
+    if (dt > 250u) dt = 250u;
+
+    n = pc_net_game_wildlife_peer_count();
+    s_accum_ms += (float)dt * (1.0f + 0.4f * (float)(n - 1));
+    if (s_accum_ms < 120000.0f) {
+        return;
+    }
+    s_accum_ms -= 120000.0f;
+
+    count = 0;
+    for (az = 0; az < PCFA_ACRE_Z_NUM; az++) {
+        for (ax = 0; ax < PCFA_ACRE_X_NUM; ax++) {
+            mActor_name_t* items = Save_Get(fg[az][ax]).items[0];
+            for (t = 0; t < UT_TOTAL_NUM; t++) {
+                if (pcnetgame_is_picked_fruit_tree(items[t])) {
+                    count++;
+                }
+            }
+        }
+    }
+    if (count == 0) {
+        return;
+    }
+
+    pick = rand() % count;
+    for (az = 0; az < PCFA_ACRE_Z_NUM; az++) {
+        for (ax = 0; ax < PCFA_ACRE_X_NUM; ax++) {
+            mActor_name_t* items = Save_Get(fg[az][ax]).items[0];
+            for (t = 0; t < UT_TOTAL_NUM; t++) {
+                if (pcnetgame_is_picked_fruit_tree(items[t])) {
+                    if (pick == 0) {
+                        mActor_name_t grown = bg_item_fg_sub_tree_grow(items[t], 0, mCoBG_PLANT4);
+                        if (grown != items[t]) {
+                            int acre = az * PCFA_ACRE_X_NUM + ax;
+                            items[t] = grown;
+                            pcnetgame_host_flush_mask((uint32_t)1u << acre);
+                        }
+                        return;
+                    }
+                    pick--;
+                }
+            }
+        }
+    }
 }
 
 int pc_net_game_wildlife_remote_players(PcWldRemotePlayer* out, int max) {
@@ -53945,3 +54060,4 @@ void pc_net_game_dedicated_chat(const char* cmd, const char* args, void (*out)(c
 #include "pc_net_game_arrtrain.c_inc" /* SYNCED ARRIVAL TRAIN (message 105): the host's arrival timeline, the client's copy, the game-facing API */
 #include "pc_net_game_bedroom.c_inc"   /* MULTI-RESIDENT BEDROOMS (message 106): authoritative bedroom wire sync */
 #include "pc_net_game_roommates.c_inc" /* ROOMMATES / MOVE-IN (message 104): the host relations, the client seam, the console */
+#include "pc_net_game_missions.c_inc"  /* DAILY VILLAGER MISSIONS (message 107): daily seed sync & turn-in */

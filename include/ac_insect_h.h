@@ -10,7 +10,11 @@
 extern "C" {
 #endif
 
+#ifdef TARGET_PC
+#define aINS_ACTOR_NUM 16
+#else
 #define aINS_ACTOR_NUM 9
+#endif
 #define aINS_MAX_STRESS_DIST (3 * mFI_UNIT_BASE_SIZE_F)
 #define aINS_PATIENCE_STEP 0.5f
 

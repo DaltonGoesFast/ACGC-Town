@@ -15,6 +15,7 @@
 #include "pc_version.h" /* the title screen's version corner (pc_version_corner_draw) */
 #include "pc_dedicated.h" /* g_pc_dedicated */
 #include "pc_touch.h"
+#include "pc_missions.h"
 
 #include "m_font.h"
 #include "m_rcp.h"
@@ -43,13 +44,14 @@ typedef enum {
     PAGE_MAIN = 0,
     PAGE_SETTINGS = 1,
     PAGE_CONFIRM_QUIT = 2,
+    PAGE_MISSIONS = 3,
 } PauseMenuPage;
 
-#define MAIN_ITEM_COUNT     3
+#define MAIN_ITEM_COUNT     4
 #define CONFIRM_ITEM_COUNT  2
 
 static PauseMenuPage cur_page = PAGE_MAIN;
-static int main_sel = 0;    /* 0=Resume, 1=Settings, 2=Quit Game */
+static int main_sel = 0;    /* 0=Resume, 1=Daily Missions, 2=Settings, 3=Quit Game */
 static int confirm_sel = 0; /* 0=No (default), 1=Yes */
 
 void pc_pause_menu_toggle(void) {
@@ -71,11 +73,14 @@ static void main_activate(void) {
         case 0: /* Resume */
             pc_pause_menu_toggle();
             break;
-        case 1: /* Settings */
+        case 1: /* Daily Missions */
+            cur_page = PAGE_MISSIONS;
+            break;
+        case 2: /* Settings */
             cur_page = PAGE_SETTINGS;
             pc_settings_menu_enter();
             break;
-        case 2: /* Quit Game -> confirm page (default to No) */
+        case 3: /* Quit Game -> confirm page (default to No) */
             cur_page = PAGE_CONFIRM_QUIT;
             confirm_sel = 0;
             break;
@@ -139,9 +144,10 @@ static void handle_action(MenuAction act) {
             case ACT_CONFIRM:
                 if (cur_page == PAGE_MAIN)              main_activate();
                 else if (cur_page == PAGE_CONFIRM_QUIT) confirm_activate();
+                else if (cur_page == PAGE_MISSIONS)     cur_page = PAGE_MAIN;
                 break;
             case ACT_CANCEL:
-                if (cur_page == PAGE_CONFIRM_QUIT) cur_page = PAGE_MAIN;
+                if (cur_page == PAGE_CONFIRM_QUIT || cur_page == PAGE_MISSIONS) cur_page = PAGE_MAIN;
                 else                               pc_pause_menu_toggle();
                 break;
             default: break;
@@ -211,6 +217,10 @@ int pc_pause_menu_pointer(float font_x, float font_y) {
         if (!pc_settings_menu_active()) cur_page = PAGE_MAIN;
         return 1;
     }
+    if (cur_page == PAGE_MISSIONS) {
+        cur_page = PAGE_MAIN;
+        return 1;
+    }
     if (cur_page == PAGE_CONFIRM_QUIT) {
         if (font_y < 140.0f || font_y > 175.0f) return 0;
         confirm_sel = (font_x < 160.0f) ? 0 : 1;
@@ -245,7 +255,7 @@ int pc_pause_menu_handle_event(const SDL_Event* e) {
 /* Drawing */
 
 static void draw_main_page(struct game_s* game) {
-    static const char* items[MAIN_ITEM_COUNT] = { "Resume", "Settings", "Quit Game" };
+    static const char* items[MAIN_ITEM_COUNT] = { "Resume", "Daily Missions", "Settings", "Quit Game" };
 
     pc_menu_draw_centered(game, "- Paused -", 80.0f, 255, 255, 255, 255, 1.0f);
 
@@ -258,6 +268,31 @@ static void draw_main_page(struct game_s* game) {
         pc_menu_draw_centered(game, items[i], y + i * line_h, r, g, b, a,
                               selected ? PC_MENU_SCALE_SELECTED : 1.0f);
     }
+}
+
+static void draw_missions_page(struct game_s* game) {
+    const PCMissionState* ms = pc_missions_get_state();
+    int i, n = (int)ms->count;
+    pc_menu_draw_centered(game, "- Daily Missions -", 68.0f, 255, 255, 255, 255, 1.0f);
+    if (n > PC_MISSIONS_MAX) n = PC_MISSIONS_MAX;
+    for (i = 0; i < n; i++) {
+        const PCMissionDef* d = &ms->defs[i];
+        int cur = 0, tgt = 1;
+        int ready = pc_missions_get_progress(i, &cur, &tgt);
+        int done = (ms->completed_mask & (1u << i)) != 0;
+        char row[80];
+        if (done) {
+            snprintf(row, sizeof(row), "%s: %s [DONE]", d->villager_name, d->title);
+            pc_menu_draw_centered(game, row, 96.0f + i * 18.0f, 160, 210, 160, 255, 0.9f);
+        } else if (ready) {
+            snprintf(row, sizeof(row), "%s: %s [DELIVER! %uB]", d->villager_name, d->title, (unsigned)d->reward_bells);
+            pc_menu_draw_centered(game, row, 96.0f + i * 18.0f, 120, 255, 140, 255, 0.95f);
+        } else {
+            snprintf(row, sizeof(row), "%s: %s (%d/%d) [%uB]", d->villager_name, d->title, cur, tgt, (unsigned)d->reward_bells);
+            pc_menu_draw_centered(game, row, 96.0f + i * 18.0f, 240, 235, 200, 255, 0.9f);
+        }
+    }
+    pc_menu_draw_centered(game, "Talk to the villager to deliver! [B/ESC: Back]", 200.0f, 190, 190, 190, 255, 0.85f);
 }
 
 static void draw_confirm_page(struct game_s* game) {
@@ -283,6 +318,7 @@ void pc_pause_menu_draw(struct game_s* game) {
     } else {
         pc_menu_dim_rect(game->graph, 180);
         if (cur_page == PAGE_MAIN)              draw_main_page(game);
+        else if (cur_page == PAGE_MISSIONS)     draw_missions_page(game);
         else if (cur_page == PAGE_CONFIRM_QUIT) draw_confirm_page(game);
     }
 

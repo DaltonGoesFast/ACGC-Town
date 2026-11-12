@@ -148,10 +148,18 @@ static void Player_actor_Put_Hole_Dig_scoop(ACTOR* actor) {
              * untouched -- they already ran/will run unconditionally this frame. */
             if (pc_net_game_role() == PC_NETGAME_ROLE_CLIENT) {
                 int ux, uz, hn = mCoBG_GetHoleNumber(*pos);
+                if (item == ITM_FOSSIL) {
+                    extern void pc_missions_note_fossil_dug(void);
+                    pc_missions_note_fossil_dug();
+                }
                 if (hn >= 0 && mFI_Wpos2UtNum(&ux, &uz, *pos)) {
                     pc_net_game_request_dig_hole(ux, uz, (uint8_t)hn);
                 }
                 return;
+            }
+            if (item == ITM_FOSSIL) {
+                extern void pc_missions_note_fossil_dug(void);
+                pc_missions_note_fossil_dug();
             }
 #endif
 

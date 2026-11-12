@@ -1,0 +1,114 @@
+/* pc_net_game_missions.c_inc - Daily Villager Missions wire sync (Phase 4).
+ * Message 107 (PC_NETGAME_MSG_MISSIONS): Daily mission sync, turn-in requests, and ACKs.
+ */
+#ifndef PC_NET_GAME_MISSIONS_C_INC
+#define PC_NET_GAME_MISSIONS_C_INC
+
+#include "pc_missions.h"
+
+static void pcnetgame_missions_peer_key(PCNetPeerId peer, char* out, size_t cap) {
+    if (peer >= 0 && peer < pcnetgame_peer_span() && s_host_peer[peer].ready_identity_valid) {
+        snprintf(out, cap, "pid_%04X", (unsigned)s_host_peer[peer].ready_player_id);
+    } else {
+        snprintf(out, cap, "local_resident");
+    }
+}
+
+void pc_net_game_missions_send_turn_in(int slot, uint16_t npc_id) {
+    const PCMissionState* st = pc_missions_get_state();
+    PCMissionMsg req;
+
+    if (s_role != PC_NETGAME_ROLE_CLIENT) {
+        return;
+    }
+
+    memset(&req, 0, sizeof(req));
+    req.msg_type = (uint8_t)PC_NETGAME_MSG_MISSIONS;
+    req.op = (uint8_t)PC_MISSION_OP_TURN_IN_REQ;
+    req.slot = (uint8_t)slot;
+    req.year = st->year;
+    req.month = st->month;
+    req.day = st->day;
+    req.npc_id = npc_id;
+
+    pc_net_send(0, PC_NET_RELIABLE, &req, sizeof(req));
+}
+
+static void pcnetgame_missions_host_on_ready(PCNetPeerId peer) {
+    lbRTC_time_c* rtc = Common_GetPointer(time.rtc_time);
+    PCMissionMsg sync_msg;
+    char key[32];
+    uint8_t mask = 0;
+
+    if (s_role != PC_NETGAME_ROLE_HOST || rtc == NULL) return;
+    pc_missions_init_or_roll(rtc->year, rtc->month, rtc->day);
+    pcnetgame_missions_peer_key(peer, key, sizeof(key));
+    pc_missions_store_load_mask(NULL, key, rtc->year, rtc->month, rtc->day, &mask);
+    pc_missions_build_sync_msg(&sync_msg, mask);
+    pc_net_send(peer, PC_NET_RELIABLE, &sync_msg, sizeof(sync_msg));
+}
+
+void pc_net_game_missions_host_day_roll(void) {
+    lbRTC_time_c* rtc = Common_GetPointer(time.rtc_time);
+    int p;
+    if (s_role != PC_NETGAME_ROLE_HOST || rtc == NULL) return;
+    pc_missions_init_or_roll(rtc->year, rtc->month, rtc->day);
+    for (p = 0; p < pcnetgame_peer_span(); p++) {
+        if (s_host_peer_link[p] == PC_NETGAME_LINK_READY) {
+            pcnetgame_missions_host_on_ready((PCNetPeerId)p);
+        }
+    }
+}
+
+static void pcnetgame_handle_host_missions(PCNetPeerId peer, const uint8_t* data, uint16_t size) {
+    const PCMissionMsg* req;
+    const PCMissionState* st;
+    PCMissionMsg ack;
+    char key[32];
+    uint8_t mask = 0;
+
+    if (size != sizeof(PCMissionMsg)) return;
+    req = (const PCMissionMsg*)data;
+    if (req->op != PC_MISSION_OP_TURN_IN_REQ) return;
+
+    pc_missions_ensure_local_today();
+    st = pc_missions_get_state();
+
+    memset(&ack, 0, sizeof(ack));
+    ack.msg_type = (uint8_t)PC_NETGAME_MSG_MISSIONS;
+    ack.op = (uint8_t)PC_MISSION_OP_TURN_IN_ACK;
+    ack.slot = req->slot;
+    ack.year = st->year;
+    ack.month = st->month;
+    ack.day = st->day;
+    ack.count = st->count;
+
+    if (req->slot < st->count &&
+        req->year == st->year && req->month == st->month && req->day == st->day &&
+        st->defs[req->slot].villager_npc_id == req->npc_id) {
+        pcnetgame_missions_peer_key(peer, key, sizeof(key));
+        pc_missions_store_load_mask(NULL, key, st->year, st->month, st->day, &mask);
+        if ((mask & (1u << req->slot)) == 0) {
+            mask |= (uint8_t)(1u << req->slot);
+            pc_missions_store_save_mask(NULL, key, st->year, st->month, st->day, mask);
+            ack.ok = 1;
+            ack.completed_mask = mask;
+            printf("[NET][MISSIONS] Host approved mission slot %u turn-in for %s\n",
+                   (unsigned)req->slot, key);
+        } else {
+            ack.ok = 0;
+            ack.completed_mask = mask;
+        }
+    }
+
+    pc_net_send(peer, PC_NET_RELIABLE, &ack, sizeof(ack));
+}
+
+static void pcnetgame_handle_client_missions(const uint8_t* data, uint16_t size) {
+    const PCMissionMsg* msg;
+    if (size != sizeof(PCMissionMsg)) return;
+    msg = (const PCMissionMsg*)data;
+    pc_missions_apply_sync_msg(msg);
+}
+
+#endif /* PC_NET_GAME_MISSIONS_C_INC */

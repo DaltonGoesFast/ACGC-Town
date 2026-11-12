@@ -63,10 +63,15 @@ void pcwld_reset(void);
  * calls out for a later stage's catch-request validation. entity_id 0 always returns 0. */
 int pcwld_find_by_id(uint32_t entity_id, PcWildlifeRecord* out);
 
-/* 1 iff at least one record of `kind` currently exists in acre (bx, bz). This is what the host
- * spawn adapter's clip shims (pcwld_host_spawn_trigger()'s internal chk_live_* replacements) use in
- * place of the vanilla local-pool "already alive in this acre" scan. */
+/* 1 iff at least one record of `kind` currently exists in acre (bx, bz). */
 int pcwld_acre_has_kind(int bx, int bz, int kind);
+
+/* Number of currently-live records of `kind` in acre (bx, bz). */
+int pcwld_acre_count_kind(int bx, int bz, int kind);
+
+/* HOST-ONLY: dynamic per-acre cap per kind based on online peer count N:
+ * Target = Base * (1 + 0.4 * (N - 1)) with Base = 1, clamped to [1, 4]. */
+int pcwld_host_scaled_acre_cap(void);
 
 /* Number of currently-live records in acre (bx, bz), any kind. Test/diagnostic helper. */
 int pcwld_count_in_acre(int bx, int bz);
