@@ -21,6 +21,7 @@ struct npc_sendo_s {
   u8 agb_trans_se;
   aSEN_PROC action_proc;
   int talk_action;
+  u8 talk_step;
   aSEN_PROC talk_proc;
   u16 kappa_counter;
   f32 anime_progress; // only loaded, never set?

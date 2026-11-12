@@ -42,11 +42,7 @@ PCSettings g_pc_settings = {
     .touch_virtual_pad = 0,
     .nes_aspect = 1,
     .master_volume = 100,
-#ifdef __ANDROID__
-    .audio = 0,
-#else
     .audio = 1,
-#endif
     .stick_deadzone = 12,
     .cstick_deadzone = 12,
     .max_guests = 4,
@@ -169,13 +165,9 @@ static const char* DEFAULT_SETTINGS =
     "# Master output volume as a percentage (0-100)\n"
     "master_volume = 100\n"
     "\n"
-#ifdef __ANDROID__
-    "# 1 = open the audio device and run the audio thread, 0 = silent. Android starts at 0.\n"
-    "audio = 0\n"
-#else
     "# 1 = open the audio device and run the audio thread (default), 0 = silent\n"
     "audio = 1\n"
-#endif
+    "audio_migrated = 1\n"
     "\n"
     "\n"
     "[Input]\n"
@@ -244,6 +236,8 @@ static void trim_end(char* s) {
         s[--len] = '\0';
     }
 }
+
+static int s_audio_migrated_seen = 0;
 
 static void apply_setting(const char* key, const char* value) {
     int val = atoi(value);
@@ -321,6 +315,8 @@ static void apply_setting(const char* key, const char* value) {
         if (val >= 0 && val <= 100) g_pc_settings.master_volume = val;
     } else if (strcmp(key, "audio") == 0) {
         if (val == 0 || val == 1) g_pc_settings.audio = val;
+    } else if (strcmp(key, "audio_migrated") == 0) {
+        if (val == 0 || val == 1) s_audio_migrated_seen = val;
     } else if (strcmp(key, "stick_deadzone") == 0) {
         if (val >= 0 && val <= 40) g_pc_settings.stick_deadzone = val;
     } else if (strcmp(key, "cstick_deadzone") == 0) {
@@ -494,6 +490,7 @@ void pc_settings_save(void) {
     fprintf(f, "\n");
     fprintf(f, "# 1 = open the audio device and run the audio thread, 0 = silent\n");
     fprintf(f, "audio = %d\n", g_pc_settings.audio);
+    fprintf(f, "audio_migrated = 1\n");
     fprintf(f, "\n");
     fprintf(f, "[Input]\n");
     fprintf(f, "# Gamepad stick deadzones as a percentage (0-40)\n");
@@ -701,6 +698,7 @@ void pc_settings_apply(void) {
 }
 
 void pc_settings_load(void) {
+    s_audio_migrated_seen = 0;
     FILE* f = fopen(SETTINGS_FILE, "r");
     if (!f) {
         write_defaults(SETTINGS_FILE);
@@ -730,6 +728,11 @@ void pc_settings_load(void) {
         }
     }
     fclose(f);
+    if (!s_audio_migrated_seen && g_pc_settings.audio == 0) {
+        printf("[Settings] Migrating legacy audio=0 default to audio=1\n");
+        g_pc_settings.audio = 1;
+        pc_settings_save();
+    }
     apply_frame_limit_setting();
     apply_borderless_acres_setting();
 

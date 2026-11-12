@@ -20,52 +20,42 @@ sys.path.insert(0, HERE)
 import net_spike_lib as L  # noqa: E402
 
 REPO = os.path.abspath(os.path.join(HERE, "..", "..", ".."))
-ISO = os.path.join(REPO, "pc", "build64", "bin", "rom", "Animal Crossing.iso")
-
-
 def rd(*p):
     return open(os.path.join(REPO, *p), encoding="utf-8", errors="replace").read().replace("\r\n", "\n")
 
 
 def real_messages():
     """decodes forest_2nd.arc message data from the disc image; None when it is not available"""
-    if not os.path.isfile(ISO):
-        return None
     try:
-        sys.path.insert(0, os.path.join(REPO, "tools"))
+        sys.path.insert(0, os.path.join(REPO, "pc", "tools"))
+        from test_all_interactions import DiscReader, extract_archive_from_disc, find_default_rom
         import pyjkernel
         import msg_tool as M
     except Exception:  # noqa: BLE001
         return None
-    f = open(ISO, "rb")
-    f.seek(0x424)
-    fst_off, fst_sz = struct.unpack(">II", f.read(8))
-    f.seek(fst_off)
-    d = f.read(fst_sz)
-    n = struct.unpack(">I", d[8:12])[0]
-    names = d[n * 12:]
-    arc = None
-    for i in range(1, n):
-        if d[i * 12] == 0:
-            no = struct.unpack(">I", b"\0" + d[i * 12 + 1:i * 12 + 4])[0]
-            if names[no:names.index(b"\0", no)] == b"forest_2nd.arc":
-                a, b = struct.unpack(">II", d[i * 12 + 4:i * 12 + 12])
-                f.seek(a)
-                arc = f.read(b)
-    if arc is None:
+    rom_path = find_default_rom()
+    if not rom_path or not os.path.isfile(rom_path):
         return None
-    import tempfile
-    tmp = os.path.join(tempfile.mkdtemp(prefix="rover_arc "), "forest_2nd.arc")
-    open(tmp, "wb").write(arc)
-    a = pyjkernel.from_archive_file(tmp, True)
-    data = bytearray(a.get_file("bin2/data/message_data.bin").data)
-    tab = a.get_file("bin2/data/message_data_table.bin").data
+    try:
+        dr = DiscReader(rom_path)
+        arc = extract_archive_from_disc(dr, "forest_2nd.arc")
+        dr.close()
+        if arc is None:
+            return None
+        import tempfile
+        tmp = os.path.join(tempfile.mkdtemp(prefix="rover_arc "), "forest_2nd.arc")
+        open(tmp, "wb").write(arc)
+        a = pyjkernel.from_archive_file(tmp, True)
+        data = bytearray(a.get_file("bin2/data/message_data.bin").data)
+        tab = a.get_file("bin2/data/message_data_table.bin").data
 
-    def msg(i):
-        s = 0 if i == 0 else struct.unpack(">I", tab[(i - 1) * 4:i * 4])[0]
-        e = struct.unpack(">I", tab[i * 4:i * 4 + 4])[0]
-        return M.decode_entry(data, s, e, i)
-    return msg
+        def msg(i):
+            s = 0 if i == 0 else struct.unpack(">I", tab[(i - 1) * 4:i * 4])[0]
+            e = struct.unpack(">I", tab[i * 4:i * 4 + 4])[0]
+            return M.decode_entry(data, s, e, i)
+        return msg
+    except Exception:
+        return None
 
 
 def main():

@@ -79,10 +79,10 @@ static void aSEN_set_request_act(NPC_SENDO_ACTOR* sendo) {
 }
 
 static void aSEN_pl_ride_on_end_wait(NPC_SENDO_ACTOR* sendo, GAME_PLAY* play) {
-    BOAT_DEMO_ACTOR* boat_demo = boat_demo = (BOAT_DEMO_ACTOR*)sendo->npc_class.actor_class.parent_actor;
+    BOAT_DEMO_ACTOR* boat_demo = (BOAT_DEMO_ACTOR*)sendo->npc_class.actor_class.parent_actor;
     u8 act;
 
-    if (boat_demo->action == aBTD_ACTION_START_CALL_END_WAIT) {
+    if (boat_demo != NULL && boat_demo->action == aBTD_ACTION_START_CALL_END_WAIT) {
         if (boat_demo->at_island == FALSE) {
             mISL_ClearNowPlayerAction();
 
@@ -100,10 +100,10 @@ static void aSEN_pl_ride_on_end_wait(NPC_SENDO_ACTOR* sendo, GAME_PLAY* play) {
 }
 
 static void aSEN_sing_start_wait(NPC_SENDO_ACTOR* sendo, GAME_PLAY* play) {
-    BOAT_DEMO_ACTOR* boat_demo = boat_demo = (BOAT_DEMO_ACTOR*)sendo->npc_class.actor_class.parent_actor;
+    BOAT_DEMO_ACTOR* boat_demo = (BOAT_DEMO_ACTOR*)sendo->npc_class.actor_class.parent_actor;
     u8 act;
 
-    if (boat_demo->action == aBTD_ACTION_SING_SENDO_MSG_SET_WAIT) {
+    if (boat_demo != NULL && boat_demo->action == aBTD_ACTION_SING_SENDO_MSG_SET_WAIT) {
         if (boat_demo->at_island == FALSE) {
             act = 8;
         } else {
@@ -115,18 +115,18 @@ static void aSEN_sing_start_wait(NPC_SENDO_ACTOR* sendo, GAME_PLAY* play) {
 }
 
 static void aSEN_touch_wharf_start_wait(NPC_SENDO_ACTOR* sendo, GAME_PLAY* play) {
-    BOAT_DEMO_ACTOR* boat_demo = boat_demo = (BOAT_DEMO_ACTOR*)sendo->npc_class.actor_class.parent_actor;
+    BOAT_DEMO_ACTOR* boat_demo = (BOAT_DEMO_ACTOR*)sendo->npc_class.actor_class.parent_actor;
 
-    if (boat_demo->action == aBTD_ACTION_TOUCH_WHARF_END_WAIT) {
+    if (boat_demo != NULL && boat_demo->action == aBTD_ACTION_TOUCH_WHARF_END_WAIT) {
         aSEN_setup_think_proc(sendo, play, 11);
     }
 }
 
 static void aSEN_touch_wharf_end_wait(NPC_SENDO_ACTOR* sendo, GAME_PLAY* play) {
-    BOAT_DEMO_ACTOR* boat_demo = boat_demo = (BOAT_DEMO_ACTOR*)sendo->npc_class.actor_class.parent_actor;
+    BOAT_DEMO_ACTOR* boat_demo = (BOAT_DEMO_ACTOR*)sendo->npc_class.actor_class.parent_actor;
     u8 act;
 
-    if (boat_demo->action == aBTD_ACTION_PL_RIDE_OFF_START_WAIT) {
+    if (boat_demo != NULL && boat_demo->action == aBTD_ACTION_PL_RIDE_OFF_START_WAIT) {
         if (boat_demo->at_island == FALSE) {
             act = 12;
         } else {
@@ -145,10 +145,10 @@ static void aSEN_pl_ride_off_end_wait(NPC_SENDO_ACTOR* sendo, GAME_PLAY* play) {
 
     static u32 sex_pact[] = { mISL_PLAYER_ACTION_SEX_MALE, mISL_PLAYER_ACTION_SEX_FEMALE };
 
-    BOAT_DEMO_ACTOR* boat_demo = boat_demo = (BOAT_DEMO_ACTOR*)sendo->npc_class.actor_class.parent_actor;
+    BOAT_DEMO_ACTOR* boat_demo = (BOAT_DEMO_ACTOR*)sendo->npc_class.actor_class.parent_actor;
     u8 act;
 
-    if (boat_demo->action == aBTD_ACTION_ANCHOR_WAIT) {
+    if (boat_demo != NULL && boat_demo->action == aBTD_ACTION_ANCHOR_WAIT) {
         if (boat_demo->at_island == FALSE) {
             u32 destiny = Common_Get(now_private)->destiny.type;
             u32 sex = Common_Get(now_private)->gender;
@@ -182,21 +182,23 @@ static void aSEN_think_main_proc(NPC_ACTOR* actorx, GAME_PLAY* play) {
 
 static void aSEN_think_init_proc(NPC_ACTOR* actorx, GAME_PLAY* play) {
     NPC_SENDO_ACTOR* sendo = (NPC_SENDO_ACTOR*)actorx;
-    BOAT_DEMO_ACTOR* boat_demo = boat_demo = (BOAT_DEMO_ACTOR*)sendo->npc_class.actor_class.parent_actor;
+    BOAT_DEMO_ACTOR* boat_demo = (BOAT_DEMO_ACTOR*)sendo->npc_class.actor_class.parent_actor;
     u8 act;
 
     actorx->think.interrupt_flags = 0;
     actorx->action.act_proc = (aNPC_ACTION_PROC)&none_proc1;
 
     aSEN_set_request_act(sendo);
-    if (boat_demo->at_island == FALSE) {
+    if (boat_demo != NULL && boat_demo->at_island == FALSE) {
         if (mEnv_NowWeather() == mEnv_WEATHER_RAIN) {
             act = 1;
         } else {
             act = 0;
         }
-    } else {
+    } else if (boat_demo != NULL) {
         act = 2;
+    } else {
+        act = 0;
     }
 
     aSEN_setup_think_proc(sendo, play, act);
@@ -211,9 +213,11 @@ static void aSEN_talk_start_wait_init(NPC_SENDO_ACTOR* sendo, GAME_PLAY* play) {
 }
 
 static void aSEN_pl_ride_on_end_wait_init(NPC_SENDO_ACTOR* sendo, GAME_PLAY* play) {
-    BOAT_DEMO_ACTOR* boat_demo = boat_demo = (BOAT_DEMO_ACTOR*)sendo->npc_class.actor_class.parent_actor;
+    BOAT_DEMO_ACTOR* boat_demo = (BOAT_DEMO_ACTOR*)sendo->npc_class.actor_class.parent_actor;
 
-    boat_demo->demo_act = aBTD_DEMO_PL_RIDE_ON_END;
+    if (boat_demo != NULL) {
+        boat_demo->demo_act = aBTD_DEMO_PL_RIDE_ON_END;
+    }
 }
 
 static void aSEN_start_call_v_init(NPC_SENDO_ACTOR* sendo, GAME_PLAY* play) {
@@ -226,9 +230,11 @@ static void aSEN_start_call_v_init(NPC_SENDO_ACTOR* sendo, GAME_PLAY* play) {
 }
 
 static void aSEN_sing_start_wait_init(NPC_SENDO_ACTOR* sendo, GAME_PLAY* play) {
-    BOAT_DEMO_ACTOR* boat_demo = boat_demo = (BOAT_DEMO_ACTOR*)sendo->npc_class.actor_class.parent_actor;
+    BOAT_DEMO_ACTOR* boat_demo = (BOAT_DEMO_ACTOR*)sendo->npc_class.actor_class.parent_actor;
 
-    boat_demo->demo_act = aBTD_DEMO_MOVE_BOAT_END;
+    if (boat_demo != NULL) {
+        boat_demo->demo_act = aBTD_DEMO_MOVE_BOAT_END;
+    }
     sendo->npc_class.talk_info.default_animation = 123;
     sendo->npc_class.draw.anim_speed_type = aNPC_ANIM_SPEED_TYPE_FREE;
 }
@@ -246,9 +252,11 @@ static void aSEN_arrive_call_init(NPC_SENDO_ACTOR* sendo, GAME_PLAY* play) {
 }
 
 static void aSEN_pl_ride_off_end_wait_init(NPC_SENDO_ACTOR* sendo, GAME_PLAY* play) {
-    BOAT_DEMO_ACTOR* boat_demo = boat_demo = (BOAT_DEMO_ACTOR*)sendo->npc_class.actor_class.parent_actor;
+    BOAT_DEMO_ACTOR* boat_demo = (BOAT_DEMO_ACTOR*)sendo->npc_class.actor_class.parent_actor;
 
-    boat_demo->demo_act = aBTD_DEMO_PL_RIDE_OFF_END;
+    if (boat_demo != NULL) {
+        boat_demo->demo_act = aBTD_DEMO_PL_RIDE_OFF_END;
+    }
 }
 
 static void aSEN_out_of_service_init(NPC_SENDO_ACTOR* sendo, GAME_PLAY* play) {
@@ -350,9 +358,10 @@ static int aSEN_get_msg_no(NPC_SENDO_ACTOR* sendo, int msg_no) {
 
     if (msg_no == 0x3091 || msg_no == 0x3096) {
         BOAT_DEMO_ACTOR* boat_demo = (BOAT_DEMO_ACTOR*)sendo->npc_class.actor_class.parent_actor;
+        int at_island = (boat_demo != NULL) ? boat_demo->at_island : 0;
 
-        msg_base = msg_base_no[boat_demo->at_island][Common_Get(now_private)->gender];
-        msg = boat_demo->sing_msg_no;
+        msg_base = msg_base_no[at_island][Common_Get(now_private)->gender];
+        msg = (boat_demo != NULL) ? boat_demo->sing_msg_no : msg_base;
         msg_index = msg - msg_base;
 
         if (msg_index < 0 || msg_index >= 5) {
@@ -438,7 +447,7 @@ static void aSEN_change_talk_proc(NPC_SENDO_ACTOR*, u8);
 static void aSEN_sing_end_wait_talk_proc(NPC_SENDO_ACTOR* sendo, GAME_PLAY* play) {
     BOAT_DEMO_ACTOR* boat_demo = (BOAT_DEMO_ACTOR*)sendo->npc_class.actor_class.parent_actor;
 
-    if (boat_demo->action == aBTD_ACTION_TOUCH_WHARF_END_WAIT && sendo->npc_class.draw.animation_id != 124) {
+    if (boat_demo != NULL && boat_demo->action == aBTD_ACTION_TOUCH_WHARF_END_WAIT && sendo->npc_class.draw.animation_id != 124) {
         sendo->next_action = 11;
         (*Common_Get(clip).npc_clip->animation_init_proc)((ACTOR*)sendo, 124, FALSE);
     }
@@ -450,13 +459,20 @@ static void aSEN_pl_ride_on_check_talk_proc(NPC_SENDO_ACTOR* sendo, GAME_PLAY* p
     if (mMsg_Check_MainNormalContinue(msg_p) == TRUE) {
         switch (mChoice_Get_ChoseNum(mChoice_Get_base_window_p())) {
             case mChoice_CHOICE0:
-                /* Player chose not to ride */
+                /* Player chose to ride */
                 mDemo_Set_OrderValue(mDemo_ORDER_NPC0, 9, 0);
+#ifdef TARGET_PC
+                sendo->use_island_data_in_ram = TRUE;
+                mDemo_Set_OrderValue(mDemo_ORDER_NPC0, 9, 1);
+                aSEN_change_talk_proc(sendo, aSEN_TALK_CHK_EXIST_ISLAND_DATA_IN_RAM);
+                break;
+#else
                 mMsg_Set_LockContinue(msg_p);
                 mGcgba_InitVar();
                 sendo->gba_comm_tries = 0;
                 aSEN_change_talk_proc(sendo, aSEN_TALK_CHK_POWER_AGB);
                 break;
+#endif
             case mChoice_CHOICE1:
                 /* Player chose to ride */
                 mDemo_Set_OrderValue(mDemo_ORDER_NPC0, 9, 0);
@@ -516,7 +532,12 @@ static void aSEN_get_island_name_menu_start_wait_talk_proc(NPC_SENDO_ACTOR* send
 }
 
 static void aSEN_get_island_name_menu_end_wait_talk_proc(NPC_SENDO_ACTOR* sendo, GAME_PLAY* play) {
-    if (play->submenu.open_flag == FALSE) {
+    static int s_menu_opened = FALSE;
+
+    if (play->submenu.open_flag == TRUE) {
+        s_menu_opened = TRUE;
+    } else if (s_menu_opened == TRUE && play->submenu.open_flag == FALSE) {
+        s_menu_opened = FALSE;
         mISL_KeepIsland(Save_GetPointer(island));
         mMsg_request_main_appear_wait_type1(mMsg_Get_base_window_p());
         aSEN_change_talk_proc(sendo, aSEN_TALK_MSG_WIN_OPEN_WAIT);
@@ -640,7 +661,7 @@ static void aSEN_trans_data_for_agb_start_wait_talk_proc(NPC_SENDO_ACTOR* sendo,
         mDemo_Set_OrderValue(mDemo_ORDER_NPC0, 9, 0);
         mMsg_Set_LockContinue(mMsg_Get_base_window_p());
 
-        if (sendo->talk_action == aSEN_TALK_TRANS_DATA_FOR_AGB_START_WAIT) {
+        if (sendo->talk_step == aSEN_TALK_TRANS_DATA_FOR_AGB_START_WAIT) {
             aSEN_set_island_info_for_agb(Common_GetPointer(transfer_island), Save_GetPointer(island));
             talk_act = aSEN_TALK_TRANS_DATA_FOR_AGB_END_WAIT;
         } else {
@@ -1177,8 +1198,10 @@ static void aSEN_change_talk_proc(NPC_SENDO_ACTOR* sendo, u8 talk_idx) {
         aSEN_chk_read_agb3_talk_proc,
     };
 
-    sendo->talk_action = talk_idx;
-    sendo->talk_proc = talk_proc[talk_idx];
+    if (talk_idx < aSEN_TALK_NUM) {
+        sendo->talk_step = talk_idx;
+        sendo->talk_proc = talk_proc[talk_idx];
+    }
 }
 
 static void aSEN_set_force_talk_info(ACTOR* actorx) {
@@ -1193,7 +1216,11 @@ static void aSEN_set_force_talk_info(ACTOR* actorx) {
     };
 
     NPC_SENDO_ACTOR* sendo = (NPC_SENDO_ACTOR*)actorx;
-    aSEN_talk_request_c* talk_request = &dt_tbl[sendo->talk_action];
+    int act = sendo->talk_action;
+    if (act < 0 || act >= (int)ARRAY_COUNT(dt_tbl)) {
+        act = 0;
+    }
+    aSEN_talk_request_c* talk_request = &dt_tbl[act];
 
     mDemo_Set_msg_num(aSEN_get_msg_no(sendo, talk_request->msg_no));
     mDemo_Set_talk_turn(talk_request->player_talk_turn);
@@ -1231,7 +1258,11 @@ static void aSEN_set_norm_talk_info(ACTOR* actorx) {
         sendo->npc_class.talk_info.turn = 0;
         aSEN_change_talk_proc(sendo, aSEN_TALK_END_WAIT);
     } else {
-        aSEN_talk_request_c* talk_request = &dt_tbl[sendo->talk_action];
+        int act = sendo->talk_action;
+        if (act < 0 || act >= (int)ARRAY_COUNT(dt_tbl)) {
+            act = 0;
+        }
+        aSEN_talk_request_c* talk_request = &dt_tbl[act];
 
         mDemo_Set_msg_num(aSEN_get_msg_no(sendo, talk_request->msg_no));
         mDemo_Set_talk_turn(talk_request->player_talk_turn);
