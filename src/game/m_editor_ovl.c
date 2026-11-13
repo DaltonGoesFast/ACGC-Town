@@ -54,6 +54,9 @@ static u8 mED_ornament_table[] = {
 };
 
 static void mED_open_warning_window(Submenu* submenu, mSM_MenuInfo_c* menu_info, int warning) {
+#if defined(TARGET_PC) && defined(KEYBOARD_TYPING)
+    { extern int g_pc_editor_active; g_pc_editor_active = 0; }
+#endif
     mWR_SHOW_WARNING(submenu, warning);
     menu_info->proc_status = mSM_OVL_PROC_WAIT;
     menu_info->next_proc_status = mSM_OVL_PROC_WAIT;
@@ -1838,6 +1841,8 @@ static void mED_move_Play(Submenu* submenu, mSM_MenuInfo_c* menu_info) {
                         editor_ovl->now_code = CHAR_NEW_LINE;
                         editor_ovl->command = mED_COMMAND_OUTPUT_CODE;
                     }
+                } else if (typed == 262) {
+                    editor_ovl->command = mED_COMMAND_END_EDIT;
                 } else {
                     editor_ovl->now_code = (u8)typed;
                     editor_ovl->command = mED_COMMAND_OUTPUT_CODE;
@@ -1876,6 +1881,9 @@ static void mED_move_Play(Submenu* submenu, mSM_MenuInfo_c* menu_info) {
 }
 
 static void mED_move_Wait(Submenu* submenu, mSM_MenuInfo_c* menu_info) {
+#if defined(TARGET_PC) && defined(KEYBOARD_TYPING)
+    { extern int g_pc_editor_active; g_pc_editor_active = 0; }
+#endif
     if (submenu->menu_type != menu_info->next_menu_type) {
         menu_info->proc_status = mSM_OVL_PROC_PLAY;
     }

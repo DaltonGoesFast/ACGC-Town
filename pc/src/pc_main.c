@@ -444,16 +444,28 @@ void pc_platform_shutdown(void) {
 int g_pc_content_x = 0, g_pc_content_y = 0, g_pc_content_w = PC_SCREEN_WIDTH, g_pc_content_h = PC_SCREEN_HEIGHT;
 int g_pc_layout_portrait = 0;
 
-static void pc_layout_insets(int* l, int* t, int* r, int* b) {
-    FILE* f = fopen("safe_insets.txt", "r");
-    *l = *t = *r = *b = 0;
-    if (f == NULL) return;
-    if (fscanf(f, "%d %d %d %d", l, t, r, b) != 4) *l = *t = *r = *b = 0;
-    fclose(f);
-    if (*l < 0) *l = 0;
-    if (*t < 0) *t = 0;
-    if (*r < 0) *r = 0;
-    if (*b < 0) *b = 0;
+void pc_layout_insets(int* l, int* t, int* r, int* b) {
+    static int s_cached = 0, s_l = 0, s_t = 0, s_r = 0, s_b = 0;
+    static Uint32 s_last_ms = 0;
+    Uint32 now = SDL_GetTicks();
+    if (!s_cached || now - s_last_ms > 1000u) {
+        FILE* f = fopen("safe_insets.txt", "r");
+        s_last_ms = now;
+        s_cached = 1;
+        s_l = s_t = s_r = s_b = 0;
+        if (f != NULL) {
+            if (fscanf(f, "%d %d %d %d", &s_l, &s_t, &s_r, &s_b) != 4) s_l = s_t = s_r = s_b = 0;
+            fclose(f);
+            if (s_l < 0) s_l = 0;
+            if (s_t < 0) s_t = 0;
+            if (s_r < 0) s_r = 0;
+            if (s_b < 0) s_b = 0;
+        }
+    }
+    *l = s_l;
+    *t = s_t;
+    *r = s_r;
+    *b = s_b;
 }
 
 void pc_layout_refresh(void) {

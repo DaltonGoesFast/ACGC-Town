@@ -35,6 +35,13 @@ extern void pc_creator_menu_pointer(float fx, float fy);
 #include "m_hand_ovl.h"
 #include "m_mail.h"
 #include "m_inventory_ovl.h"
+#include "m_editEndChk_ovl.h"
+#include "m_address_ovl.h"
+#include "m_map_ovl.h"
+#include "m_repay_ovl.h"
+#include "m_bank_ovl.h"
+#include "m_timeIn_ovl.h"
+#include "m_birthday_ovl.h"
 #include "m_item_name.h"
 #include "m_font.h"
 #include "dataobject.h"
@@ -42,6 +49,8 @@ extern void pc_creator_menu_pointer(float fx, float fy);
 #include "audio_defs.h"
 #include "m_collision_bg.h"
 #include <dolphin/pad.h>
+
+extern void pc_layout_insets(int* l, int* t, int* r, int* b);
 
 #include <math.h>
 #include <stdio.h>
@@ -58,12 +67,15 @@ extern void pc_creator_menu_pointer(float fx, float fy);
 
 enum { HIT_NONE = 0, HIT_PICTURE, HIT_STICK, HIT_NUB, HIT_ACTION, HIT_BACK, HIT_MENU, HIT_KEY, HIT_BAG, HIT_MAP, HIT_CLOSE, HIT_CONTEXT, HIT_CHOICE, HIT_SUB_TAB,
        HIT_SHEET_CLOSE, HIT_SHEET_BELLS, HIT_SHEET_TAB, HIT_SHEET_CARD, HIT_SHEET_ACT, HIT_SHEET_BODY, HIT_CAM,
-       HIT_STORAGE, HIT_STOR_PREV, HIT_STOR_NEXT };
+       HIT_STORAGE, HIT_STOR_PREV, HIT_STOR_NEXT,
+       HIT_TOOL, HIT_EMOTE, HIT_CHAT,
+       HIT_DPAD_UP, HIT_DPAD_DOWN, HIT_DPAD_LEFT, HIT_DPAD_RIGHT, HIT_TRIG_L, HIT_TRIG_R };
 
 typedef struct {
     int active;            /* 1 if drawer is visible */
     int current_tab;       /* 0: Pockets, 1: Letters, 2: Fish, 3: Bugs, 4: Missions */
     int sel_slot;          /* -1 = none, 0..14 = pocket slot */
+    int sel_mail;          /* -1 = none, 0..9 = mail slot */
     int swap_mode;         /* 1 if waiting for second slot to swap */
     int swap_source;       /* source slot index */
 
@@ -91,7 +103,7 @@ typedef struct {
 } MobileSheet;
 
 static MobileSheet s_sheet;
-static int s_pending_drop = 0;
+static int s_pending_row = -1;
 
 static void mobile_sheet_layout(void);
 static int mobile_sheet_hit(float x, float y, int* key);
@@ -101,23 +113,16 @@ static void mobile_sheet_handle_tab(int tab_id);
 static void mobile_sheet_handle_bells(void);
 static void mobile_sheet_draw(void);
 
-static int s_pointer_was = 0;
-static float s_down_x = 0.0f, s_down_y = 0.0f, s_last_x = 0.0f, s_last_y = 0.0f;
-static int s_down_hit = HIT_NONE;
 static int s_pulse_a = 0;
 static int s_pulse_b = 0;
 static int s_have_target = 0;
 static int s_interact = 0;
 static float s_target_x = 0.0f, s_target_z = 0.0f;
-static float s_knob_x = 0.0f, s_knob_y = 0.0f;
 static int s_title_valid = 0;
 static int s_title_life = 0;
 static float s_title_y = 0.0f;
 static unsigned s_latch = 0;
 static int s_latch_frames = 0;
-static int s_gest = 0;
-static int s_tap_ready = 0;
-static float s_gest_x = 0, s_gest_y = 0, s_tap_x = 0, s_tap_y = 0;
 static int s_hud = HUD_OFF;
 static int s_logged = 0;
 static int s_overlay_logged = 0;
@@ -126,7 +131,6 @@ static float s_mark_x = 0, s_mark_y = 0, s_mark_t = 0;
 static float s_best_dist = -1;
 static int s_stall = 0;
 static int s_slide = 0;
-static int s_lay_w = 0, s_lay_h = 0;
 static SDL_Haptic* s_haptic = NULL;
 static int s_haptic_tried = 0;
 static int s_running = 0;
@@ -134,7 +138,6 @@ static int s_drag_logged = 0;
 static int s_tap_logged = 0;
 static Uint32 s_last_tap_ms = 0;
 static int s_swipe = 0;
-static int s_choice_confirm = 0;
 static char s_tap_kind[32] = "-";
 static int s_drag_active = 0;
 static float s_drag_ox = 0.0f, s_drag_oy = 0.0f;
@@ -151,18 +154,38 @@ static int s_cam_pulse_x = 0, s_cam_pulse_y = 0;
 static int s_cam_pulse_timer = 0;
 static int s_cam_cooldown = 0;
 
-enum { FINGERS = 4 };
-typedef struct { SDL_FingerID id; float x, y; int down; } Finger;
+enum { FINGERS = 6 };
+typedef struct {
+    SDL_FingerID id;
+    float x, y;
+    float ox, oy;
+    Uint32 t0;
+    int down;
+    int just_down;
+    int just_up;
+    int moved;
+    int hit;
+    int key;
+} Finger;
 static Finger s_fin[FINGERS];
+static int s_mouse_was_down = 0;
+static int s_kb_mode = 0; /* 0: abc, 1: ABC, 2: 123/sym */
+static int s_drag_slot = -1;
+static int s_stick_slot = -1;
+static float s_stick_kx = 0.0f, s_stick_ky = 0.0f;
 
 typedef struct {
     int show_stick, show_nub, show_action, show_back, show_menu, show_keys, show_quick, show_cam;
     int show_close, show_context, choice_n;
     int show_sub_tabs, sub_tab_n;
+    int show_tool, show_emote, show_chat;
+    int show_dpad, show_trigs;
     float sx, sy, sr, nx, ny, nr, ax, ay, ar, bx, by, br, mx, my, mr;
     float bag_x, bag_y, map_x, map_y, cam_x, cam_y, cam_r, qr;
+    float tool_x, tool_y, tool_r, emote_x, emote_y, emote_r, chat_x, chat_y, chat_r;
+    float dpad_cx, dpad_cy, dpad_r, trig_lx, trig_ly, trig_rx, trig_ry, trig_r;
     float close_x, close_y, close_r, ctx_x, ctx_y, ctx_r;
-    float choice_x, choice_r, choice_y[6];
+    float choice_x, choice_r, choice_w, choice_y[6];
     int show_storage;
     float storage_x, storage_y;
     int show_stor_pages;
@@ -170,8 +193,8 @@ typedef struct {
     float sub_tab_x[4], sub_tab_y[4], sub_tab_r;
     int sub_tab_id[4];
     int key_n;
-    float kx[40], ky[40], kr;
-    char kc[40];
+    float kx[48], ky[48], kw[48], kh[48], kr;
+    char kc[48];
 } Hud;
 
 int pc_touch_enabled(void) {
@@ -207,22 +230,39 @@ int pc_touch_take_title_tap(float* font_y) {
     return 1;
 }
 
-static void finger_set(SDL_FingerID id, float x, float y, int down) {
+static void finger_set(SDL_FingerID id, float x, float y, int type) {
     int i, free_slot = -1;
     for (i = 0; i < FINGERS; i++) {
-        if (s_fin[i].down && s_fin[i].id == id) {
+        if ((s_fin[i].down || s_fin[i].just_down || s_fin[i].just_up) && s_fin[i].id == id) {
             s_fin[i].x = x;
             s_fin[i].y = y;
-            s_fin[i].down = down;
+            if (type == SDL_FINGERDOWN) {
+                s_fin[i].ox = x;
+                s_fin[i].oy = y;
+                s_fin[i].t0 = SDL_GetTicks();
+                s_fin[i].down = 1;
+                s_fin[i].just_down = 1;
+                s_fin[i].just_up = 0;
+                s_fin[i].moved = 0;
+            } else if (type == SDL_FINGERUP) {
+                s_fin[i].down = 0;
+                s_fin[i].just_up = 1;
+            }
             return;
         }
-        if (!s_fin[i].down && free_slot < 0) free_slot = i;
+        if (!s_fin[i].down && !s_fin[i].just_down && !s_fin[i].just_up && free_slot < 0) free_slot = i;
     }
-    if (down && free_slot >= 0) {
+    if (type == SDL_FINGERDOWN && free_slot >= 0) {
+        memset(&s_fin[free_slot], 0, sizeof(s_fin[free_slot]));
         s_fin[free_slot].id = id;
         s_fin[free_slot].x = x;
         s_fin[free_slot].y = y;
+        s_fin[free_slot].ox = x;
+        s_fin[free_slot].oy = y;
+        s_fin[free_slot].t0 = SDL_GetTicks();
         s_fin[free_slot].down = 1;
+        s_fin[free_slot].just_down = 1;
+        s_fin[free_slot].key = -1;
     }
 }
 
@@ -232,20 +272,7 @@ void pc_touch_note_event(const SDL_Event* e) {
     if (e->type == SDL_FINGERDOWN || e->type == SDL_FINGERUP || e->type == SDL_FINGERMOTION) {
         x = e->tfinger.x * (float)g_pc_window_w;
         y = e->tfinger.y * (float)g_pc_window_h;
-        finger_set(e->tfinger.fingerId, x, y, e->type != SDL_FINGERUP);
-        if (e->type == SDL_FINGERDOWN) {
-            s_gest = 1;
-            s_gest_x = x;
-            s_gest_y = y;
-        } else if (e->type == SDL_FINGERUP && s_gest) {
-            /* A short tap's up often arrives in the same poll as its down, before PADRead. */
-            s_gest = 0;
-            s_tap_ready = 1;
-            s_tap_x = s_gest_x;
-            s_tap_y = s_gest_y;
-            s_gest_x = x;
-            s_gest_y = y;
-        }
+        finger_set(e->tfinger.fingerId, x, y, e->type);
         if (s_logged < 6 && e->type != SDL_FINGERMOTION) {
             char line[96];
             s_logged++;
@@ -287,63 +314,124 @@ static int submenu_open(void) {
 
 static int keys_up(void) {
 #ifdef KEYBOARD_TYPING
-    if (g_pc_editor_active && g_pc_settings.touch_keyboard) return 1;
+    if (g_pc_editor_active && g_pc_settings.touch_keyboard) {
+        GAME_PLAY* play = get_game_play();
+        if (play != NULL && play->submenu.menu_type == mSM_OVL_EDITOR &&
+            play->submenu.overlay != NULL &&
+            play->submenu.overlay->menu_info[mSM_OVL_EDITOR].proc_status == mSM_OVL_PROC_PLAY) {
+            return 1;
+        }
+    }
+    if (pc_chat_typing() && g_pc_settings.touch_keyboard) return 1;
 #endif
     return pc_play_online_menu_text_active();
 }
 
 static int in_picture(float x, float y) {
-    return x >= (float)g_pc_content_x && y >= (float)g_pc_content_y &&
-           x < (float)(g_pc_content_x + g_pc_content_w) &&
-           y < (float)(g_pc_content_y + g_pc_content_h);
+    int bx = g_pc_content_x, by = g_pc_content_y, bw = g_pc_content_w, bh = g_pc_content_h;
+    pc_layout_box(2, &bx, &by, &bw, &bh);
+    return x >= (float)bx && y >= (float)by &&
+           x < (float)(bx + bw) &&
+           y < (float)(by + bh);
 }
 
 static void to_font(float x, float y, float* fx, float* fy) {
-    if (g_pc_layout_portrait) {
-        float cw = (float)g_pc_content_w;
-        float ch = cw * 3.0f / 4.0f;
-        float cy = (float)g_pc_content_y + ((float)g_pc_content_h - ch) * 0.5f;
-        *fx = (x - (float)g_pc_content_x) / cw * 320.0f;
-        *fy = (y - cy) / ch * 240.0f;
-    } else {
-        *fx = (x - (float)g_pc_content_x) / (float)g_pc_content_w * 320.0f;
-        *fy = (y - (float)g_pc_content_y) / (float)g_pc_content_h * 240.0f;
-    }
+    int bx = g_pc_content_x, by = g_pc_content_y, bw = g_pc_content_w, bh = g_pc_content_h;
+    pc_layout_box(2, &bx, &by, &bw, &bh);
+    if (bw < 1) bw = 1;
+    if (bh < 1) bh = 1;
+    *fx = (x - (float)bx) / (float)bw * 320.0f;
+    *fy = (y - (float)by) / (float)bh * 240.0f;
 }
 
 static void place_keys(Hud* h, float top, float bottom, float left, float right) {
-    static const char* rows[4] = { "qwertyuiop", "asdfghjkl", "zxcvbnm<", " +" };
+    static const char* rows_lower[3] = { "qwertyuiop", "asdfghjkl", "\x01zxcvbnm\x08" };
+    static const char* rows_upper[3] = { "QWERTYUIOP", "ASDFGHJKL", "\x01ZXCVBNM\x08" };
+    static const char* rows_num[3]   = { "1234567890", ".:-_/@!?'&", "\x01()+=%,\"\x08" };
+    const char* const* rows = (s_kb_mode == 1) ? rows_upper : ((s_kb_mode == 2) ? rows_num : rows_lower);
     int r, c, n = 0;
     float band = bottom - top;
-    float rh = band / 4.2f;
-    if (rh < 28.0f) rh = 28.0f;
-    h->kr = rh * 0.42f;
-    if (h->kr > 26.0f) h->kr = 26.0f;
-    if (h->kr < 16.0f) h->kr = 16.0f;
-    for (r = 0; r < 4 && n < 40; r++) {
+    float total_w = right - left;
+    float rh = band / 4.15f;
+    float gap_x, key_w, key_h;
+    if (rh < 30.0f) rh = 30.0f;
+    if (rh > 66.0f) rh = 66.0f;
+    gap_x = total_w * 0.012f;
+    if (gap_x < 4.0f) gap_x = 4.0f;
+    if (gap_x > 10.0f) gap_x = 10.0f;
+    key_w = (total_w - 9.0f * gap_x) / 10.0f;
+    if (key_w > 78.0f) {
+        key_w = 78.0f;
+        total_w = 10.0f * key_w + 9.0f * gap_x;
+        left = left + ((right - left) - total_w) * 0.5f;
+        right = left + total_w;
+    }
+    key_h = rh * 0.84f;
+    h->kr = (key_w < key_h ? key_w : key_h) * 0.48f;
+
+    for (r = 0; r < 3 && n < 48; r++) {
         int count = (int)strlen(rows[r]);
-        float span = (float)count * h->kr * 2.15f;
-        float x0 = left + ((right - left) - span) * 0.5f + h->kr;
-        float y = top + rh * ((float)r + 0.55f);
-        if (r == 3) {
-            h->kx[n] = left + (right - left) * 0.38f;
-            h->ky[n] = y;
-            h->kc[n] = ' ';
-            n++;
-            h->kx[n] = left + (right - left) * 0.78f;
-            h->ky[n] = y;
-            h->kc[n] = '\n';
-            n++;
-            continue;
+        float y = top + rh * ((float)r + 0.52f);
+        if (r == 2) {
+            /* Row 2 has Shift (\x01), 7 chars, Backspace (\x08) */
+            float wide_w = key_w * 1.42f;
+            float row_span = 2.0f * wide_w + (float)(count - 2) * key_w + (float)(count - 1) * gap_x;
+            float cur_x = left + (total_w - row_span) * 0.5f;
+            for (c = 0; c < count && n < 48; c++) {
+                char ch = rows[r][c];
+                float w = (ch == '\x01' || ch == '\x08') ? wide_w : key_w;
+                h->kx[n] = cur_x + w * 0.5f;
+                h->ky[n] = y;
+                h->kw[n] = w;
+                h->kh[n] = key_h;
+                h->kc[n] = ch;
+                cur_x += w + gap_x;
+                n++;
+            }
+        } else {
+            float row_span = (float)count * key_w + (float)(count - 1) * gap_x;
+            float x0 = left + (total_w - row_span) * 0.5f + key_w * 0.5f;
+            for (c = 0; c < count && n < 48; c++) {
+                h->kx[n] = x0 + (float)c * (key_w + gap_x);
+                h->ky[n] = y;
+                h->kw[n] = key_w;
+                h->kh[n] = key_h;
+                h->kc[n] = rows[r][c];
+                n++;
+            }
         }
-        for (c = 0; c < count && n < 40; c++) {
-            h->kx[n] = x0 + (float)c * h->kr * 2.15f;
+    }
+    /* Row 3: [123/ABC (\x02)] [< (\x05)] [SPACE (' ')] [> (\x06)] [Line ('\n')] [Done (\x03)] */
+    if (n + 6 <= 48) {
+        static const char bot_kc[6] = { '\x02', '\x05', ' ', '\x06', '\n', '\x03' };
+        static const float bot_wt[6] = { 1.35f, 0.95f, 3.60f, 0.95f, 1.35f, 1.65f };
+        float wt_sum = 9.85f;
+        float avail_w = total_w - 5.0f * gap_x;
+        float cur_x = left;
+        float y = top + rh * 3.55f;
+        for (c = 0; c < 6; c++) {
+            float w = avail_w * (bot_wt[c] / wt_sum);
+            h->kx[n] = cur_x + w * 0.5f;
             h->ky[n] = y;
-            h->kc[n] = rows[r][c];
+            h->kw[n] = w;
+            h->kh[n] = key_h;
+            h->kc[n] = bot_kc[c];
+            cur_x += w + gap_x;
             n++;
         }
     }
     h->key_n = n;
+}
+
+static int submenu_needs_dpad(void) {
+    GAME_PLAY* play = get_game_play();
+    int mt;
+    if (!submenu_open() || play == NULL) return 0;
+    mt = play->submenu.menu_type;
+    return (mt == mSM_OVL_BOARD || mt == mSM_OVL_DIARY || mt == mSM_OVL_CALENDAR ||
+            mt == mSM_OVL_CATALOG || mt == mSM_OVL_NEEDLEWORK || mt == mSM_OVL_DESIGN ||
+            mt == mSM_OVL_CPORIGINAL || mt == mSM_OVL_MUSIC || mt == mSM_OVL_CPMAIL ||
+            mt == mSM_OVL_CPEDIT || mt == mSM_OVL_MSCORE);
 }
 
 static void hud_build(Hud* h) {
@@ -351,15 +439,11 @@ static void hud_build(Hud* h) {
     float il = 0, it = 0, ir = 0, ib = 0;
     float rad;
     int town, menu, dialog;
-    FILE* f = fopen("safe_insets.txt", "r");
+    int in_l = 0, in_t = 0, in_r = 0, in_b = 0;
     memset(h, 0, sizeof(*h));
-    if (f != NULL) {
-        int a = 0, b = 0, c = 0, d = 0;
-        if (fscanf(f, "%d %d %d %d", &a, &b, &c, &d) == 4) {
-            il = (float)a; it = (float)b; ir = (float)c; ib = (float)d;
-        }
-        fclose(f);
-    }
+    pc_layout_insets(&in_l, &in_t, &in_r, &in_b);
+    il = (float)in_l; it = (float)in_t; ir = (float)in_r; ib = (float)in_b;
+
     town = !g_pc_paused && !g_pc_title_main_menu_visible && !pc_settings_menu_active() &&
            !pc_play_online_menu_active() && !pc_play_offline_menu_active() && !pc_creator_menu_active() &&
            !message_open() && !submenu_open() && !keys_up();
@@ -382,18 +466,23 @@ static void hud_build(Hud* h) {
     }
     h->show_keys = keys_up();
     h->show_nub = 0;
-    h->show_stick = 0;
-    /* Pocket Camp controls: Action, Back, Menu, Bag, Map, Cam are available in town */
+    h->show_stick = !h->show_keys && town && (g_pc_settings.touch_stick || g_pc_settings.touch_virtual_pad);
+    /* Action, Back, Menu, Bag, Map, Cam, Tool, Emote, Chat are available in town */
     h->show_action = !h->show_keys;
     h->show_back = !h->show_keys;
     h->show_menu = !h->show_keys;
-    h->show_quick = !h->show_keys && (town || menu);
+    h->show_quick = !h->show_keys && town;
     h->show_cam = !h->show_keys && town;
-    h->show_close = !h->show_keys && (menu || dialog);
+    h->show_tool = !h->show_keys && town;
+    h->show_emote = !h->show_keys && town;
+    h->show_chat = !h->show_keys && town;
+    h->show_close = h->show_keys || menu || dialog;
     h->show_context = 0;
+    h->show_dpad = !h->show_keys && submenu_needs_dpad();
+    h->show_trigs = h->show_dpad;
 
     if (g_pc_layout_portrait) {
-        /* Portrait HUD: Action and Back in bottom-right; Pockets, Map & Cam in bottom-left; Menu in top-right */
+        /* Portrait HUD */
         h->ar = rad * 1.20f;
         h->ax = W - ir - h->ar - 24.0f;
         h->ay = H - ib - h->ar - 28.0f;
@@ -402,27 +491,60 @@ static void hud_build(Hud* h) {
         h->bx = h->ax - h->ar - h->br - 22.0f;
         h->by = h->ay;
 
-        h->qr = rad * 0.95f;
-        h->bag_x = il + h->qr + 28.0f;
-        h->bag_y = H - ib - h->qr - 32.0f;
+        h->tool_r = rad * 0.85f;
+        h->tool_x = h->ax;
+        h->tool_y = h->ay - h->ar - h->tool_r - 18.0f;
+
+        h->emote_r = rad * 0.78f;
+        h->emote_x = h->bx;
+        h->emote_y = h->by - h->br - h->emote_r - 18.0f;
+
+        h->qr = rad * 0.92f;
+        h->bag_x = il + h->qr + 26.0f;
+        h->bag_y = H - ib - h->qr - 30.0f;
 
         h->map_x = h->bag_x;
-        h->map_y = h->bag_y - h->qr * 2.35f;
+        h->map_y = h->bag_y - h->qr * 2.30f;
 
         h->cam_r = h->qr;
         h->cam_x = h->bag_x;
-        h->cam_y = h->map_y - h->qr * 2.35f;
+        h->cam_y = h->map_y - h->qr * 2.30f;
+
+        h->sr = rad * 1.35f;
+        h->sx = il + h->sr + 36.0f;
+        h->sy = H - ib - h->sr - 36.0f;
+        if (h->show_stick) {
+            /* Shift Bag/Map/Cam above the virtual stick so they never overlap */
+            h->bag_y = h->sy - h->sr - h->qr - 20.0f;
+            h->map_y = h->bag_y - h->qr * 2.25f;
+            h->cam_y = h->map_y - h->qr * 2.25f;
+        }
 
         h->mr = rad * 0.85f;
         h->mx = W - ir - h->mr - 24.0f;
         h->my = it + h->mr + 24.0f;
 
+        h->chat_r = rad * 0.80f;
+        h->chat_x = h->mx - h->mr - h->chat_r - 18.0f;
+        h->chat_y = h->my;
+
         h->close_r = rad * 0.85f;
         h->close_x = il + h->close_r + 24.0f;
         h->close_y = it + h->close_r + 24.0f;
 
+        if (h->show_dpad) {
+            h->dpad_r = rad * 0.72f;
+            h->dpad_cx = il + h->dpad_r * 2.4f + 22.0f;
+            h->dpad_cy = H - ib - h->dpad_r * 2.4f - 24.0f;
+            h->trig_r = rad * 0.72f;
+            h->trig_lx = h->dpad_cx - h->dpad_r * 1.1f;
+            h->trig_ly = h->dpad_cy - h->dpad_r * 2.5f;
+            h->trig_rx = h->dpad_cx + h->dpad_r * 1.1f;
+            h->trig_ry = h->trig_ly;
+        }
+
         if (h->show_keys) {
-            place_keys(h, H * 0.55f, H - ib - 16.0f, il + 8.0f, W - ir - 8.0f);
+            place_keys(h, H * 0.55f, H - ib - 14.0f, il + 8.0f, W - ir - 8.0f);
         }
     } else {
         /* Landscape HUD */
@@ -434,27 +556,62 @@ static void hud_build(Hud* h) {
         h->bx = h->ax - h->ar - h->br - 20.0f;
         h->by = h->ay;
 
+        h->tool_r = rad * 0.82f;
+        h->tool_x = h->ax;
+        h->tool_y = h->ay - h->ar - h->tool_r - 16.0f;
+
+        h->emote_r = rad * 0.76f;
+        h->emote_x = h->bx;
+        h->emote_y = h->by - h->br - h->emote_r - 16.0f;
+
         h->qr = rad * 0.85f;
         h->bag_x = il + h->qr + 24.0f;
         h->bag_y = H - ib - h->qr - 24.0f;
 
         h->map_x = h->bag_x;
-        h->map_y = h->bag_y - h->qr * 2.3f;
+        h->map_y = h->bag_y - h->qr * 2.25f;
 
         h->cam_r = h->qr;
         h->cam_x = h->bag_x;
-        h->cam_y = h->map_y - h->qr * 2.3f;
+        h->cam_y = h->map_y - h->qr * 2.25f;
+
+        h->sr = rad * 1.35f;
+        h->sx = il + h->sr + 36.0f;
+        h->sy = H - ib - h->sr - 32.0f;
+        if (h->show_stick) {
+            h->bag_x = h->sx + h->sr + h->qr + 22.0f;
+            h->bag_y = H - ib - h->qr - 24.0f;
+            h->map_x = h->bag_x + h->qr * 2.25f;
+            h->map_y = h->bag_y;
+            h->cam_x = h->sx;
+            h->cam_y = h->sy - h->sr - h->cam_r - 18.0f;
+        }
 
         h->mr = rad * 0.80f;
         h->mx = W - ir - h->mr - 20.0f;
         h->my = it + h->mr + 20.0f;
 
+        h->chat_r = rad * 0.76f;
+        h->chat_x = h->mx - h->mr - h->chat_r - 16.0f;
+        h->chat_y = h->my;
+
         h->close_r = rad * 0.80f;
         h->close_x = il + h->close_r + 20.0f;
         h->close_y = it + h->close_r + 20.0f;
 
+        if (h->show_dpad) {
+            h->dpad_r = rad * 0.70f;
+            h->dpad_cx = il + h->dpad_r * 2.4f + 20.0f;
+            h->dpad_cy = H - ib - h->dpad_r * 2.4f - 20.0f;
+            h->trig_r = rad * 0.70f;
+            h->trig_lx = h->dpad_cx - h->dpad_r * 1.1f;
+            h->trig_ly = h->dpad_cy - h->dpad_r * 2.45f;
+            h->trig_rx = h->dpad_cx + h->dpad_r * 1.1f;
+            h->trig_ry = h->trig_ly;
+        }
+
         if (h->show_keys) {
-            place_keys(h, H - ib - rad * 3.4f, H - ib - 6.0f, W * 0.22f, W * 0.78f);
+            place_keys(h, H - ib - rad * 4.4f, H - ib - 8.0f, W * 0.14f, W * 0.86f);
         }
     }
 
@@ -464,26 +621,22 @@ static void hud_build(Hud* h) {
         int nchoice = 0;
         if (choice != NULL && mChoice_check_main_normal(choice)) nchoice = choice->data.choice_num;
         if (nchoice > 6) nchoice = 6;
-        if (nchoice > 0 && dialog) {
+        if (nchoice > 0 && dialog && g_pc_layout_portrait) {
+            int bx, by, bw, bh, i;
             float band_top, band_bot, step;
-            int i;
-            if (g_pc_layout_portrait) {
-                float cw = (float)g_pc_content_w;
-                float ch_43 = cw * 3.0f / 4.0f;
-                float cy_43 = (float)g_pc_content_y + ((float)g_pc_content_h - ch_43) * 0.5f;
-                band_top = cy_43 + ch_43 * 0.70f;
-                band_bot = H - ib - rad * 2.2f;
-                if (band_bot < band_top + 60.0f) { band_top = cy_43 + ch_43 * 0.50f; band_bot = H - ib - 16.0f; }
-            } else {
-                band_top = H * 0.52f;
-                band_bot = H - ib - rad * 2.8f;
-                if (band_bot < band_top + 80.0f) { band_top = H * 0.45f; band_bot = H - ib - 20.0f; }
+            pc_layout_box(2, &bx, &by, &bw, &bh);
+            band_top = (float)(by + bh) + 18.0f;
+            band_bot = H - ib - rad * 2.5f;
+            if (band_bot < band_top + 60.0f) {
+                band_top = (float)by + (float)bh * 0.55f;
+                band_bot = H - ib - 16.0f;
             }
             step = (band_bot - band_top) / (float)(nchoice + 1);
             h->choice_n = nchoice;
-            h->choice_r = step * 0.38f;
-            if (h->choice_r > rad * 0.85f) h->choice_r = rad * 0.85f;
-            if (h->choice_r < 24.0f) h->choice_r = 24.0f;
+            h->choice_r = step * 0.40f;
+            if (h->choice_r > rad * 0.75f) h->choice_r = rad * 0.75f;
+            if (h->choice_r < 22.0f) h->choice_r = 22.0f;
+            h->choice_w = fminf(W - il - ir - 48.0f, 340.0f);
             h->choice_x = W * 0.5f;
             for (i = 0; i < nchoice; i++) h->choice_y[i] = band_top + step * (float)(i + 1);
         }
@@ -491,32 +644,36 @@ static void hud_build(Hud* h) {
 
     h->show_sub_tabs = 0;
     if (get_game_play() != NULL && submenu_open() && !h->show_keys && h->choice_n == 0) {
-        h->show_sub_tabs = 1;
-        h->sub_tab_n = 4;
-        h->sub_tab_id[0] = 0; /* Items */
-        h->sub_tab_id[1] = 1; /* Letters */
-        h->sub_tab_id[2] = 2; /* Fish */
-        h->sub_tab_id[3] = 3; /* Bugs */
-        if (g_pc_layout_portrait) {
-            int bx, by, bw, bh;
-            pc_layout_box(2, &bx, &by, &bw, &bh);
-            float tab_y = (float)(by + bh) + 42.0f;
-            if (tab_y > h->ay - rad * 1.25f) tab_y = h->ay - rad * 1.25f;
-            h->sub_tab_r = rad * 0.78f;
-            if (h->sub_tab_r > 42.0f) h->sub_tab_r = 42.0f;
-            if (h->sub_tab_r < 24.0f) h->sub_tab_r = 24.0f;
-            float band_w = W - il - ir;
-            for (int i = 0; i < 4; i++) {
-                h->sub_tab_x[i] = il + band_w * (0.16f + 0.226f * (float)i);
-                h->sub_tab_y[i] = tab_y;
-            }
-        } else {
-            h->sub_tab_r = rad * 0.65f;
-            if (h->sub_tab_r > 34.0f) h->sub_tab_r = 34.0f;
-            if (h->sub_tab_r < 20.0f) h->sub_tab_r = 20.0f;
-            for (int i = 0; i < 4; i++) {
-                h->sub_tab_x[i] = il + h->sub_tab_r + 20.0f + (float)i * (h->sub_tab_r * 2.3f);
-                h->sub_tab_y[i] = H - ib - h->sub_tab_r - 20.0f;
+        GAME_PLAY* play = get_game_play();
+        if (play != NULL && play->submenu.menu_type == mSM_OVL_INVENTORY &&
+            play->submenu.param0 == mSM_IV_OPEN_NORMAL && !pc_dresser_ui_active() && !pc_dresser_ui_basket()) {
+            h->show_sub_tabs = 1;
+            h->sub_tab_n = 4;
+            h->sub_tab_id[0] = 0; /* Items */
+            h->sub_tab_id[1] = 1; /* Letters */
+            h->sub_tab_id[2] = 2; /* Fish */
+            h->sub_tab_id[3] = 3; /* Bugs */
+            if (g_pc_layout_portrait) {
+                int bx, by, bw, bh;
+                pc_layout_box(2, &bx, &by, &bw, &bh);
+                float tab_y = (float)(by + bh) + 42.0f;
+                if (tab_y > h->ay - rad * 1.25f) tab_y = h->ay - rad * 1.25f;
+                h->sub_tab_r = rad * 0.78f;
+                if (h->sub_tab_r > 42.0f) h->sub_tab_r = 42.0f;
+                if (h->sub_tab_r < 24.0f) h->sub_tab_r = 24.0f;
+                float band_w = W - il - ir;
+                for (int i = 0; i < 4; i++) {
+                    h->sub_tab_x[i] = il + band_w * (0.16f + 0.226f * (float)i);
+                    h->sub_tab_y[i] = tab_y;
+                }
+            } else {
+                h->sub_tab_r = rad * 0.65f;
+                if (h->sub_tab_r > 34.0f) h->sub_tab_r = 34.0f;
+                if (h->sub_tab_r < 20.0f) h->sub_tab_r = 20.0f;
+                for (int i = 0; i < 4; i++) {
+                    h->sub_tab_x[i] = il + h->sub_tab_r + 20.0f + (float)i * (h->sub_tab_r * 2.3f);
+                    h->sub_tab_y[i] = H - ib - h->sub_tab_r - 20.0f;
+                }
             }
         }
     }
@@ -524,13 +681,15 @@ static void hud_build(Hud* h) {
     if (g_pc_settings.touch_left_hand) {
         h->sx = W - h->sx; h->nx = W - h->nx; h->ax = W - h->ax;
         h->bx = W - h->bx; h->mx = W - h->mx;
+        h->tool_x = W - h->tool_x; h->emote_x = W - h->emote_x; h->chat_x = W - h->chat_x;
+        h->dpad_cx = W - h->dpad_cx;
+        h->trig_lx = W - h->trig_lx; h->trig_rx = W - h->trig_rx;
         h->bag_x = W - h->bag_x; h->map_x = W - h->map_x; h->cam_x = W - h->cam_x;
         h->close_x = W - h->close_x;
         h->storage_x = W - h->storage_x;
         h->stor_prev_x = W - h->stor_prev_x;
         h->stor_next_x = W - h->stor_next_x;
         h->ctx_x = W - h->ctx_x;
-        for (int i = 0; i < h->key_n; i++) h->kx[i] = W - h->kx[i];
         for (int i = 0; i < h->sub_tab_n; i++) h->sub_tab_x[i] = W - h->sub_tab_x[i];
     }
     if (!h->show_stick) { h->sx = -1000.0f; }
@@ -540,7 +699,7 @@ static void hud_build(Hud* h) {
         h->show_storage = 1;
         if (g_pc_layout_portrait) {
             h->storage_x = h->bag_x;
-            h->storage_y = h->cam_y - h->qr * 2.35f;
+            h->storage_y = h->cam_y - h->qr * 2.30f;
         } else {
             h->storage_x = h->bag_x + h->qr * 2.3f;
             h->storage_y = h->bag_y;
@@ -564,10 +723,15 @@ static void hud_build(Hud* h) {
         h->show_back = 0;
         h->show_quick = 0;
         h->show_cam = 0;
+        h->show_tool = 0;
+        h->show_emote = 0;
+        h->show_chat = 0;
         h->show_close = 0;
         h->show_sub_tabs = 0;
         h->show_context = 0;
         h->show_menu = 0;
+        h->show_dpad = 0;
+        h->show_trigs = 0;
     }
 }
 
@@ -575,6 +739,10 @@ static int hit_disc(float x, float y, float cx, float cy, float r) {
     float dx = x - cx, dy = y - cy;
     r *= 1.15f; /* a little slop so a fold does not miss the disc */
     return dx * dx + dy * dy <= r * r;
+}
+
+static int hit_rect_center(float x, float y, float cx, float cy, float w, float h) {
+    return fabsf(x - cx) <= w * 0.54f && fabsf(y - cy) <= h * 0.56f;
 }
 
 static int classify(float x, float y, Hud* h, int* key) {
@@ -586,13 +754,40 @@ static int classify(float x, float y, Hud* h, int* key) {
     }
     if (h->show_keys) {
         for (i = 0; i < h->key_n; i++) {
-            float r = (h->kc[i] == ' ' || h->kc[i] == '\n') ? h->kr * 1.6f : h->kr;
-            if (hit_disc(x, y, h->kx[i], h->ky[i], r)) { *key = i; return HIT_KEY; }
+            if (hit_rect_center(x, y, h->kx[i], h->ky[i], h->kw[i], h->kh[i])) {
+                *key = i;
+                return HIT_KEY;
+            }
+        }
+        if (h->show_close && hit_disc(x, y, h->close_x, h->close_y, h->close_r)) return HIT_CLOSE;
+        return HIT_SHEET_BODY; /* swallow misses inside keyboard band */
+    }
+    /* Check native choice window rows BEFORE Action/Back buttons so bottom-right choices are never blocked */
+    if (get_game_play() != NULL) {
+        mChoice_c* c = mChoice_Get_base_window_p();
+        if (c != NULL && mChoice_check_main_normal(c) && c->data.choice_num > 0) {
+            float fx, fy;
+            to_font(x, y, &fx, &fy);
+            float cx = (c->center_x > 10.0f) ? c->center_x : 160.0f;
+            float cy = (c->center_y > 10.0f) ? c->center_y : 120.0f;
+            float row0_y = (cy - 120.0f) + c->text_y;
+            float box_h = (float)c->data.choice_num * 16.0f;
+            if (fx >= cx - 92.0f && fx <= cx + 92.0f && fy >= row0_y - 8.0f && fy <= row0_y + box_h + 8.0f) {
+                int idx = (int)((fy - (row0_y - 2.0f)) / 16.0f);
+                if (idx < 0) idx = 0;
+                if (idx >= c->data.choice_num) idx = c->data.choice_num - 1;
+                *key = idx;
+                return HIT_CHOICE;
+            }
         }
     }
     if (h->choice_n > 0) {
         for (i = 0; i < h->choice_n; i++) {
-            if (hit_disc(x, y, h->choice_x, h->choice_y[i], h->choice_r)) { *key = i; return HIT_CHOICE; }
+            float cw = (h->choice_w > 0.0f) ? h->choice_w : (h->choice_r * 2.2f);
+            if (hit_rect_center(x, y, h->choice_x, h->choice_y[i], cw, h->choice_r * 2.0f)) {
+                *key = i;
+                return HIT_CHOICE;
+            }
         }
     }
     if (h->show_sub_tabs) {
@@ -610,10 +805,24 @@ static int classify(float x, float y, Hud* h, int* key) {
         if (hit_disc(x, y, h->stor_prev_x, h->stor_prev_y, h->stor_page_r)) return HIT_STOR_PREV;
         if (hit_disc(x, y, h->stor_next_x, h->stor_next_y, h->stor_page_r)) return HIT_STOR_NEXT;
     }
+    if (h->show_dpad) {
+        float step = h->dpad_r * 1.35f;
+        if (hit_disc(x, y, h->dpad_cx, h->dpad_cy - step, h->dpad_r)) return HIT_DPAD_UP;
+        if (hit_disc(x, y, h->dpad_cx, h->dpad_cy + step, h->dpad_r)) return HIT_DPAD_DOWN;
+        if (hit_disc(x, y, h->dpad_cx - step, h->dpad_cy, h->dpad_r)) return HIT_DPAD_LEFT;
+        if (hit_disc(x, y, h->dpad_cx + step, h->dpad_cy, h->dpad_r)) return HIT_DPAD_RIGHT;
+    }
+    if (h->show_trigs) {
+        if (hit_disc(x, y, h->trig_lx, h->trig_ly, h->trig_r)) return HIT_TRIG_L;
+        if (hit_disc(x, y, h->trig_rx, h->trig_ry, h->trig_r)) return HIT_TRIG_R;
+    }
     if (h->show_quick && hit_disc(x, y, h->bag_x, h->bag_y, h->qr)) return HIT_BAG;
     if (h->show_quick && hit_disc(x, y, h->map_x, h->map_y, h->qr)) return HIT_MAP;
     if (h->show_cam && hit_disc(x, y, h->cam_x, h->cam_y, h->cam_r)) return HIT_CAM;
-    if (h->show_stick && hit_disc(x, y, h->sx, h->sy, h->sr)) return HIT_STICK;
+    if (h->show_tool && hit_disc(x, y, h->tool_x, h->tool_y, h->tool_r)) return HIT_TOOL;
+    if (h->show_emote && hit_disc(x, y, h->emote_x, h->emote_y, h->emote_r)) return HIT_EMOTE;
+    if (h->show_chat && hit_disc(x, y, h->chat_x, h->chat_y, h->chat_r)) return HIT_CHAT;
+    if (h->show_stick && hit_disc(x, y, h->sx, h->sy, h->sr * 1.15f)) return HIT_STICK;
     if (h->show_nub && hit_disc(x, y, h->nx, h->ny, h->nr)) return HIT_NUB;
     if (h->show_action && hit_disc(x, y, h->ax, h->ay, h->ar)) return HIT_ACTION;
     if (h->show_back && hit_disc(x, y, h->bx, h->by, h->br)) return HIT_BACK;
@@ -952,27 +1161,108 @@ static void refresh_action_label(void) {
 }
 
 static void type_char(char ch) {
+    pc_touch_buzz();
+    if (ch == '\x01') {
+        s_kb_mode = (s_kb_mode == 1) ? 0 : 1;
+        return;
+    }
+    if (ch == '\x02') {
+        s_kb_mode = (s_kb_mode == 2) ? 0 : 2;
+        return;
+    }
 #ifdef KEYBOARD_TYPING
-    if (g_pc_editor_active) {
+    if (g_pc_editor_active && keys_up() && !pc_chat_typing() && !pc_play_online_menu_text_active()) {
         g_pc_typing_mode = 1;
-        if (ch == '<') pc_typing_queue_push(PC_TYPING_CMD_BACKSPACE);
+        if (ch == '<' || ch == '\x08') pc_typing_queue_push(PC_TYPING_CMD_BACKSPACE);
+        else if (ch == '\x05') pc_typing_queue_push(PC_TYPING_CMD_LEFT);
+        else if (ch == '\x06') pc_typing_queue_push(PC_TYPING_CMD_RIGHT);
         else if (ch == '\n') pc_typing_queue_push(PC_TYPING_CMD_ENTER);
-        else if (ch == ' ' || (ch >= 33 && ch < 127)) pc_typing_queue_push((int)ch);
+        else if (ch == '\x03') pc_typing_queue_push(PC_TYPING_CMD_END_EDIT);
+        else if (ch == ' ' || (ch >= 33 && ch < 127)) {
+            char s[2];
+            s[0] = ch;
+            s[1] = '\0';
+            int code = pc_utf8_to_game_code(s);
+            if (code >= 0) pc_typing_queue_push(code);
+            if (s_kb_mode == 1 && ch >= 'A' && ch <= 'Z') s_kb_mode = 0;
+        }
+        return;
+    }
+    if (pc_chat_typing()) {
+        SDL_Event e;
+        memset(&e, 0, sizeof(e));
+        if (ch == '<' || ch == '\x08' || ch == '\n' || ch == '\x03' || ch == '\x05' || ch == '\x06') {
+            e.type = SDL_KEYDOWN;
+            if (ch == '<' || ch == '\x08') e.key.keysym.sym = SDLK_BACKSPACE;
+            else if (ch == '\x05') e.key.keysym.sym = SDLK_LEFT;
+            else if (ch == '\x06') e.key.keysym.sym = SDLK_RIGHT;
+            else e.key.keysym.sym = SDLK_RETURN;
+            pc_chat_handle_event(&e);
+        } else if (ch >= 32 && ch < 127) {
+            e.type = SDL_TEXTINPUT;
+            e.text.text[0] = ch;
+            e.text.text[1] = 0;
+            pc_chat_handle_event(&e);
+            if (s_kb_mode == 1 && ch >= 'A' && ch <= 'Z') s_kb_mode = 0;
+        }
         return;
     }
 #endif
     if (pc_play_online_menu_text_active()) {
         SDL_Event e;
         memset(&e, 0, sizeof(e));
-        if (ch == '<' || ch == '\n') {
+        if (ch == '<' || ch == '\x08' || ch == '\n' || ch == '\x03' || ch == '\x05' || ch == '\x06') {
             e.type = SDL_KEYDOWN;
-            e.key.keysym.sym = (ch == '<') ? SDLK_BACKSPACE : SDLK_RETURN;
+            if (ch == '<' || ch == '\x08') e.key.keysym.sym = SDLK_BACKSPACE;
+            else if (ch == '\x05') e.key.keysym.sym = SDLK_LEFT;
+            else if (ch == '\x06') e.key.keysym.sym = SDLK_RIGHT;
+            else e.key.keysym.sym = SDLK_RETURN;
             pc_play_online_menu_handle_text_event(&e);
-        } else {
+        } else if (ch >= 32 && ch < 127) {
             e.type = SDL_TEXTINPUT;
             e.text.text[0] = ch;
             e.text.text[1] = 0;
             pc_play_online_menu_handle_text_event(&e);
+            if (s_kb_mode == 1 && ch >= 'A' && ch <= 'Z') s_kb_mode = 0;
+        }
+    }
+}
+
+static void cancel_keys_or_close(void);
+static void note_tap(const char* kind);
+
+static void equip_next_tool(void) {
+    static int s_tool_cursor = -1;
+    GAME_PLAY* play = get_game_play();
+    Private_c* priv = Now_Private;
+    int step, found = -1;
+    if (play == NULL || priv == NULL || !can_steer()) return;
+    for (step = 0; step < mPr_POCKETS_SLOT_COUNT; step++) {
+        int i = (s_tool_cursor + 1 + step) % mPr_POCKETS_SLOT_COUNT;
+        mActor_name_t it = priv->inventory.pockets[i];
+        if (ITEM_IS_TOOL(it) || (it >= ITM_MY_ORG_UMBRELLA0 && it <= ITM_MY_ORG_UMBRELLA7)) {
+            found = i;
+            break;
+        }
+    }
+    if (found >= 0) {
+        mActor_name_t new_eq = priv->inventory.pockets[found];
+        mActor_name_t old_eq = priv->equipment;
+        priv->inventory.pockets[found] = old_eq;
+        priv->equipment = new_eq;
+        s_tool_cursor = found;
+        sAdo_SysTrgStart(NA_SE_5E);
+        pc_touch_buzz();
+        note_tap("tool_cycle");
+    } else if (priv->equipment != EMPTY_NO) {
+        int empty_slot = mPr_GetPossessionItemIdx(priv, EMPTY_NO);
+        if (empty_slot >= 0) {
+            priv->inventory.pockets[empty_slot] = priv->equipment;
+            priv->equipment = EMPTY_NO;
+            s_tool_cursor = -1;
+            sAdo_SysTrgStart(NA_SE_CURSOL);
+            pc_touch_buzz();
+            note_tap("tool_unequip");
         }
     }
 }
@@ -1012,6 +1302,30 @@ static void latch_consume(unsigned short* buttons) {
         if (s_latch & PAD_BUTTON_START) pc_diag_milestone("pad Start consumed");
         s_latch = 0;
     }
+}
+
+static void cancel_keys_or_close(void) {
+    if (pc_chat_typing()) {
+        SDL_Event e;
+        memset(&e, 0, sizeof(e));
+        e.type = SDL_KEYDOWN;
+        e.key.keysym.sym = SDLK_ESCAPE;
+        pc_chat_handle_event(&e);
+        pc_touch_buzz();
+        return;
+    }
+    if (pc_play_online_menu_text_active()) {
+        SDL_Event e;
+        memset(&e, 0, sizeof(e));
+        e.type = SDL_KEYDOWN;
+        e.key.keysym.sym = SDLK_ESCAPE;
+        pc_play_online_menu_handle_text_event(&e);
+        pc_touch_buzz();
+        return;
+    }
+    latch_button(PAD_BUTTON_B, "B");
+    pc_touch_buzz();
+    if (g_pc_paused) pause_key(SDLK_ESCAPE);
 }
 
 static int choice_count_now(void);
@@ -1084,20 +1398,14 @@ static void on_submenu_tap(float x, float y) {
     Submenu* submenu;
     Submenu_Overlay_c* ovl;
     mTG_Ovl_c* tag_ovl;
-    mTG_tag_c* tag;
-    float cw, ch_43, center_x, center_y, gx, gy;
+    mTG_tag_c* tag = NULL;
+    float cw, ch_43, center_x, center_y, gx, gy, fx, fy;
     int hand_empty;
 
     if (play == NULL) return;
     submenu = &play->submenu;
     ovl = submenu->overlay;
-    if (ovl == NULL || ovl->tag_ovl == NULL) return;
-    tag_ovl = ovl->tag_ovl;
-    if (tag_ovl->sel_tag_idx < 0 || tag_ovl->sel_tag_idx >= mTG_TAG_NUM) {
-        s_pulse_a = 1;
-        return;
-    }
-    tag = &tag_ovl->tags[tag_ovl->sel_tag_idx];
+    if (ovl == NULL) return;
 
     {
         int bx, by, bw, bh;
@@ -1108,22 +1416,141 @@ static void on_submenu_tap(float x, float y) {
         center_y = (float)by + ch_43 * 0.5f;
     }
 
-    /* Convert touch point to GameCube 2D tag coordinate space:
-     * X in [-160, 160], Y in [-120, 120] (GameCube Y is up) */
     gx = (x - center_x) / (cw * 0.5f) * 160.0f;
     gy = -(y - center_y) / (ch_43 * 0.5f) * 120.0f;
+    to_font(x, y, &fx, &fy);
+
+    /* A. End-of-Edit Check ("Is this OK? Yes / Rewrite / Throw it out") & Warning popups */
+    if (submenu->menu_type == mSM_OVL_WARNING ||
+        ovl->menu_info[mSM_OVL_WARNING].proc_status == mSM_OVL_PROC_PLAY) {
+        s_pulse_a = 1;
+        pc_touch_buzz();
+        note_tap("warning_ok");
+        return;
+    }
+    if (submenu->menu_type == mSM_OVL_EDITENDCHK ||
+        ovl->menu_info[mSM_OVL_EDITENDCHK].proc_status == mSM_OVL_PROC_PLAY) {
+        mEE_Ovl_c* ee = ovl->editEndChk_ovl;
+        if (ee != NULL) {
+            if (!ee->moving_in) {
+                s_pulse_a = 1;
+                pc_touch_buzz();
+                note_tap("editend_open");
+                return;
+            }
+            {
+                int max_sel = (ovl->menu_info[mSM_OVL_EDITENDCHK].data0 == 2) ? 3 : 2;
+                int row = (int)((fy - 142.0f) / 16.0f);
+                if (row >= 0 && row < max_sel) {
+                    ee->selected_answer = (u8)row;
+                }
+                s_pulse_a = 1;
+                pc_touch_buzz();
+                note_tap("editend_pick");
+                return;
+            }
+        }
+    }
+
+    /* B. Address book (when choosing recipient for a letter) */
+    if (submenu->menu_type == mSM_OVL_ADDRESS ||
+        ovl->menu_info[mSM_OVL_ADDRESS].proc_status == mSM_OVL_PROC_PLAY) {
+        mAD_Ovl_c* ad = ovl->address_ovl;
+        if (ad != NULL) {
+            if (fx < 70.0f) {
+                s_swipe = -1;
+                pc_touch_buzz();
+                return;
+            }
+            if (fx > 250.0f) {
+                s_swipe = 1;
+                pc_touch_buzz();
+                return;
+            }
+            {
+                int row = (int)((fy - 58.0f) / 18.0f);
+                if (row >= 0 && row < 6) {
+                    ad->curIdx = (u8)row;
+                    s_pulse_a = 1;
+                    pc_touch_buzz();
+                    note_tap("address_pick");
+                    return;
+                }
+            }
+        }
+        s_pulse_a = 1;
+        pc_touch_buzz();
+        return;
+    }
+
+    /* C. Town Map (mSM_OVL_MAP): tap directly on acre grid to move cursor */
+    if (submenu->menu_type == mSM_OVL_MAP && ovl->map_ovl != NULL) {
+        mMP_Ovl_c* mp = ovl->map_ovl;
+        /* Map grid is centered around gx in [-84..56], gy in [-66..54] (5 cols x 6 rows of 24x20 acres) */
+        int col = (int)floorf((gx - (-79.0f)) / 24.0f);
+        int row = (int)floorf((50.0f - gy) / 20.0f);
+        if (col >= 0 && col < 5 && row >= 0 && row < 6) {
+            mp->sel_bx = (u8)(col + 1);
+            mp->sel_bz = (u8)(row + 1);
+            mp->map_cursor_current_xpos = ((f32)col - 2.5f) * 24.0f;
+            mp->map_cursor_current_zpos = (-((f32)row - 3.0f)) * 20.0f;
+            mp->map_cursor_target_xpos = mp->map_cursor_current_xpos;
+            mp->map_cursor_target_zpos = mp->map_cursor_current_zpos;
+            sAdo_SysTrgStart(NA_SE_CURSOL);
+            pc_touch_buzz();
+            note_tap("map_acre");
+            return;
+        }
+        s_pulse_b = 1;
+        pc_touch_buzz();
+        return;
+    }
+
+    /* D. Loan Repayment (mSM_OVL_REPAY) & Bank (mSM_OVL_BANK) */
+    if (submenu->menu_type == mSM_OVL_REPAY && ovl->repay_ovl != NULL) {
+        if (fy > 145.0f) { s_pulse_a = 1; pc_touch_buzz(); return; }
+        if (fy < 105.0f) { s_swipe = 2; pc_touch_buzz(); return; }
+        if (fy > 120.0f) { s_swipe = -2; pc_touch_buzz(); return; }
+        if (fx < 150.0f) { s_swipe = -1; pc_touch_buzz(); return; }
+        s_swipe = 1; pc_touch_buzz(); return;
+    }
+    if (submenu->menu_type == mSM_OVL_BANK && ovl->bank_ovl != NULL) {
+        if (fy > 145.0f) { s_pulse_a = 1; pc_touch_buzz(); return; }
+        if (fy < 105.0f) { s_swipe = 2; pc_touch_buzz(); return; }
+        if (fy > 120.0f) { s_swipe = -2; pc_touch_buzz(); return; }
+        if (fx < 150.0f) { s_swipe = -1; pc_touch_buzz(); return; }
+        s_swipe = 1; pc_touch_buzz(); return;
+    }
+
+    /* E. Clock / Birthday Input (mSM_OVL_TIMEIN / mSM_OVL_BIRTHDAY) */
+    if (submenu->menu_type == mSM_OVL_TIMEIN || submenu->menu_type == mSM_OVL_BIRTHDAY) {
+        if (fy > 155.0f) { s_pulse_a = 1; pc_touch_buzz(); return; }
+        if (fy < 100.0f) { s_swipe = 2; pc_touch_buzz(); return; }
+        if (fy > 125.0f) { s_swipe = -2; pc_touch_buzz(); return; }
+        if (fx < 150.0f) { s_swipe = -1; pc_touch_buzz(); return; }
+        s_swipe = 1; pc_touch_buzz(); return;
+    }
+
+    if (ovl->tag_ovl == NULL) {
+        s_pulse_a = 1;
+        return;
+    }
+    tag_ovl = ovl->tag_ovl;
+    if (tag_ovl->sel_tag_idx < 0 || tag_ovl->sel_tag_idx >= mTG_TAG_NUM) {
+        s_pulse_a = 1;
+        return;
+    }
+    tag = &tag_ovl->tags[tag_ovl->sel_tag_idx];
     hand_empty = submenu_hand_is_empty(submenu);
 
     /* 1. Item Action Popup Tag Menu (Wear, Drop, Grab, Quit, etc.) */
     if (tag->type != mTG_TYPE_NONE) {
-        float fx, fy;
         float pos_y = 120.0f - (tag->base_pos[1] + tag->body_ofs[1] + tag->text_ofs[1]);
         float pos_x = (tag->base_pos[0] + tag->body_ofs[0] + 160.0f);
         int tapped_row;
-        to_font(x, y, &fx, &fy);
 
-        if (fx >= pos_x - 45.0f && fx <= pos_x + 95.0f) {
-            tapped_row = (int)((fy - (pos_y - 6.0f)) / 15.0f);
+        if (fx >= pos_x - 55.0f && fx <= pos_x + 105.0f) {
+            tapped_row = (int)((fy - (pos_y - 8.0f)) / 15.0f);
             if (tapped_row >= 0 && tapped_row < 6) {
                 tag->tag_row = tapped_row;
                 s_pulse_a = 1;
@@ -1139,46 +1566,49 @@ static void on_submenu_tap(float x, float y) {
         return;
     }
 
-    /* 2. Side Tabs on Inventory Rim */
-    /* Right Top: Fish Collection (gx: 85..130, gy: 18..58) */
-    if (gx >= 85.0f && gx <= 130.0f && gy >= 18.0f && gy <= 58.0f) {
-        tag->table = mTG_TABLE_WCHANGE;
-        tag->tag_col = 0;
-        tag->tag_row = mIV_PAGE_FISH_COLLECTION;
-        s_pulse_a = 1;
-        note_tap("tab_fish");
-        pc_touch_buzz();
-        return;
-    }
-    /* Right Mid: Face / Designs Tab (gx: 85..130, gy: -18..18) */
-    if (gx >= 85.0f && gx <= 130.0f && gy > -18.0f && gy < 18.0f) {
-        tag->table = mTG_TABLE_WCHANGE;
-        tag->tag_col = 0;
-        tag->tag_row = 1;
-        s_pulse_a = 1;
-        note_tap("tab_face");
-        pc_touch_buzz();
-        return;
-    }
-    /* Right Bot: Insect Collection (gx: 85..130, gy: -58..-18) */
-    if (gx >= 85.0f && gx <= 130.0f && gy >= -58.0f && gy <= -18.0f) {
-        tag->table = mTG_TABLE_WCHANGE;
-        tag->tag_col = 0;
-        tag->tag_row = mIV_PAGE_INSECT_COLLECTION;
-        s_pulse_a = 1;
-        note_tap("tab_bugs");
-        pc_touch_buzz();
-        return;
-    }
-    /* Left Tab: Original Patterns / Needlework (gx: -130..-85, gy: -25..25) */
-    if (gx >= -130.0f && gx <= -85.0f && gy >= -25.0f && gy <= 25.0f) {
-        tag->table = mTG_TABLE_INVENTORY_WC_ORG;
-        tag->tag_col = 0;
-        tag->tag_row = 0;
-        s_pulse_a = 1;
-        note_tap("tab_designs");
-        pc_touch_buzz();
-        return;
+    /* 2. Side Tabs on Inventory Rim (only in normal inventory) */
+    if (submenu->menu_type == mSM_OVL_INVENTORY && submenu->param0 == mSM_IV_OPEN_NORMAL &&
+        !pc_dresser_ui_active() && !pc_dresser_ui_basket()) {
+        /* Right Top: Fish Collection (gx: 85..130, gy: 18..58) */
+        if (gx >= 85.0f && gx <= 130.0f && gy >= 18.0f && gy <= 58.0f) {
+            tag->table = mTG_TABLE_WCHANGE;
+            tag->tag_col = 0;
+            tag->tag_row = mIV_PAGE_FISH_COLLECTION;
+            s_pulse_a = 1;
+            note_tap("tab_fish");
+            pc_touch_buzz();
+            return;
+        }
+        /* Right Mid: Face / Designs Tab (gx: 85..130, gy: -18..18) */
+        if (gx >= 85.0f && gx <= 130.0f && gy > -18.0f && gy < 18.0f) {
+            tag->table = mTG_TABLE_WCHANGE;
+            tag->tag_col = 0;
+            tag->tag_row = 1;
+            s_pulse_a = 1;
+            note_tap("tab_face");
+            pc_touch_buzz();
+            return;
+        }
+        /* Right Bot: Insect Collection (gx: 85..130, gy: -58..-18) */
+        if (gx >= 85.0f && gx <= 130.0f && gy >= -58.0f && gy <= -18.0f) {
+            tag->table = mTG_TABLE_WCHANGE;
+            tag->tag_col = 0;
+            tag->tag_row = mIV_PAGE_INSECT_COLLECTION;
+            s_pulse_a = 1;
+            note_tap("tab_bugs");
+            pc_touch_buzz();
+            return;
+        }
+        /* Left Tab: Original Patterns / Needlework (gx: -130..-85, gy: -25..25) */
+        if (gx >= -130.0f && gx <= -85.0f && gy >= -25.0f && gy <= 25.0f) {
+            tag->table = mTG_TABLE_INVENTORY_WC_ORG;
+            tag->tag_col = 0;
+            tag->tag_row = 0;
+            s_pulse_a = 1;
+            note_tap("tab_designs");
+            pc_touch_buzz();
+            return;
+        }
     }
 
     /* 3. Fish & Insect Collection Page Grid (8 cols x 5 rows) */
@@ -1200,30 +1630,105 @@ static void on_submenu_tap(float x, float y) {
         return;
     }
 
-    /* 4. Dresser / Gyroid storage (mSM_OVL_HANIWA) */
-    if (submenu->menu_type == mSM_OVL_HANIWA) {
-        if (gy >= 25.0f) {
-            int c = (int)roundf((gx - (-106.0f)) / 22.0f);
-            int r = (int)roundf((82.0f - gy) / 22.0f);
-            if (c >= 0 && c < 9 && r >= 0 && r < 3) {
-                int already = (tag->table == mTG_TABLE_HANIWA && tag->tag_col == c && tag->tag_row == r);
+    /* 4. Dresser / Sell Basket / Gyroid storage (mSM_OVL_HANIWA) */
+    if (submenu->menu_type == mSM_OVL_HANIWA || pc_dresser_ui_active() || pc_dresser_ui_basket()) {
+        if (pc_dresser_ui_basket()) {
+            /* Nook Sell Basket: 5x3 grid at cols={10,26,42,58,74}, rows={70,54,38} + Sell button at col 5 (gy=20..32) */
+            if (gx >= -2.0f && gx <= 96.0f && gy >= 16.0f && gy <= 84.0f) {
+                if (gy < 31.0f) {
+                    /* SELL button (col 5, row 0) */
+                    int already = (tag->table == mTG_TABLE_HANIWA && tag->tag_col == 5);
+                    tag->table = mTG_TABLE_HANIWA;
+                    tag->tag_col = 5;
+                    tag->tag_row = 0;
+                    if (already || hand_empty) s_pulse_a = 1;
+                    else if (tag_ovl->init_tag_data_item_win_proc != NULL) tag_ovl->init_tag_data_item_win_proc(submenu);
+                    note_tap("basket_sell");
+                    pc_touch_buzz();
+                    return;
+                } else {
+                    int c = (int)roundf((gx - 10.0f) / 16.0f);
+                    int r = (int)roundf((70.0f - gy) / 16.0f);
+                    if (c < 0) c = 0;
+                    if (c > 4) c = 4;
+                    if (r < 0) r = 0;
+                    if (r > 2) r = 2;
+                    {
+                        int already = (tag->table == mTG_TABLE_HANIWA && tag->tag_col == c && tag->tag_row == r);
+                        tag->table = mTG_TABLE_HANIWA;
+                        tag->tag_col = c;
+                        tag->tag_row = r;
+                        if (!hand_empty || already) s_pulse_a = 1;
+                        else if (tag_ovl->init_tag_data_item_win_proc != NULL) tag_ovl->init_tag_data_item_win_proc(submenu);
+                        note_tap("basket_slot");
+                        pc_touch_buzz();
+                        return;
+                    }
+                }
+            }
+        } else if (pc_dresser_ui_active()) {
+            if (gy >= 22.0f) {
+                int c = (int)roundf((gx - (-106.0f)) / 22.0f);
+                int r = (int)roundf((82.0f - gy) / 22.0f);
+                if (c >= 0 && c < 9 && r >= 0 && r < 3) {
+                    int already = (tag->table == mTG_TABLE_HANIWA && tag->tag_col == c && tag->tag_row == r);
+                    tag->table = mTG_TABLE_HANIWA;
+                    tag->tag_col = c;
+                    tag->tag_row = r;
+                    if (!hand_empty || already) {
+                        s_pulse_a = 1;
+                    } else if (tag_ovl->init_tag_data_item_win_proc != NULL) {
+                        tag_ovl->init_tag_data_item_win_proc(submenu);
+                    }
+                    note_tap("dresser_slot");
+                    pc_touch_buzz();
+                    return;
+                }
+            }
+        } else if (gy >= 28.0f) {
+            /* Vanilla 4x1 Gyroid strip at cols={13, 37, 61, 85}, gy=58 */
+            int c = (int)roundf((gx - 13.0f) / 24.0f);
+            if (c >= 0 && c < 4) {
+                int already = (tag->table == mTG_TABLE_HANIWA && tag->tag_col == c);
                 tag->table = mTG_TABLE_HANIWA;
                 tag->tag_col = c;
-                tag->tag_row = r;
-                if (!hand_empty || already) {
-                    s_pulse_a = 1;
-                } else if (tag_ovl->init_tag_data_item_win_proc != NULL) {
-                    tag_ovl->init_tag_data_item_win_proc(submenu);
-                }
-                note_tap("dresser_slot");
+                tag->tag_row = 0;
+                if (!hand_empty || already) s_pulse_a = 1;
+                else if (tag_ovl->init_tag_data_item_win_proc != NULL) tag_ovl->init_tag_data_item_win_proc(submenu);
+                note_tap("haniwa_slot");
                 pc_touch_buzz();
                 return;
             }
         }
     }
 
+    /* 4b. Mailbox (mSM_OVL_MAILBOX): 2x5 grid at cols={-36, -12}, rows={39, 15, -9, -33, -57} */
+    if (submenu->menu_type == mSM_OVL_MAILBOX && gx >= -54.0f && gx <= 6.0f && gy >= -72.0f && gy <= 56.0f) {
+        static const float mbox_cols[2] = { -36.0f, -12.0f };
+        static const float mbox_rows[5] = { 39.0f, 15.0f, -9.0f, -33.0f, -57.0f };
+        int best_c = 0, best_r = 0, c, r;
+        float best_d2 = 1e9f;
+        for (c = 0; c < 2; c++) {
+            for (r = 0; r < 5; r++) {
+                float d2 = (gx - mbox_cols[c]) * (gx - mbox_cols[c]) + (gy - mbox_rows[r]) * (gy - mbox_rows[r]);
+                if (d2 < best_d2) { best_d2 = d2; best_c = c; best_r = r; }
+            }
+        }
+        if (best_d2 <= 26.0f * 26.0f) {
+            int already = (tag->table == mTG_TABLE_MBOX && tag->tag_col == best_c && tag->tag_row == best_r);
+            tag->table = mTG_TABLE_MBOX;
+            tag->tag_col = best_c;
+            tag->tag_row = best_r;
+            if (!hand_empty || already) s_pulse_a = 1;
+            else if (tag_ovl->init_tag_data_item_win_proc != NULL) tag_ovl->init_tag_data_item_win_proc(submenu);
+            note_tap("mailbox_slot");
+            pc_touch_buzz();
+            return;
+        }
+    }
+
     /* 5. Player portrait: (-59, 63) */
-    {
+    if (submenu->menu_type == mSM_OVL_INVENTORY) {
         float dx = gx - (-59.0f), dy = gy - 63.0f;
         if (dx * dx + dy * dy <= 32.0f * 32.0f) {
             int already = (tag->table == mTG_TABLE_PLAYER);
@@ -1243,7 +1748,7 @@ static void on_submenu_tap(float x, float y) {
     }
 
     /* 6. Wallet: (-22, 10) */
-    {
+    if (submenu->menu_type == mSM_OVL_INVENTORY) {
         float dx = gx - (-22.0f), dy = gy - 10.0f;
         if (dx * dx + dy * dy <= 28.0f * 28.0f) {
             int already = (tag->table == mTG_TABLE_MONEY);
@@ -1361,20 +1866,16 @@ static void on_picture_release(float x, float y) {
     }
     if (choice_is_up()) {
         mChoice_c* c = mChoice_Get_base_window_p();
-        if (c != NULL && c->data.choice_num > 1) {
+        if (c != NULL && mChoice_check_main_normal(c) && c->data.choice_num > 0) {
             float cy = (c->center_y > 10.0f) ? c->center_y : 120.0f;
-            float half_h = (float)c->data.choice_num * 14.0f;
-            if (fy < cy - half_h * 0.2f) {
-                c->selected_choice_idx = 0;
-            } else if (fy > cy + half_h * 0.2f) {
-                c->selected_choice_idx = c->data.choice_num - 1;
-            } else {
-                int idx = (int)((fy - (cy - half_h)) / (2.0f * half_h / (float)c->data.choice_num));
-                if (idx >= 0 && idx < c->data.choice_num) c->selected_choice_idx = idx;
-            }
+            float row0_y = (cy - 120.0f) + c->text_y;
+            int idx = (int)((fy - (row0_y - 2.0f)) / 16.0f);
+            if (idx < 0) idx = 0;
+            if (idx >= c->data.choice_num) idx = c->data.choice_num - 1;
+            c->selected_choice_idx = idx;
+            s_pulse_a = 1;
+            note_tap("choice");
         }
-        s_pulse_a = 1;
-        note_tap("choice");
         return;
     }
     if (submenu_open()) {
@@ -1412,50 +1913,98 @@ static void pick_choice(int i) {
     char line[32];
     if (c == NULL || i < 0 || i >= c->data.choice_num) return;
     c->selected_choice_idx = i;
-    s_choice_confirm = 1;
     s_pulse_a = 1;
     note_tap("choice");
     snprintf(line, sizeof(line), "tap choice %d", i + 1);
     pc_diag_milestone(line);
 }
 
-static int read_point(float* x, float* y, float* x2, float* y2, int* n) {
-    int i, mx = 0, my = 0;
+static void sync_mouse_slot(void) {
+    int i, any_touch = 0, mx = 0, my = 0;
     Uint32 mouse;
-    *n = 0;
-    for (i = 0; i < FINGERS && *n < 2; i++) {
-        if (!s_fin[i].down) continue;
-        if (*n == 0) { *x = s_fin[i].x; *y = s_fin[i].y; }
-        else { *x2 = s_fin[i].x; *y2 = s_fin[i].y; }
-        (*n)++;
-    }
-    if (*n > 0) return 1;
-    if (SDL_GetNumTouchDevices() > 0) {
-        SDL_TouchID id = SDL_GetTouchDevice(0);
-        int nf = SDL_GetNumTouchFingers(id);
-        for (i = 0; i < nf && *n < 2; i++) {
-            SDL_Finger* f = SDL_GetTouchFinger(id, i);
-            if (f == NULL) continue;
-            if (*n == 0) { *x = f->x * (float)g_pc_window_w; *y = f->y * (float)g_pc_window_h; }
-            else { *x2 = f->x * (float)g_pc_window_w; *y2 = f->y * (float)g_pc_window_h; }
-            (*n)++;
+    for (i = 0; i < FINGERS - 1; i++) {
+        if (s_fin[i].down || s_fin[i].just_down || s_fin[i].just_up) {
+            any_touch = 1;
+            break;
         }
     }
-    mouse = SDL_GetMouseState(&mx, &my);
-    if (*n == 0 && (mouse & SDL_BUTTON(SDL_BUTTON_LEFT))) {
-        *x = (float)mx; *y = (float)my; *n = 1;
+    if (SDL_GetNumTouchDevices() > 0 && !any_touch) {
+        SDL_TouchID tid = SDL_GetTouchDevice(0);
+        int nf = SDL_GetNumTouchFingers(tid);
+        if (nf > 0) any_touch = 1;
     }
+    mouse = SDL_GetMouseState(&mx, &my);
     if (mouse & SDL_BUTTON(SDL_BUTTON_RIGHT)) s_have_target = 0;
-    return *n > 0;
+    if (any_touch) {
+        s_mouse_was_down = 0;
+        return;
+    }
+    {
+        int is_down = (mouse & SDL_BUTTON(SDL_BUTTON_LEFT)) != 0;
+        Finger* mf = &s_fin[FINGERS - 1];
+        if (is_down && !s_mouse_was_down) {
+            memset(mf, 0, sizeof(*mf));
+            mf->id = -99;
+            mf->x = (float)mx;
+            mf->y = (float)my;
+            mf->ox = (float)mx;
+            mf->oy = (float)my;
+            mf->t0 = SDL_GetTicks();
+            mf->down = 1;
+            mf->just_down = 1;
+            mf->key = -1;
+        } else if (is_down && s_mouse_was_down) {
+            mf->x = (float)mx;
+            mf->y = (float)my;
+            mf->down = 1;
+        } else if (!is_down && s_mouse_was_down) {
+            mf->x = (float)mx;
+            mf->y = (float)my;
+            mf->down = 0;
+            mf->just_up = 1;
+        }
+        s_mouse_was_down = is_down;
+    }
+}
+
+static int handle_claim_modal_tap(float tx, float ty) {
+    float W = (float)g_pc_window_w, H = (float)g_pc_window_h;
+    float ui = fmaxf(1.0f, H / 720.0f);
+    float cw = fminf(380.0f * ui, W * 0.90f);
+    float ch = 190.0f * ui;
+    float cx = W * 0.5f, cy = H * 0.5f;
+    float bh = 42.0f * ui;
+    float bw = (cw - 40.0f * ui) * 0.46f;
+    float btn_y = cy + 45.0f * ui;
+    float claim_cx = cx - bw * 0.55f;
+    float cancel_cx = cx + bw * 0.55f;
+    if (fabsf(tx - claim_cx) <= bw * 0.55f && fabsf(ty - btn_y) <= bh * 0.65f) {
+        pc_touch_buzz();
+        pc_bedroom_confirm_claim();
+        return 1;
+    }
+    if (fabsf(tx - cancel_cx) <= bw * 0.55f && fabsf(ty - btn_y) <= bh * 0.65f) {
+        pc_touch_buzz();
+        pc_bedroom_cancel_claim();
+        return 1;
+    }
+    if (fabsf(tx - cx) > cw * 0.5f || fabsf(ty - cy) > ch * 0.5f) {
+        pc_touch_buzz();
+        pc_bedroom_cancel_claim();
+        return 1;
+    }
+    return 1;
 }
 
 void pc_touch_apply(unsigned short* buttons, signed char* stick_x, signed char* stick_y,
                     signed char* cstick_x, signed char* cstick_y,
                     int* wheel_hold, int* emote_hold, int* pointer_x, int* pointer_y) {
     Hud hud;
-    float x = 0, y = 0, x2 = 0, y2 = 0;
-    int n = 0, down, rising, hit, key = -1, tap_handled = 0;
-    (void)wheel_hold; (void)emote_hold; (void)pointer_x; (void)pointer_y;
+    int i, pic_fingers = 0, pic_idx[2] = { -1, -1 };
+    float min_dim = (float)(g_pc_window_w < g_pc_window_h ? g_pc_window_w : g_pc_window_h);
+    float drag_slop = fmaxf(22.0f, 0.026f * min_dim);
+    float tap_slop = fmaxf(34.0f, 0.038f * min_dim);
+
     if (s_title_life > 0 && --s_title_life == 0) s_title_valid = 0;
     refresh_action_label();
     if (pc_bedroom_claim_prompt_active()) {
@@ -1473,7 +2022,10 @@ void pc_touch_apply(unsigned short* buttons, signed char* stick_x, signed char* 
         }
     }
     if (!pc_touch_enabled() || buttons == NULL || g_pc_window_w < 2) return;
+
+    sync_mouse_slot();
     hud_build(&hud);
+
     if (s_cam_pulse_timer > 0) {
         if (cstick_x) *cstick_x = (signed char)s_cam_pulse_x;
         if (cstick_y) *cstick_y = (signed char)s_cam_pulse_y;
@@ -1486,156 +2038,184 @@ void pc_touch_apply(unsigned short* buttons, signed char* stick_x, signed char* 
     if (s_cam_cooldown > 0) {
         s_cam_cooldown--;
     }
-    if (s_pending_drop && submenu_open()) {
+    if (s_pending_row >= 0 && submenu_open()) {
         GAME_PLAY* play = get_game_play();
         if (play != NULL && play->submenu.overlay != NULL && play->submenu.overlay->tag_ovl != NULL) {
             mTG_tag_c* tag = &play->submenu.overlay->tag_ovl->tags[0];
             if (tag->type != mTG_TYPE_NONE) {
-                tag->tag_row = 1;
+                tag->tag_row = s_pending_row;
                 s_pulse_a = 1;
-                s_pending_drop = 0;
+                s_pending_row = -1;
                 pc_touch_buzz();
-                note_tap("mobile_sheet_drop");
+                note_tap("mobile_sheet_act");
+            }
+        }
+    } else if (!submenu_open()) {
+        s_pending_row = -1;
+    }
+
+    /* 1. Process new finger-down events */
+    for (i = 0; i < FINGERS; i++) {
+        Finger* f = &s_fin[i];
+        if (!f->just_down) continue;
+        f->just_down = 0;
+
+        if (pc_bedroom_claim_prompt_active()) {
+            f->hit = HIT_SHEET_BODY;
+            f->just_up = 0;
+            handle_claim_modal_tap(f->ox, f->oy);
+            continue;
+        }
+
+        f->hit = classify(f->ox, f->oy, &hud, &f->key);
+
+        if (f->hit == HIT_SHEET_CLOSE) {
+            latch_button(PAD_BUTTON_B, "B");
+            s_sheet.active = 0;
+            s_sheet.swap_mode = 0;
+            pc_touch_buzz();
+            note_tap("sheet_close");
+        } else if (f->hit == HIT_SHEET_BELLS) {
+            mobile_sheet_handle_bells();
+        } else if (f->hit == HIT_SHEET_TAB) {
+            mobile_sheet_handle_tab(f->key);
+        } else if (f->hit == HIT_SHEET_CARD) {
+            mobile_sheet_handle_card(f->key);
+        } else if (f->hit == HIT_SHEET_ACT) {
+            mobile_sheet_handle_act(f->key);
+        } else if (f->hit == HIT_KEY) {
+            if (f->key >= 0 && f->key < hud.key_n) {
+                type_char(hud.kc[f->key]);
+            }
+        } else if (f->hit == HIT_CHOICE) {
+            pick_choice(f->key);
+            pc_touch_buzz();
+        } else if (f->hit == HIT_SUB_TAB) {
+            handle_sub_tab_tap(f->key);
+            pc_touch_buzz();
+        } else if (f->hit == HIT_NUB) {
+            g_pc_settings.touch_stick = !g_pc_settings.touch_stick;
+            pc_settings_save();
+            pc_touch_buzz();
+            pc_diag_milestone(g_pc_settings.touch_stick ? "touch stick shown" : "touch stick hidden");
+        } else if (f->hit == HIT_MENU) {
+            pc_touch_buzz();
+            pc_diag_milestone("touch menu");
+            if (g_pc_title_main_menu_visible && !pc_settings_menu_active() && !pc_play_online_menu_active() && !pc_play_offline_menu_active())
+                latch_button(PAD_BUTTON_START, "Start");
+            else if (message_open() || submenu_open() || pc_settings_menu_active() || pc_play_online_menu_active() || pc_play_offline_menu_active())
+                latch_button(PAD_BUTTON_B, "B");
+            else if (g_pc_paused) pause_key(SDLK_ESCAPE);
+            else pc_pause_menu_toggle();
+        } else if (f->hit == HIT_CLOSE) {
+            pc_diag_milestone("touch close");
+            note_tap("close");
+            cancel_keys_or_close();
+        } else if (f->hit == HIT_ACTION || f->hit == HIT_CONTEXT) {
+            latch_button(PAD_BUTTON_A, "A");
+            pc_touch_buzz();
+            pc_diag_milestone("touch action");
+            note_tap("action");
+        } else if (f->hit == HIT_BACK) {
+            latch_button(PAD_BUTTON_B, "B");
+            pc_touch_buzz();
+            pc_diag_milestone("touch back");
+            note_tap("back");
+            if (g_pc_paused) pause_key(SDLK_ESCAPE);
+        } else if (f->hit == HIT_STORAGE) {
+            pc_touch_buzz();
+            pc_diag_milestone("touch storage");
+            if (!submenu_open() && get_game_play() != NULL) {
+                pc_cloud_storage_client_open(NULL);
+                pc_dresser_ui_begin(NULL);
+                mSM_open_submenu(&get_game_play()->submenu, mSM_OVL_INVENTORY, mSM_IV_OPEN_HANIWA_ENTRUST, 0);
+            }
+        } else if (f->hit == HIT_STOR_PREV) {
+            pc_touch_buzz();
+            pc_cloud_storage_client_prev_page();
+            pc_dresser_ui_note_input();
+            sAdo_SysTrgStart(NA_SE_CURSOL);
+        } else if (f->hit == HIT_STOR_NEXT) {
+            pc_touch_buzz();
+            pc_cloud_storage_client_next_page();
+            pc_dresser_ui_note_input();
+            sAdo_SysTrgStart(NA_SE_CURSOL);
+        } else if (f->hit == HIT_BAG) {
+            s_have_target = 0;
+            latch_button(PAD_BUTTON_Y, "Y");
+            pc_touch_buzz();
+            pc_diag_milestone("touch inventory");
+        } else if (f->hit == HIT_MAP) {
+            s_have_target = 0;
+            latch_button(PAD_BUTTON_X, "X");
+            pc_touch_buzz();
+            pc_diag_milestone("touch map");
+        } else if (f->hit == HIT_CHAT) {
+            s_have_target = 0;
+            pc_touch_buzz();
+            pc_chat_touch_open();
+            note_tap("chat");
+        } else if (f->hit == HIT_TOOL || f->hit == HIT_EMOTE) {
+            pc_touch_buzz();
+        } else if (f->hit == HIT_DPAD_UP) {
+            latch_button(PAD_BUTTON_UP, "Up");
+            pc_touch_buzz();
+        } else if (f->hit == HIT_DPAD_DOWN) {
+            latch_button(PAD_BUTTON_DOWN, "Down");
+            pc_touch_buzz();
+        } else if (f->hit == HIT_DPAD_LEFT) {
+            latch_button(PAD_BUTTON_LEFT, "Left");
+            pc_touch_buzz();
+        } else if (f->hit == HIT_DPAD_RIGHT) {
+            latch_button(PAD_BUTTON_RIGHT, "Right");
+            pc_touch_buzz();
+        } else if (f->hit == HIT_TRIG_L) {
+            latch_button(PAD_TRIGGER_L, "L");
+            pc_touch_buzz();
+        } else if (f->hit == HIT_TRIG_R) {
+            latch_button(PAD_TRIGGER_R, "R");
+            pc_touch_buzz();
+        } else if (f->hit == HIT_STICK) {
+            s_stick_slot = i;
+            s_stick_kx = hud.sx;
+            s_stick_ky = hud.sy;
+            s_have_target = 0;
+            s_drag_active = 0;
+            pc_touch_buzz();
+        } else if (f->hit == HIT_PICTURE) {
+            if (can_steer() && s_drag_slot < 0) {
+                s_drag_slot = i;
+                s_drag_active = 1;
+                s_drag_ox = f->ox;
+                s_drag_oy = f->oy;
+                s_drag_cx = f->x;
+                s_drag_cy = f->y;
+                s_drag_t0 = f->t0;
+                s_drag_moved = 0;
             }
         }
     }
-    if (s_tap_ready) {
-        float dx = s_gest_x - s_tap_x, dy = s_gest_y - s_tap_y;
-        s_tap_ready = 0;
-        tap_handled = 1;
-        if (dx * dx + dy * dy < 64.0f * 64.0f) {
-            if (pc_bedroom_claim_prompt_active()) {
-                float W = (float)g_pc_window_w, H = (float)g_pc_window_h;
-                float ui = fmaxf(1.0f, H / 720.0f);
-                float cw = fminf(380.0f * ui, W * 0.90f);
-                float ch = 190.0f * ui;
-                float cx = W * 0.5f, cy = H * 0.5f;
-                float bh = 42.0f * ui;
-                float bw = (cw - 40.0f * ui) * 0.46f;
-                float btn_y = cy + 45.0f * ui;
-                float claim_cx = cx - bw * 0.55f;
-                float cancel_cx = cx + bw * 0.55f;
-                if (fabsf(s_tap_x - claim_cx) <= bw * 0.5f && fabsf(s_tap_y - btn_y) <= bh * 0.5f) {
-                    pc_touch_buzz();
-                    pc_bedroom_confirm_claim();
-                    return;
-                }
-                if (fabsf(s_tap_x - cancel_cx) <= bw * 0.5f && fabsf(s_tap_y - btn_y) <= bh * 0.5f) {
-                    pc_touch_buzz();
-                    pc_bedroom_cancel_claim();
-                    return;
-                }
-                if (fabsf(s_tap_x - cx) > cw * 0.5f || fabsf(s_tap_y - cy) > ch * 0.5f) {
-                    pc_touch_buzz();
-                    pc_bedroom_cancel_claim();
-                    return;
-                }
-                return;
-            }
-            int th = 0, tk = -1;
-            th = classify(s_tap_x, s_tap_y, &hud, &tk);
-            if (th == HIT_SHEET_CLOSE) {
-                latch_button(PAD_BUTTON_B, "B");
-                s_sheet.active = 0;
-                s_sheet.swap_mode = 0;
-                pc_touch_buzz();
-                note_tap("sheet_close");
-            } else if (th == HIT_SHEET_BELLS) {
-                mobile_sheet_handle_bells();
-            } else if (th == HIT_SHEET_TAB) {
-                mobile_sheet_handle_tab(tk);
-            } else if (th == HIT_SHEET_CARD) {
-                mobile_sheet_handle_card(tk);
-            } else if (th == HIT_SHEET_ACT) {
-                mobile_sheet_handle_act(tk);
-            } else if (th == HIT_SHEET_BODY) {
-                /* Swallowed touch on sheet background */
-            } else if (th == HIT_PICTURE) {
-                if (can_steer()) {
-                    if (!s_tap_logged) begin_move(s_tap_x, s_tap_y, 1);
-                } else on_picture_release(s_tap_x, s_tap_y);
-            }
-            else if (th == HIT_NUB) {
-                g_pc_settings.touch_stick = !g_pc_settings.touch_stick;
-                pc_settings_save();
-                pc_touch_buzz();
-                pc_diag_milestone(g_pc_settings.touch_stick ? "touch stick shown" : "touch stick hidden");
-            } else if (th == HIT_MENU) {
-                pc_touch_buzz();
-                pc_diag_milestone("touch menu");
-                if (g_pc_title_main_menu_visible && !pc_settings_menu_active() && !pc_play_online_menu_active() && !pc_play_offline_menu_active())
-                    latch_button(PAD_BUTTON_START, "Start");
-                else if (message_open() || submenu_open() || pc_settings_menu_active() || pc_play_online_menu_active() || pc_play_offline_menu_active())
-                    latch_button(PAD_BUTTON_B, "B");
-                else if (g_pc_paused) pause_key(SDLK_ESCAPE);
-                else pc_pause_menu_toggle();
-            } else if (th == HIT_ACTION) {
-                latch_button(PAD_BUTTON_A, "A");
-                pc_touch_buzz();
-                pc_diag_milestone("touch action");
-            } else if (th == HIT_BACK || th == HIT_CLOSE) {
-                latch_button(PAD_BUTTON_B, "B");
-                pc_touch_buzz();
-                pc_diag_milestone(th == HIT_CLOSE ? "touch close" : "touch back");
-                note_tap(th == HIT_CLOSE ? "close" : "back");
-                if (g_pc_paused) pause_key(SDLK_ESCAPE);
-            } else if (th == HIT_CONTEXT) {
-                latch_button(PAD_BUTTON_A, "A");
-                pc_touch_buzz();
-                pc_diag_milestone("touch context");
-                note_tap("context");
-            } else if (th == HIT_CHOICE) {
-                pick_choice(tk);
-                pc_touch_buzz();
-            } else if (th == HIT_STORAGE) {
-                pc_touch_buzz();
-                pc_diag_milestone("touch storage");
-                if (!submenu_open() && get_game_play() != NULL) {
-                    pc_cloud_storage_client_open(NULL);
-                    pc_dresser_ui_begin(NULL);
-                    mSM_open_submenu(&get_game_play()->submenu, mSM_OVL_INVENTORY, mSM_IV_OPEN_HANIWA_ENTRUST, 0);
-                }
-            } else if (th == HIT_STOR_PREV) {
-                pc_touch_buzz();
-                pc_cloud_storage_client_prev_page();
-                pc_dresser_ui_note_input();
-                sAdo_SysTrgStart(NA_SE_CURSOL);
-            } else if (th == HIT_STOR_NEXT) {
-                pc_touch_buzz();
-                pc_cloud_storage_client_next_page();
-                pc_dresser_ui_note_input();
-                sAdo_SysTrgStart(NA_SE_CURSOL);
-            } else if (th == HIT_BAG) {
-                latch_button(PAD_BUTTON_Y, "Y");
-                pc_touch_buzz();
-                pc_diag_milestone("touch inventory");
-            } else if (th == HIT_MAP) {
-                latch_button(PAD_BUTTON_X, "X");
-                pc_touch_buzz();
-                pc_diag_milestone("touch map");
-            } else if (th == HIT_CAM) {
-                pc_touch_cam_cycle();
-            } else if (th == HIT_SUB_TAB) {
-                handle_sub_tab_tap(tk);
-                pc_touch_buzz();
-            } else if (th == HIT_KEY) {
-                int i;
-                for (i = 0; i < hud.key_n; i++) {
-                    float r = (hud.kc[i] == ' ' || hud.kc[i] == '\n') ? hud.kr * 1.6f : hud.kr;
-                    if (hit_disc(s_tap_x, s_tap_y, hud.kx[i], hud.ky[i], r)) type_char(hud.kc[i]);
-                }
-            }
+
+    /* 2. Check if two fingers are simultaneously in HIT_PICTURE for 2-finger camera gestures */
+    for (i = 0; i < FINGERS; i++) {
+        if (s_fin[i].down && s_fin[i].hit == HIT_PICTURE) {
+            if (pic_fingers < 2) pic_idx[pic_fingers] = i;
+            pic_fingers++;
         }
     }
-    if (s_pulse_a) { latch_button(PAD_BUTTON_A, "A"); s_pulse_a = 0; pc_touch_buzz(); }
-    if (s_pulse_b) { latch_button(PAD_BUTTON_B, "B"); s_pulse_b = 0; pc_touch_buzz(); }
-    latch_consume(buttons);
-    down = read_point(&x, &y, &x2, &y2, &n);
-    rising = down && !s_pointer_was;
-    if (n >= 2 && g_pc_settings.touch_camera) {
-        float cur_dist = hypotf(x2 - x, y2 - y);
-        float mid_x = (x + x2) * 0.5f;
-        float mid_y = (y + y2) * 0.5f;
+    if (pic_fingers >= 2 && g_pc_settings.touch_camera && can_steer()) {
+        Finger* f0 = &s_fin[pic_idx[0]];
+        Finger* f1 = &s_fin[pic_idx[1]];
+        float cur_dist = hypotf(f1->x - f0->x, f1->y - f0->y);
+        float mid_x = (f0->x + f1->x) * 0.5f;
+        float mid_y = (f0->y + f1->y) * 0.5f;
+
+        f0->moved = 1;
+        f1->moved = 1;
+        s_have_target = 0;
+        s_drag_active = 0;
+        s_drag_moved = 0;
+        s_drag_slot = -1;
 
         if (!s_cam_two_finger_was || s_cam_prev_dist <= 0.0f) {
             s_cam_two_finger_was = 1;
@@ -1660,47 +2240,35 @@ void pc_touch_apply(unsigned short* buttons, signed char* stick_x, signed char* 
 
             if (s_cam_cooldown == 0) {
                 if (s_cam_accum_pinch > 35.0f) {
-                    /* Pinch out (spread fingers) -> Zoom in */
                     s_cam_pulse_y = 80;
                     s_cam_pulse_x = 0;
                     s_cam_pulse_timer = 3;
                     s_cam_cooldown = 14;
-                    s_cam_accum_pinch = 0.0f;
-                    s_cam_accum_dx = 0.0f;
-                    s_cam_accum_dy = 0.0f;
+                    s_cam_accum_pinch = s_cam_accum_dx = s_cam_accum_dy = 0.0f;
                     pc_touch_buzz();
                     pc_diag_milestone("pinch zoom in");
                 } else if (s_cam_accum_pinch < -35.0f) {
-                    /* Pinch in (contract fingers) -> Zoom out */
                     s_cam_pulse_y = -80;
                     s_cam_pulse_x = 0;
                     s_cam_pulse_timer = 3;
                     s_cam_cooldown = 14;
-                    s_cam_accum_pinch = 0.0f;
-                    s_cam_accum_dx = 0.0f;
-                    s_cam_accum_dy = 0.0f;
+                    s_cam_accum_pinch = s_cam_accum_dx = s_cam_accum_dy = 0.0f;
                     pc_touch_buzz();
                     pc_diag_milestone("pinch zoom out");
                 } else if (fabsf(s_cam_accum_dx) > 38.0f && fabsf(s_cam_accum_dx) > fabsf(s_cam_accum_dy) * 1.2f) {
-                    /* Two-finger swipe horizontal -> Rotate camera */
                     s_cam_pulse_x = (s_cam_accum_dx > 0.0f) ? 80 : -80;
                     s_cam_pulse_y = 0;
                     s_cam_pulse_timer = 3;
                     s_cam_cooldown = 14;
-                    s_cam_accum_pinch = 0.0f;
-                    s_cam_accum_dx = 0.0f;
-                    s_cam_accum_dy = 0.0f;
+                    s_cam_accum_pinch = s_cam_accum_dx = s_cam_accum_dy = 0.0f;
                     pc_touch_buzz();
                     pc_diag_milestone(s_cam_pulse_x > 0 ? "swipe rotate right" : "swipe rotate left");
                 } else if (fabsf(s_cam_accum_dy) > 38.0f && fabsf(s_cam_accum_dy) > fabsf(s_cam_accum_dx) * 1.2f) {
-                    /* Two-finger swipe vertical -> Zoom / tilt */
                     s_cam_pulse_y = (s_cam_accum_dy < 0.0f) ? 80 : -80;
                     s_cam_pulse_x = 0;
                     s_cam_pulse_timer = 3;
                     s_cam_cooldown = 14;
-                    s_cam_accum_pinch = 0.0f;
-                    s_cam_accum_dx = 0.0f;
-                    s_cam_accum_dy = 0.0f;
+                    s_cam_accum_pinch = s_cam_accum_dx = s_cam_accum_dy = 0.0f;
                     pc_touch_buzz();
                     pc_diag_milestone(s_cam_pulse_y > 0 ? "swipe zoom in" : "swipe zoom out");
                 }
@@ -1710,202 +2278,182 @@ void pc_touch_apply(unsigned short* buttons, signed char* stick_x, signed char* 
             if (cstick_x) *cstick_x = (signed char)s_cam_pulse_x;
             if (cstick_y) *cstick_y = (signed char)s_cam_pulse_y;
         }
-        s_have_target = 0;
-        s_drag_active = 0;
-        s_pointer_was = 1;
-        latch_consume(buttons);
-        return;
     } else {
         s_cam_two_finger_was = 0;
         s_cam_prev_dist = 0.0f;
     }
-    if (!down) {
-        if (s_drag_active) {
-            float ddx = s_last_x - s_drag_ox, ddy = s_last_y - s_drag_oy;
-            if (!tap_handled && (!s_drag_moved || (SDL_GetTicks() - s_drag_t0 < 250 && hypotf(ddx, ddy) < 22.0f))) {
-                if (can_steer()) begin_move(s_down_x, s_down_y, 1);
-                else on_picture_release(s_down_x, s_down_y);
+
+    /* 3. Process held fingers (multi-touch steering + action/sprint/tool/emote/dpad) */
+    for (i = 0; i < FINGERS; i++) {
+        Finger* f = &s_fin[i];
+        float dx, dy, dist;
+        if (!f->down) continue;
+        dx = f->x - f->ox;
+        dy = f->y - f->oy;
+        dist = hypotf(dx, dy);
+
+        if (f->hit == HIT_ACTION || f->hit == HIT_CONTEXT) {
+            *buttons |= PAD_BUTTON_A;
+        } else if (f->hit == HIT_BACK) {
+            if (!g_pc_paused) *buttons |= PAD_BUTTON_B;
+        } else if (f->hit == HIT_BAG) {
+            *buttons |= PAD_BUTTON_Y;
+        } else if (f->hit == HIT_MAP) {
+            *buttons |= PAD_BUTTON_X;
+        } else if (f->hit == HIT_DPAD_UP) {
+            *buttons |= PAD_BUTTON_UP;
+            if (stick_y && *stick_y == 0) *stick_y = 85;
+        } else if (f->hit == HIT_DPAD_DOWN) {
+            *buttons |= PAD_BUTTON_DOWN;
+            if (stick_y && *stick_y == 0) *stick_y = -85;
+        } else if (f->hit == HIT_DPAD_LEFT) {
+            *buttons |= PAD_BUTTON_LEFT;
+            if (stick_x && *stick_x == 0) *stick_x = -85;
+        } else if (f->hit == HIT_DPAD_RIGHT) {
+            *buttons |= PAD_BUTTON_RIGHT;
+            if (stick_x && *stick_x == 0) *stick_x = 85;
+        } else if (f->hit == HIT_TRIG_L) {
+            *buttons |= PAD_TRIGGER_L;
+        } else if (f->hit == HIT_TRIG_R) {
+            *buttons |= PAD_TRIGGER_R;
+        } else if (f->hit == HIT_TOOL) {
+            if (dist > 16.0f || (SDL_GetTicks() - f->t0) > 200) {
+                float gain = 2.0f;
+                f->moved = 1;
+                if (wheel_hold) *wheel_hold = 1;
+                if (pointer_x) *pointer_x = (int)((float)g_pc_window_w * 0.5f + (f->x - f->ox) * gain);
+                if (pointer_y) *pointer_y = (int)((float)g_pc_window_h * 0.5f + (f->y - f->oy) * gain);
             }
-            s_drag_active = 0;
-            s_drag_moved = 0;
-        }
-        if (!tap_handled && s_pointer_was && hypotf(s_last_x - s_down_x, s_last_y - s_down_y) < 36.0f) {
-            if (s_down_hit == HIT_SHEET_CLOSE) {
-                latch_button(PAD_BUTTON_B, "B");
-                s_sheet.active = 0;
-                s_sheet.swap_mode = 0;
-                pc_touch_buzz();
-                note_tap("sheet_close");
-            } else if (s_down_hit == HIT_SHEET_BELLS) {
-                mobile_sheet_handle_bells();
-            } else if (s_down_hit == HIT_SHEET_TAB) {
-                mobile_sheet_handle_tab(key);
-            } else if (s_down_hit == HIT_SHEET_CARD) {
-                mobile_sheet_handle_card(key);
-            } else if (s_down_hit == HIT_SHEET_ACT) {
-                mobile_sheet_handle_act(key);
-            } else if (s_down_hit == HIT_PICTURE && !can_steer()) on_picture_release(s_down_x, s_down_y);
-            else if (s_down_hit == HIT_SUB_TAB) {
-                handle_sub_tab_tap(key);
-                pc_touch_buzz();
-            } else if (s_down_hit == HIT_NUB) {
-                g_pc_settings.touch_stick = !g_pc_settings.touch_stick;
-                pc_settings_save();
-                pc_touch_buzz();
-                pc_diag_milestone(g_pc_settings.touch_stick ? "touch stick shown" : "touch stick hidden");
-            } else if (s_down_hit == HIT_MENU) {
-                pc_touch_buzz();
-                pc_diag_milestone("touch menu");
-                if (message_open() || submenu_open() || pc_settings_menu_active() || pc_play_online_menu_active() || pc_play_offline_menu_active())
-                    s_pulse_b = 1;
-                else if (g_pc_paused) pause_key(SDLK_ESCAPE);
-                else pc_pause_menu_toggle();
-            } else if (s_down_hit == HIT_CAM) {
-                float cdx = s_last_x - s_down_x;
-                if (cdx > 25.0f) {
-                    GAME_PLAY* play = get_game_play();
-                    if (play != NULL) {
-                        play->camera.indoor_direction_addition_idx = 2;
-                        sAdo_SysTrgStart(NA_SE_CAMERA_MOVE1);
-                        pc_touch_buzz();
-                        pc_diag_milestone("cam rotate right");
-                    }
-                } else if (cdx < -25.0f) {
-                    GAME_PLAY* play = get_game_play();
-                    if (play != NULL) {
-                        play->camera.indoor_direction_addition_idx = 0;
-                        sAdo_SysTrgStart(NA_SE_CAMERA_MOVE1);
-                        pc_touch_buzz();
-                        pc_diag_milestone("cam rotate left");
-                    }
-                } else {
-                    pc_touch_cam_cycle();
-                }
-            } else if (s_down_hit == HIT_KEY) {
-                Hud now;
-                hud_build(&now);
-                if (s_down_hit == HIT_KEY && key >= 0) { /* key index stored below */ }
-                (void)now;
-            }
-        }
-        if (s_pointer_was && s_down_hit == HIT_KEY) {
-            Hud now;
-            int i, which = -1;
-            hud_build(&now);
-            for (i = 0; i < now.key_n; i++) {
-                float r = (now.kc[i] == ' ' || now.kc[i] == '\n') ? now.kr * 1.6f : now.kr;
-                if (hit_disc(s_down_x, s_down_y, now.kx[i], now.ky[i], r)) which = i;
-            }
-            if (which >= 0) type_char(now.kc[which]);
-        }
-        if (s_pointer_was && submenu_open() && !s_sheet.active) {
-            float dx = s_last_x - s_down_x, dy = s_last_y - s_down_y;
-            float dist = hypotf(dx, dy);
-            if (dist > 45.0f) {
-                if (fabsf(dx) > fabsf(dy)) {
-                    s_swipe = (dx > 0.0f) ? 1 : -1;
-                } else {
-                    s_swipe = (dy < 0.0f) ? 2 : -2;
-                }
-                pc_touch_buzz();
-                pc_diag_milestone("submenu swipe");
-            }
-        } else if (s_pointer_was && s_hud == HUD_MENU) {
-            float dx = s_last_x - s_down_x, dy = s_last_y - s_down_y;
-            if (fabsf(dy) > 56.0f && fabsf(dy) > fabsf(dx)) {
-                s_swipe = (dy < 0.0f) ? 70 : -70;
-                pc_diag_milestone("swipe");
-            }
-        }
-        s_pointer_was = 0;
-        s_down_hit = HIT_NONE;
-        s_tap_logged = 0;
-        s_knob_x = s_knob_y = 0.0f;
-    } else {
-        hit = classify(x, y, &hud, &key);
-        if (g_pc_window_w != s_lay_w || g_pc_window_h != s_lay_h) {
-            s_lay_w = g_pc_window_w;
-            s_lay_h = g_pc_window_h;
-            if (!rising) s_down_hit = hit; /* fold or unfold: the finger keeps whatever disc is under it now */
-        }
-        if (rising) {
-            s_down_x = x; s_down_y = y; s_down_hit = hit;
-            s_tap_logged = 0;
-            if (hit == HIT_SHEET_CLOSE) {
-                *buttons |= PAD_BUTTON_B;
-                s_sheet.active = 0;
-                s_sheet.swap_mode = 0;
-                pc_touch_buzz();
-                note_tap("sheet_close");
-            } else if (hit == HIT_SHEET_BELLS) {
-                mobile_sheet_handle_bells();
-            } else if (hit == HIT_SHEET_TAB) {
-                mobile_sheet_handle_tab(key);
-            } else if (hit == HIT_SHEET_CARD) {
-                mobile_sheet_handle_card(key);
-            } else if (hit == HIT_SHEET_ACT) {
-                mobile_sheet_handle_act(key);
-            }
-            if (hit == HIT_PICTURE && can_steer()) {
-                s_drag_active = 1;
-                s_drag_ox = x; s_drag_oy = y;
-                s_drag_cx = x; s_drag_cy = y;
-                s_drag_t0 = SDL_GetTicks();
-                s_drag_moved = 0;
-            } else if (hit != HIT_NONE && hit != HIT_PICTURE) {
-                s_have_target = 0;
-                s_drag_active = 0;
-            }
-            if (hit == HIT_SUB_TAB) {
-                handle_sub_tab_tap(key);
-                pc_touch_buzz();
-            }
-            if (hit == HIT_BAG) *buttons |= PAD_BUTTON_Y;
-            if (hit == HIT_MAP) *buttons |= PAD_BUTTON_X;
-            if (hit == HIT_ACTION || hit == HIT_CONTEXT) *buttons |= PAD_BUTTON_A;
-            if ((hit == HIT_BACK || hit == HIT_CLOSE) && !g_pc_paused) *buttons |= PAD_BUTTON_B;
-        } else if (s_down_hit == HIT_PICTURE && can_steer() && s_drag_active) {
-            float dx = x - s_drag_ox;
-            float dy = y - s_drag_oy;
-            float dist = hypotf(dx, dy);
-            float max_r = 75.0f * ((float)g_pc_settings.touch_hud_scale / 100.0f);
-            if (max_r < 35.0f) max_r = 35.0f;
-            s_drag_cx = x; s_drag_cy = y;
-            if (dist > 12.0f) {
-                float clamp_d = dist > max_r ? max_r : dist;
-                float sx = (dx / dist) * (clamp_d / max_r) * 127.0f;
-                float sy = (-dy / dist) * (clamp_d / max_r) * 127.0f;
-                s_drag_moved = 1;
+        } else if (f->hit == HIT_EMOTE) {
+            float gain = 2.0f;
+            f->moved = 1;
+            if (emote_hold) *emote_hold = 1;
+            if (pointer_x) *pointer_x = (int)((float)g_pc_window_w * 0.5f + (f->x - f->ox) * gain);
+            if (pointer_y) *pointer_y = (int)((float)g_pc_window_h * 0.5f + (f->y - f->oy) * gain);
+        } else if (f->hit == HIT_STICK && s_stick_slot == i && hud.show_stick) {
+            float sdx = f->x - hud.sx, sdy = f->y - hud.sy;
+            float sdist = hypotf(sdx, sdy);
+            float max_r = hud.sr > 24.0f ? hud.sr : 54.0f;
+            float clamp_d = sdist > max_r ? max_r : sdist;
+            s_stick_kx = hud.sx + (sdist > 0.001f ? (sdx / sdist) * clamp_d : 0.0f);
+            s_stick_ky = hud.sy + (sdist > 0.001f ? (sdy / sdist) * clamp_d : 0.0f);
+            if (sdist > 8.0f && can_steer()) {
+                float sx = (sdx / sdist) * (clamp_d / max_r) * 127.0f;
+                float sy = (-sdy / sdist) * (clamp_d / max_r) * 127.0f;
                 s_have_target = 0;
                 if (stick_x && stick_y && *stick_x == 0 && *stick_y == 0) {
                     *stick_x = (signed char)sx;
                     *stick_y = (signed char)sy;
                 }
-                if (dist > max_r * 0.68f && buttons != NULL) {
-                    *buttons |= PAD_BUTTON_B; /* Long drag runs! */
+                if (sdist > max_r * 0.72f) {
+                    *buttons |= PAD_BUTTON_B;
+                }
+            }
+        } else if (f->hit == HIT_PICTURE && pic_fingers < 2) {
+            if (can_steer() && s_drag_slot == i && s_drag_active) {
+                float max_r = 75.0f * ((float)g_pc_settings.touch_hud_scale / 100.0f);
+                if (max_r < 38.0f) max_r = 38.0f;
+                s_drag_cx = f->x;
+                s_drag_cy = f->y;
+                if (dist > drag_slop || s_drag_moved) {
+                    float clamp_d = dist > max_r ? max_r : dist;
+                    float sx = (dist > 0.001f) ? (dx / dist) * (clamp_d / max_r) * 127.0f : 0.0f;
+                    float sy = (dist > 0.001f) ? (-dy / dist) * (clamp_d / max_r) * 127.0f : 0.0f;
+                    s_drag_moved = 1;
+                    f->moved = 1;
+                    s_have_target = 0;
+                    if (stick_x && stick_y && *stick_x == 0 && *stick_y == 0) {
+                        *stick_x = (signed char)sx;
+                        *stick_y = (signed char)sy;
+                    }
+                    if (dist > max_r * 0.68f) {
+                        *buttons |= PAD_BUTTON_B;
+                    }
+                }
+            } else if (choice_is_up()) {
+                if (dy < -30.0f && stick_y && *stick_y == 0) {
+                    *stick_y = 80;
+                } else if (dy > 30.0f && stick_y && *stick_y == 0) {
+                    *stick_y = -80;
                 }
             }
         }
-        s_last_x = x; s_last_y = y;
-        if (choice_is_up() && s_pointer_was) {
-            float dy = y - s_down_y;
-            if (dy < -30.0f && stick_y && *stick_y == 0) {
-                *stick_y = 80;
-            } else if (dy > 30.0f && stick_y && *stick_y == 0) {
-                *stick_y = -80;
+    }
+
+    /* 4. Process finger-up events */
+    for (i = 0; i < FINGERS; i++) {
+        Finger* f = &s_fin[i];
+        float dx, dy, dist;
+        Uint32 dt;
+        if (!f->just_up) continue;
+        f->just_up = 0;
+        dx = f->x - f->ox;
+        dy = f->y - f->oy;
+        dist = hypotf(dx, dy);
+        dt = SDL_GetTicks() - f->t0;
+
+        if (f->hit == HIT_STICK && s_stick_slot == i) {
+            s_stick_slot = -1;
+            s_stick_kx = 0.0f;
+            s_stick_ky = 0.0f;
+        } else if (f->hit == HIT_TOOL) {
+            if (!f->moved && dist < tap_slop) {
+                equip_next_tool();
+            }
+        } else if (f->hit == HIT_CAM) {
+            if (dx > 25.0f) {
+                GAME_PLAY* play = get_game_play();
+                if (play != NULL) {
+                    play->camera.indoor_direction_addition_idx = 2;
+                    sAdo_SysTrgStart(NA_SE_CAMERA_MOVE1);
+                    pc_touch_buzz();
+                    pc_diag_milestone("cam rotate right");
+                }
+            } else if (dx < -25.0f) {
+                GAME_PLAY* play = get_game_play();
+                if (play != NULL) {
+                    play->camera.indoor_direction_addition_idx = 0;
+                    sAdo_SysTrgStart(NA_SE_CAMERA_MOVE1);
+                    pc_touch_buzz();
+                    pc_diag_milestone("cam rotate left");
+                }
+            } else {
+                pc_touch_cam_cycle();
+            }
+        } else if (f->hit == HIT_PICTURE) {
+            if (s_drag_slot == i) {
+                if (!f->moved && (!s_drag_moved || (dt < 240 && dist < tap_slop))) {
+                    if (can_steer()) begin_move(f->ox, f->oy, 1);
+                    else on_picture_release(f->ox, f->oy);
+                }
+                s_drag_active = 0;
+                s_drag_moved = 0;
+                s_drag_slot = -1;
+            } else if (!can_steer() && !f->moved) {
+                if (dist < tap_slop) {
+                    on_picture_release(f->ox, f->oy);
+                } else if (submenu_open() && !s_sheet.active && dist > 45.0f) {
+                    if (fabsf(dx) > fabsf(dy)) {
+                        s_swipe = (dx > 0.0f) ? 1 : -1;
+                    } else {
+                        s_swipe = (dy < 0.0f) ? 2 : -2;
+                    }
+                    pc_touch_buzz();
+                    pc_diag_milestone("submenu swipe");
+                } else if (s_hud == HUD_MENU && fabsf(dy) > 52.0f && fabsf(dy) > fabsf(dx)) {
+                    s_swipe = (dy < 0.0f) ? 70 : -70;
+                    pc_diag_milestone("swipe");
+                }
             }
         }
-        if (s_down_hit == HIT_ACTION || hit == HIT_ACTION || s_down_hit == HIT_CONTEXT || hit == HIT_CONTEXT) {
-            *buttons |= PAD_BUTTON_A;
-        } else if (s_down_hit == HIT_BACK || hit == HIT_BACK || s_down_hit == HIT_CLOSE || hit == HIT_CLOSE) {
-            if (!g_pc_paused) *buttons |= PAD_BUTTON_B;
-        } else if (s_down_hit == HIT_BAG || hit == HIT_BAG) {
-            *buttons |= PAD_BUTTON_Y;
-        } else if (s_down_hit == HIT_MAP || hit == HIT_MAP) {
-            *buttons |= PAD_BUTTON_X;
-        }
-        s_pointer_was = 1;
+
+        f->hit = HIT_NONE;
+        f->key = -1;
+        f->moved = 0;
     }
+
+    if (s_pulse_a) { latch_button(PAD_BUTTON_A, "A"); s_pulse_a = 0; pc_touch_buzz(); }
+    if (s_pulse_b) { latch_button(PAD_BUTTON_B, "B"); s_pulse_b = 0; pc_touch_buzz(); }
     latch_consume(buttons);
     if (s_swipe != 0) {
         if (s_swipe == 1 && stick_x != NULL && *stick_x == 0) *stick_x = 90;
@@ -1919,9 +2467,6 @@ void pc_touch_apply(unsigned short* buttons, signed char* stick_x, signed char* 
         (void)steer_toward(s_target_x, s_target_z, stick_x, stick_y);
     if (s_running && s_have_target && can_steer() && buttons != NULL) *buttons |= PAD_BUTTON_B;
     if (!s_have_target) s_running = 0;
-    /* Choices are confirmed by Action button (A), screen tap, or bubble */
-    s_choice_confirm = 0;
-    (void)key;
 }
 
 void pc_touch_draw(struct game_s* game) { (void)game; }
@@ -2288,13 +2833,6 @@ static void draw_word_raw(const char* s, float cx, float cy, float pix, float r,
     draw_str_raw(s, cx, cy, pix * 1.05f, r, g, b, a, 12);
 }
 
-static void glyph(char ch, float cx, float cy, float s) {
-    char str[2];
-    str[0] = ch;
-    str[1] = 0;
-    draw_text_ac(str, cx, cy, s * 2.3f, 0.16f, 0.18f, 0.15f, 0.95f, 1, 1);
-}
-
 static void draw_left(const char* s, float x, float cy, float pix) {
     draw_str_left_raw(s, x, cy, pix, 0.16f, 0.18f, 0.15f, 0.95f, 32);
 }
@@ -2433,10 +2971,42 @@ static void mobile_sheet_compute_dims(float W, float H, float* out_ui, float* ou
     if (out_act_h) *out_act_h = act_h;
 }
 
+static int mobile_sheet_should_show(void) {
+    GAME_PLAY* play = get_game_play();
+    if (!g_pc_layout_portrait || pc_creator_menu_active() || keys_up()) return 0;
+    if (!submenu_open() || play == NULL) return 0;
+    if (play->submenu.menu_type != mSM_OVL_INVENTORY || play->submenu.param0 != mSM_IV_OPEN_NORMAL) return 0;
+    if (pc_dresser_ui_active() || pc_dresser_ui_basket()) return 0;
+    if (play->submenu.overlay == NULL || play->submenu.overlay->inventory_ovl == NULL) return 0;
+    if (play->submenu.overlay->tag_ovl != NULL && play->submenu.overlay->tag_ovl->tags[0].type != mTG_TYPE_NONE) return 0;
+    if (!submenu_hand_is_empty(&play->submenu)) return 0;
+    return 1;
+}
+
+static void mobile_sheet_letter_rect(float W, float margin_x, float ui, int i,
+                                     float* ox0, float* oy0, float* ox1, float* oy1) {
+    int c = i % 2, r = i / 2;
+    float gap_x = 10.0f * ui, gap_y = 8.0f * ui;
+    float grid_top = s_sheet.card_y0[0];
+    float grid_bot = s_sheet.detail_y1;
+    float lw = (W - 2.0f * margin_x - gap_x) / 2.0f;
+    float lh = (grid_bot - grid_top - 4.0f * gap_y) / 5.0f;
+    float x0 = margin_x + (float)c * (lw + gap_x);
+    float y0 = grid_top + (float)r * (lh + gap_y);
+    *ox0 = x0;
+    *oy0 = y0;
+    *ox1 = x0 + lw;
+    *oy1 = y0 + lh;
+}
+
 int pc_touch_sheet_top_y(void) {
     float sheet_y0;
     if (g_pc_window_w < 2 || g_pc_window_h < 2) return 0;
-    if (!pc_touch_enabled() || !g_pc_layout_portrait || !submenu_open()) return 0;
+    if (!pc_touch_enabled() || !g_pc_layout_portrait) return 0;
+    if (keys_up()) {
+        return (int)((float)g_pc_window_h * 0.54f);
+    }
+    if (!mobile_sheet_should_show()) return 0;
     mobile_sheet_compute_dims((float)g_pc_window_w, (float)g_pc_window_h,
                               NULL, &sheet_y0, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL);
     return (int)sheet_y0;
@@ -2448,22 +3018,17 @@ static void mobile_sheet_layout(void) {
     float margin_x, gap_x, gap_y, card_w, card_h, cur_y;
     int c, r, i;
 
-    if (!g_pc_layout_portrait || pc_creator_menu_active()) {
+    if (!mobile_sheet_should_show()) {
         s_sheet.active = 0;
         s_sheet.swap_mode = 0;
         return;
     }
-    {
-        GAME_PLAY* play = get_game_play();
-        if (!submenu_open() || play == NULL || play->submenu.overlay == NULL || play->submenu.overlay->inventory_ovl == NULL) {
-            s_sheet.active = 0;
-            s_sheet.swap_mode = 0;
-            return;
-        }
-    }
     s_sheet.active = 1;
     if (s_sheet.sel_slot < 0 || s_sheet.sel_slot >= 15) {
         s_sheet.sel_slot = 0;
+    }
+    if (s_sheet.sel_mail < 0 || s_sheet.sel_mail >= 10) {
+        s_sheet.sel_mail = 0;
     }
 
     mobile_sheet_compute_dims(W, H, &ui, &sheet_y0, &margin_x, &gap_x, &gap_y,
@@ -2538,7 +3103,28 @@ static void mobile_sheet_layout(void) {
             item = priv->inventory.pockets[s_sheet.sel_slot];
         }
 
-        if (s_sheet.current_tab != 0) {
+        if (s_sheet.current_tab == 1) {
+            Mail_c* sel_m = (priv != NULL && s_sheet.sel_mail >= 0 && s_sheet.sel_mail < 10)
+                            ? &priv->mail[s_sheet.sel_mail] : NULL;
+            if (sel_m != NULL && !mMl_check_not_used_mail(sel_m)) {
+                int nact = 0;
+                s_sheet.action_labels[nact] = (sel_m->content.font == mMl_FONT_SEND) ? "REWRITE" : "READ";
+                s_sheet.action_ids[nact++] = 20;
+                if (sel_m->present != EMPTY_NO) {
+                    s_sheet.action_labels[nact] = "OPEN GIFT";
+                    s_sheet.action_ids[nact++] = 21;
+                }
+                s_sheet.action_labels[nact] = "OPTIONS";
+                s_sheet.action_ids[nact++] = 22;
+                s_sheet.action_labels[nact] = "POCKETS";
+                s_sheet.action_ids[nact++] = 5;
+                s_sheet.num_actions = nact;
+            } else {
+                s_sheet.action_labels[0] = "BACK TO POCKETS";
+                s_sheet.action_ids[0] = 5;
+                s_sheet.num_actions = 1;
+            }
+        } else if (s_sheet.current_tab != 0) {
             s_sheet.action_labels[0] = "BACK TO POCKETS";
             s_sheet.action_ids[0] = 5;
             s_sheet.num_actions = 1;
@@ -2569,9 +3155,12 @@ static void mobile_sheet_layout(void) {
             } else if (item >= ITM_MONEY_START && item <= ITM_MONEY_END) {
                 s_sheet.action_labels[0] = "DEPOSIT";
                 s_sheet.action_ids[0] = 16;
+            } else if (ITEM_IS_PAPER(item)) {
+                s_sheet.action_labels[0] = "WRITE";
+                s_sheet.action_ids[0] = 17;
             } else {
-                s_sheet.action_labels[0] = "SELECT";
-                s_sheet.action_ids[0] = 10;
+                s_sheet.action_labels[0] = "USE";
+                s_sheet.action_ids[0] = 18;
             }
             s_sheet.action_labels[1] = "DROP";
             s_sheet.action_ids[1] = 2;
@@ -2637,13 +3226,45 @@ static int mobile_sheet_hit(float x, float y, int* key) {
                 return HIT_SHEET_CARD;
             }
         }
+    } else if (s_sheet.current_tab == 1) {
+        float W = (float)g_pc_window_w, H = (float)g_pc_window_h, ui, margin_x;
+        mobile_sheet_compute_dims(W, H, &ui, NULL, &margin_x, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL);
+        for (i = 0; i < 10; i++) {
+            float x0, y0, x1, y1;
+            mobile_sheet_letter_rect(W, margin_x, ui, i, &x0, &y0, &x1, &y1);
+            if (x >= x0 && x <= x1 && y >= y0 && y <= y1) {
+                *key = i;
+                return HIT_SHEET_CARD;
+            }
+        }
     }
     return HIT_SHEET_BODY;
 }
 
 static void mobile_sheet_handle_card(int slot) {
     Private_c* priv = Now_Private;
-    if (priv == NULL || slot < 0 || slot >= 15) return;
+    if (priv == NULL) return;
+    if (s_sheet.current_tab == 1) {
+        if (slot < 0 || slot >= 10) return;
+        s_sheet.sel_mail = slot;
+        sAdo_SysTrgStart(NA_SE_CURSOL);
+        pc_touch_buzz();
+        note_tap("sheet_mail_select");
+        if (submenu_open()) {
+            GAME_PLAY* play = get_game_play();
+            if (play != NULL && play->submenu.overlay != NULL && play->submenu.overlay->tag_ovl != NULL) {
+                mTG_tag_c* tag = &play->submenu.overlay->tag_ovl->tags[0];
+                tag->table = mTG_TABLE_MAIL;
+                tag->tag_col = slot % 2;
+                tag->tag_row = slot / 2;
+                if (play->submenu.overlay->tag_ovl->init_tag_data_item_win_proc != NULL) {
+                    play->submenu.overlay->tag_ovl->init_tag_data_item_win_proc(&play->submenu);
+                }
+            }
+        }
+        return;
+    }
+    if (slot < 0 || slot >= 15) return;
     if (s_sheet.swap_mode) {
         int src = s_sheet.swap_source;
         int dst = slot;
@@ -2791,7 +3412,7 @@ static void mobile_sheet_handle_act(int act_id) {
                 }
             }
         }
-    } else if (act_id == 2) { /* DROP */
+    } else if (act_id == 17) { /* WRITE (Stationery) */
         if (submenu_open() && s_sheet.sel_slot >= 0 && s_sheet.sel_slot < 15) {
             GAME_PLAY* play = get_game_play();
             if (play != NULL && play->submenu.overlay != NULL && play->submenu.overlay->tag_ovl != NULL) {
@@ -2803,7 +3424,59 @@ static void mobile_sheet_handle_act(int act_id) {
                     play->submenu.overlay->tag_ovl->init_tag_data_item_win_proc(&play->submenu);
                 }
                 s_pulse_a = 1;
-                s_pending_drop = 1;
+                s_pending_row = 1; /* Write a letter */
+                pc_touch_buzz();
+                note_tap("sheet_write");
+            }
+        }
+    } else if (act_id == 18) { /* USE (open native item command menu) */
+        if (submenu_open() && s_sheet.sel_slot >= 0 && s_sheet.sel_slot < 15) {
+            GAME_PLAY* play = get_game_play();
+            if (play != NULL && play->submenu.overlay != NULL && play->submenu.overlay->tag_ovl != NULL) {
+                mTG_tag_c* tag = &play->submenu.overlay->tag_ovl->tags[0];
+                tag->table = mTG_TABLE_ITEM;
+                tag->tag_col = s_sheet.sel_slot % 5;
+                tag->tag_row = s_sheet.sel_slot / 5;
+                if (play->submenu.overlay->tag_ovl->init_tag_data_item_win_proc != NULL) {
+                    play->submenu.overlay->tag_ovl->init_tag_data_item_win_proc(&play->submenu);
+                }
+                s_pulse_a = 1;
+                s_pending_row = -1;
+                pc_touch_buzz();
+                note_tap("sheet_item_menu");
+            }
+        }
+    } else if (act_id == 20 || act_id == 21 || act_id == 22) { /* LETTERS: READ / OPEN GIFT / OPTIONS */
+        if (submenu_open() && s_sheet.sel_mail >= 0 && s_sheet.sel_mail < 10) {
+            GAME_PLAY* play = get_game_play();
+            if (play != NULL && play->submenu.overlay != NULL && play->submenu.overlay->tag_ovl != NULL) {
+                mTG_tag_c* tag = &play->submenu.overlay->tag_ovl->tags[0];
+                tag->table = mTG_TABLE_MAIL;
+                tag->tag_col = s_sheet.sel_mail % 2;
+                tag->tag_row = s_sheet.sel_mail / 2;
+                if (play->submenu.overlay->tag_ovl->init_tag_data_item_win_proc != NULL) {
+                    play->submenu.overlay->tag_ovl->init_tag_data_item_win_proc(&play->submenu);
+                }
+                s_pulse_a = 1;
+                s_pending_row = (act_id == 20) ? 0 : ((act_id == 21) ? 2 : -1);
+                pc_touch_buzz();
+                note_tap(act_id == 20 ? "sheet_mail_read" : (act_id == 21 ? "sheet_mail_gift" : "sheet_mail_menu"));
+            }
+        }
+    } else if (act_id == 2) { /* DROP */
+        if (submenu_open() && s_sheet.sel_slot >= 0 && s_sheet.sel_slot < 15) {
+            GAME_PLAY* play = get_game_play();
+            if (play != NULL && play->submenu.overlay != NULL && play->submenu.overlay->tag_ovl != NULL) {
+                mTG_tag_c* tag = &play->submenu.overlay->tag_ovl->tags[0];
+                mActor_name_t it = priv->inventory.pockets[s_sheet.sel_slot];
+                tag->table = mTG_TABLE_ITEM;
+                tag->tag_col = s_sheet.sel_slot % 5;
+                tag->tag_row = s_sheet.sel_slot / 5;
+                if (play->submenu.overlay->tag_ovl->init_tag_data_item_win_proc != NULL) {
+                    play->submenu.overlay->tag_ovl->init_tag_data_item_win_proc(&play->submenu);
+                }
+                s_pulse_a = 1;
+                s_pending_row = ITEM_IS_PAPER(it) ? 2 : 1;
                 pc_touch_buzz();
                 note_tap("sheet_drop_start");
             }
@@ -3066,26 +3739,32 @@ static void mobile_sheet_draw(void) {
     } else if (s_sheet.current_tab == 1) {
         /* Letters Tab (10 letter slots) */
         for (i = 0; i < 10; i++) {
-            int c = i % 2, r = i / 2;
-            float gap_x = 10.0f * ui, gap_y = 8.0f * ui;
-            float grid_top = s_sheet.card_y0[0];
-            float grid_bot = s_sheet.detail_y1;
-            float lw = (W - 2.0f * margin_x - gap_x) / 2.0f;
-            float lh = (grid_bot - grid_top - 4.0f * gap_y) / 5.0f;
-            float x0 = margin_x + (float)c * (lw + gap_x);
-            float y0 = grid_top + (float)r * (lh + gap_y);
-            float x1 = x0 + lw, y1 = y0 + lh;
-            float cx = (x0 + x1) * 0.5f, cy = (y0 + y1) * 0.5f;
+            float x0, y0, x1, y1;
+            float cx, cy;
             Mail_c* m = &priv->mail[i];
+            int empty_mail = mMl_check_not_used_mail(m);
+            mobile_sheet_letter_rect(W, margin_x, ui, i, &x0, &y0, &x1, &y1);
+            cx = (x0 + x1) * 0.5f;
+            cy = (y0 + y1) * 0.5f;
 
+            if (s_sheet.sel_mail == i) {
+                round_rect(x0 - 4.0f * ui, y0 - 4.0f * ui, x1 + 4.0f * ui, y1 + 4.0f * ui, 15.0f * ui, 0.20f, 0.55f, 0.98f, 0.95f);
+            }
             round_rect(x0 + 1.5f * ui, y0 + 2.0f * ui, x1 + 1.5f * ui, y1 + 2.0f * ui, 12.0f * ui, 0.05f, 0.08f, 0.05f, 0.14f);
-            round_rect(x0, y0, x1, y1, 12.0f * ui, 1.0f, 1.0f, 1.0f, 0.98f);
-            round_rect(x0 + 4.0f * ui, y0 + 4.0f * ui, x1 - 4.0f * ui, y0 + 11.0f * ui, 3.0f * ui, 0.95f, 0.50f, 0.45f, 0.95f);
+            round_rect(x0, y0, x1, y1, 12.0f * ui,
+                       empty_mail ? 0.92f : 1.0f, empty_mail ? 0.91f : 1.0f, empty_mail ? 0.88f : 1.0f,
+                       empty_mail ? 0.78f : 0.98f);
+            round_rect(x0 + 4.0f * ui, y0 + 4.0f * ui, x1 - 4.0f * ui, y0 + 11.0f * ui, 3.0f * ui,
+                       empty_mail ? 0.78f : 0.95f, empty_mail ? 0.74f : 0.50f, empty_mail ? 0.72f : 0.45f, 0.95f);
 
-            char sname[16];
-            get_clean_string(m->header.sender.personalID.player_name, 8, sname, sizeof(sname));
-            if (sname[0] != 0) {
-                snprintf(buf, sizeof(buf), "From: %s", sname);
+            if (!empty_mail) {
+                char sname[16];
+                get_clean_string(m->header.sender.personalID.player_name, 8, sname, sizeof(sname));
+                if (sname[0] != 0) {
+                    snprintf(buf, sizeof(buf), "From: %s", sname);
+                } else {
+                    snprintf(buf, sizeof(buf), "Letter #%d", i + 1);
+                }
                 draw_text_ac(buf, cx, cy + 2.0f * ui, 2.7f * ui, 0.16f, 0.18f, 0.16f, 1.0f, 1, 18);
                 if (m->present != EMPTY_NO) {
                     pill_button_shadow(x1 - 34.0f * ui, cy + 2.0f * ui, 54.0f * ui, 22.0f * ui, 0.96f, 0.78f, 0.18f, 1.0f);
@@ -3162,11 +3841,11 @@ static void mobile_sheet_draw(void) {
             int aid = s_sheet.action_ids[i];
             float br = 0.32f, bg = 0.68f, bb = 0.48f, tr = 1.0f, tg = 1.0f, tb = 1.0f;
 
-            if (aid == 10 || aid == 12 || aid == 13 || aid == 15 || aid == 16 || aid == 30) {
+            if (aid == 10 || aid == 12 || aid == 13 || aid == 15 || aid == 16 || aid == 17 || aid == 18 || aid == 20 || aid == 21 || aid == 30) {
                 br = 0.20f; bg = 0.72f; bb = 0.42f;
             } else if (aid == 2) {
                 br = 0.90f; bg = 0.35f; bb = 0.32f;
-            } else if (aid == 3) {
+            } else if (aid == 3 || aid == 22) {
                 br = 0.96f; bg = 0.68f; bb = 0.18f;
                 tr = tg = tb = 0.15f;
             } else if (aid == 11) {
@@ -3358,6 +4037,17 @@ void pc_touch_present(void) {
         disc(kx, ky, 24.0f, 0.36f, 0.65f, 0.45f, 0.92f);
         disc(kx, ky - 4.0f, 15.0f, 0.95f, 0.98f, 0.94f, 0.35f);
     }
+    if (h.show_stick) {
+        float kx = (s_stick_slot >= 0) ? s_stick_kx : h.sx;
+        float ky = (s_stick_slot >= 0) ? s_stick_ky : h.sy;
+        float kr = h.sr * 0.44f;
+        disc(h.sx, h.sy, h.sr, 0.94f, 0.95f, 0.90f, 0.24f);
+        disc(h.sx, h.sy, h.sr - 3.0f, 0.16f, 0.20f, 0.16f, 0.16f);
+        disc(h.sx, h.sy, 6.0f, 0.95f, 0.96f, 0.92f, 0.28f);
+        disc(kx + 2.0f, ky + 3.0f, kr, 0.05f, 0.06f, 0.05f, 0.28f);
+        disc(kx, ky, kr, (s_stick_slot >= 0) ? 0.36f : 0.95f, (s_stick_slot >= 0) ? 0.68f : 0.96f, (s_stick_slot >= 0) ? 0.46f : 0.92f, 0.88f);
+        disc(kx, ky - kr * 0.16f, kr * 0.64f, 1.0f, 1.0f, 1.0f, 0.32f);
+    }
     if (h.show_storage) {
         button(h.storage_x, h.storage_y, h.qr, 0.72f, 0.84f, 0.96f);
         draw_word("Store", h.storage_x, h.storage_y, h.qr * 0.13f);
@@ -3384,6 +4074,35 @@ void pc_touch_present(void) {
         button(h.cam_x, h.cam_y, h.cam_r, 0.92f, 0.88f, 0.96f);
         draw_word("Cam", h.cam_x, h.cam_y, h.cam_r * 0.14f);
     }
+    if (h.show_tool) {
+        button(h.tool_x, h.tool_y, h.tool_r, 0.96f, 0.89f, 0.72f);
+        draw_word("Tool", h.tool_x, h.tool_y, h.tool_r * 0.13f);
+    }
+    if (h.show_emote) {
+        button(h.emote_x, h.emote_y, h.emote_r, 0.98f, 0.84f, 0.84f);
+        draw_word("Emote", h.emote_x, h.emote_y, h.emote_r * 0.12f);
+    }
+    if (h.show_chat) {
+        button(h.chat_x, h.chat_y, h.chat_r, 0.82f, 0.92f, 0.98f);
+        draw_word("Chat", h.chat_x, h.chat_y, h.chat_r * 0.13f);
+    }
+    if (h.show_dpad) {
+        float step = h.dpad_r * 1.35f;
+        button(h.dpad_cx, h.dpad_cy - step, h.dpad_r, 0.93f, 0.91f, 0.86f);
+        draw_word("Up", h.dpad_cx, h.dpad_cy - step, h.dpad_r * 0.15f);
+        button(h.dpad_cx, h.dpad_cy + step, h.dpad_r, 0.93f, 0.91f, 0.86f);
+        draw_word("Dn", h.dpad_cx, h.dpad_cy + step, h.dpad_r * 0.15f);
+        button(h.dpad_cx - step, h.dpad_cy, h.dpad_r, 0.93f, 0.91f, 0.86f);
+        draw_word("<", h.dpad_cx - step, h.dpad_cy, h.dpad_r * 0.18f);
+        button(h.dpad_cx + step, h.dpad_cy, h.dpad_r, 0.93f, 0.91f, 0.86f);
+        draw_word(">", h.dpad_cx + step, h.dpad_cy, h.dpad_r * 0.18f);
+    }
+    if (h.show_trigs) {
+        button(h.trig_lx, h.trig_ly, h.trig_r, 0.84f, 0.90f, 0.96f);
+        draw_word("L", h.trig_lx, h.trig_ly, h.trig_r * 0.18f);
+        button(h.trig_rx, h.trig_ry, h.trig_r, 0.84f, 0.90f, 0.96f);
+        draw_word("R", h.trig_rx, h.trig_ry, h.trig_r * 0.18f);
+    }
     if (h.show_back) {
         button(h.bx, h.by, h.br, 0.86f, 0.50f, 0.44f);
         draw_word("B", h.bx, h.by, h.br * 0.16f);
@@ -3400,14 +4119,14 @@ void pc_touch_present(void) {
         disc(h.mx + h.mr * 0.16f, h.my - h.mr * 0.12f, h.mr * 0.22f, 0.36f, 0.52f, 0.40f, 0.95f);
     }
     if (h.show_close) {
-        if (submenu_open()) {
+        if (submenu_open() && !h.show_keys) {
             disc_raw(h.close_x + 2.0f, h.close_y + 3.0f, h.close_r, 0.05f, 0.06f, 0.05f, 0.35f);
             disc_raw(h.close_x, h.close_y, h.close_r, 0.95f, 0.88f, 0.82f, 0.96f);
             disc_raw(h.close_x, h.close_y - h.close_r * 0.18f, h.close_r * 0.70f, 1.0f, 1.0f, 1.0f, 0.30f);
             draw_word_raw("B", h.close_x, h.close_y, h.close_r * 0.22f, 0.15f, 0.15f, 0.15f, 1.0f);
         } else {
             button(h.close_x, h.close_y, h.close_r, 0.93f, 0.90f, 0.84f);
-            draw_word("Back", h.close_x, h.close_y + h.close_r + 14.0f, h.close_r * 0.16f);
+            draw_word("Back", h.close_x, h.close_y, h.close_r * 0.14f);
         }
     }
     if (h.show_context) {
@@ -3425,15 +4144,18 @@ void pc_touch_present(void) {
     }
     if (h.choice_n > 0) {
         mChoice_c* c = mChoice_Get_base_window_p();
+        float cw = (h.choice_w > 0.0f) ? h.choice_w : (h.choice_r * 2.2f);
+        float ch = h.choice_r * 1.80f;
         for (i = 0; i < h.choice_n; i++) {
-            char txt[16];
+            char txt[24];
+            int sel = (c != NULL && c->selected_choice_idx == i);
             txt[0] = 0;
             if (c != NULL && i < c->data.choice_num && c->data.string_lens[i] > 0) {
                 int len = c->data.string_lens[i];
                 int j, out = 0;
-                for (j = 0; j < len && out < 12; j++) {
-                    u8 ch = c->data.strings[i][j];
-                    if (ch >= 0x20 && ch <= 0x7E) txt[out++] = (char)ch;
+                for (j = 0; j < len && out < 20; j++) {
+                    u8 ch_u = c->data.strings[i][j];
+                    if (ch_u >= 0x20 && ch_u <= 0x7E) txt[out++] = (char)ch_u;
                 }
                 txt[out] = 0;
             }
@@ -3441,8 +4163,12 @@ void pc_touch_present(void) {
                 static const char* words[6] = { "One", "Two", "Three", "Four", "Five", "Six" };
                 snprintf(txt, sizeof(txt), "%s", words[i]);
             }
-            button(h.choice_x, h.choice_y[i], h.choice_r, 0.98f, 0.96f, 0.90f);
-            draw_word(txt, h.choice_x, h.choice_y[i], h.choice_r * 0.14f);
+            if (sel) {
+                pill_button_shadow(h.choice_x, h.choice_y[i], cw, ch, 0.98f, 0.88f, 0.52f, 0.98f);
+            } else {
+                pill_button_shadow(h.choice_x, h.choice_y[i], cw, ch, 0.97f, 0.95f, 0.90f, 0.95f);
+            }
+            draw_text_ac(txt, h.choice_x, h.choice_y[i], h.choice_r * 0.145f, 0.16f, 0.18f, 0.15f, 1.0f, 1, 20);
         }
     }
     if (h.show_sub_tabs) {
@@ -3467,12 +4193,60 @@ void pc_touch_present(void) {
         draw_left(line, (float)g_pc_content_x + 18.0f,
                   (float)(g_pc_content_y + g_pc_content_h) + 42.0f, 3.2f);
     }
-    if (h.show_keys) {
+    if (h.show_keys && h.key_n > 0) {
+        float tray_top = h.ky[0] - h.kh[0] * 0.65f - 8.0f;
+        round_rect(0.0f, tray_top, (float)g_pc_window_w, (float)g_pc_window_h + 24.0f,
+                   18.0f, 0.12f, 0.14f, 0.13f, 0.88f);
         for (i = 0; i < h.key_n; i++) {
-            float r = (h.kc[i] == ' ' || h.kc[i] == '\n') ? h.kr * 1.55f : h.kr;
-            button(h.kx[i], h.ky[i], r, 0.95f, 0.93f, 0.88f);
-            if (h.kc[i] == '\n') glyph('E', h.kx[i], h.ky[i], r * 0.16f);
-            else if (h.kc[i] != ' ') glyph(h.kc[i], h.kx[i], h.ky[i], r * 0.18f);
+            char kc = h.kc[i];
+            char kbuf[8];
+            const char* lbl = kbuf;
+            float hw = h.kw[i] * 0.5f, hh = h.kh[i] * 0.5f;
+            float cr = fminf(hw, hh) * 0.28f;
+            float kr = 0.97f, kg = 0.96f, kb = 0.93f;
+            float tr = 0.15f, tg = 0.17f, tb = 0.15f;
+            int len;
+            float kpix;
+
+            if (kc == '\x01') {
+                lbl = (s_kb_mode == 1) ? "CAPS" : "Shift";
+                if (s_kb_mode == 1) { kr = 0.74f; kg = 0.88f; kb = 0.98f; }
+                else { kr = 0.85f; kg = 0.84f; kb = 0.81f; }
+            } else if (kc == '\x02') {
+                lbl = (s_kb_mode == 2) ? "ABC" : "123";
+                kr = 0.85f; kg = 0.84f; kb = 0.81f;
+            } else if (kc == '\x08') {
+                lbl = "DEL";
+                kr = 0.94f; kg = 0.78f; kb = 0.76f;
+            } else if (kc == '\x05') {
+                lbl = "<";
+                kr = 0.85f; kg = 0.84f; kb = 0.81f;
+            } else if (kc == '\x06') {
+                lbl = ">";
+                kr = 0.85f; kg = 0.84f; kb = 0.81f;
+            } else if (kc == ' ') {
+                lbl = "Space";
+            } else if (kc == '\n') {
+                lbl = "Line";
+                kr = 0.85f; kg = 0.84f; kb = 0.81f;
+            } else if (kc == '\x03') {
+                lbl = "DONE";
+                kr = 0.24f; kg = 0.70f; kb = 0.42f;
+                tr = tg = tb = 1.0f;
+            } else {
+                kbuf[0] = kc;
+                kbuf[1] = 0;
+            }
+
+            round_rect(h.kx[i] - hw + 1.0f, h.ky[i] - hh + 2.0f, h.kx[i] + hw + 1.0f, h.ky[i] + hh + 2.0f, cr, 0.04f, 0.05f, 0.04f, 0.30f);
+            round_rect(h.kx[i] - hw, h.ky[i] - hh, h.kx[i] + hw, h.ky[i] + hh, cr, kr, kg, kb, 0.98f);
+            len = (int)strlen(lbl);
+            kpix = fminf(hh * 0.13f, hw * 0.15f);
+            if (len > 1) {
+                float max_fit = (h.kw[i] * 0.78f) / ((float)len * 5.2f);
+                if (max_fit < kpix) kpix = max_fit;
+            }
+            draw_text_ac(lbl, h.kx[i], h.ky[i], kpix, tr, tg, tb, 1.0f, 1, 8);
         }
     }
     if (s_sheet.active) {

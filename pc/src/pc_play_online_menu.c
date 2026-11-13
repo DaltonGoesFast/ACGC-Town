@@ -158,8 +158,12 @@ static int row_count(void) {
 int pc_play_online_menu_pointer(float font_x, float font_y) {
     int i, n, vis;
     if (!s_active || s_text != T_NONE) return 0;
+    if (s_page == PG_IRES) {
+        pc_play_online_menu_confirm();
+        return 1;
+    }
     if (s_page == PG_DELETE || s_page == PG_ICONF) {
-        if (font_y < 155.0f || font_y > 190.0f) return 0;
+        if (font_y < 150.0f || font_y > 195.0f) return 0;
         s_del_sel = (font_x < 160.0f) ? 0 : 1;
         pc_play_online_menu_confirm();
         return 1;
@@ -169,8 +173,19 @@ int pc_play_online_menu_pointer(float font_x, float font_y) {
         i = (int)((font_y - 44.0f) / 30.0f);
         vis = 5;
     } else {
-        i = (int)((font_y - 55.0f) / 15.0f);
+        i = (int)((font_y - 52.0f) / 15.0f);
         vis = VISIBLE;
+    }
+    if (font_x < 36.0f && i >= 0 && i < vis) {
+        if (i <= 1 && s_scroll > 0) {
+            s_scroll--;
+            if (s_sel >= s_scroll + vis) s_sel = s_scroll + vis - 1;
+            return 1;
+        } else if (i >= vis - 2 && s_scroll + vis < n) {
+            s_scroll++;
+            if (s_sel < s_scroll) s_sel = s_scroll;
+            return 1;
+        }
     }
     if (i < 0 || i >= vis || s_scroll + i >= n) return 0;
     s_sel = s_scroll + i;

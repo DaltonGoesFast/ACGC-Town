@@ -806,41 +806,87 @@ int pc_settings_menu_pointer(float font_x, float font_y) {
     float y0, line_h, apy;
     if (!s_active || s_capture) return 0;
     if (s_sub == SUB_HUD) {
-        int i = (int)((font_y - 58.0f) / 20.0f);
-        if (i < 0 || i > HUD_BACK) return 0;
-        s_hud_sel = i;
-        if (i == HUD_BACK) s_sub = SUB_SETTINGS;
-        else hud_cycle(font_x >= 180.0f ? +1 : -1);
+        int row = (int)floorf((font_y - 48.0f) / 18.0f);
+        if (row < 0 || row > HUD_BACK) return 0;
+        s_hud_sel = row;
+        if (row == HUD_BACK) s_sub = SUB_SETTINGS;
+        else hud_cycle((font_x >= 180.0f && font_x < 225.0f) ? -1 : +1);
         return 1;
     }
+    if (s_sub == SUB_BINDINGS) {
+        if (font_y >= 180.0f && font_y < 195.0f) {
+            s_bind_sel = BIND_IDX_DEFAULTS;
+            pc_settings_menu_confirm();
+            return 1;
+        }
+        if (font_y >= 195.0f && font_y <= 215.0f) {
+            s_bind_sel = BIND_IDX_BACK;
+            pc_settings_menu_confirm();
+            return 1;
+        }
+        if (font_y >= 58.0f && font_y < 58.0f + BIND_VISIBLE * 13.0f) {
+            int vis_i = (int)((font_y - 58.0f) / 13.0f);
+            if (font_x < 32.0f) {
+                if (vis_i <= 1 && s_bind_scroll > 0) s_bind_scroll--;
+                else if (vis_i >= BIND_VISIBLE - 2 && s_bind_scroll + BIND_VISIBLE < BIND_ROW_COUNT) s_bind_scroll++;
+                return 1;
+            }
+            if (vis_i >= 0 && vis_i < BIND_VISIBLE && s_bind_scroll + vis_i < BIND_ROW_COUNT) {
+                s_bind_sel = s_bind_scroll + vis_i;
+                s_bind_col = (font_x >= 210.0f && s_bind_rows[s_bind_sel].pad_off >= 0) ? 1 : 0;
+                pc_settings_menu_confirm();
+                return 1;
+            }
+        }
+        return 0;
+    }
     if (s_sub == SUB_CONFIRM_RES) {
-        if (font_y < 110.0f || font_y > 150.0f) return 0;
+        if (font_y < 140.0f || font_y > 190.0f) return 0;
         s_res_sel = (font_x < 160.0f) ? 0 : 1;
         pc_settings_menu_confirm();
         return 1;
     }
     if (s_sub == SUB_CONFIRM_BACK) {
-        if (font_y < 110.0f || font_y > 160.0f) return 0;
+        if (font_y < 140.0f || font_y > 190.0f) return 0;
         s_back_sel = (font_x < 160.0f) ? 0 : 1;
         pc_settings_menu_confirm();
         return 1;
     }
     if (s_sub != SUB_SETTINGS) return 0;
-    if (font_y >= 44.0f && font_y < 70.0f) {
-        t = (int)((font_x - 20.0f) / 70.0f);
-        if (t < 0) t = 0;
-        if (t >= TAB_COUNT) t = TAB_COUNT - 1;
-        s_tab = t;
-        s_sel = -1;
-        return 1;
+    if (font_y >= 42.0f && font_y < 70.0f) {
+        int widths[TAB_COUNT];
+        int total = 0;
+        const int gap_px = 18;
+        float tx;
+        for (t = 0; t < TAB_COUNT; t++) {
+            widths[t] = pc_text_width(s_tabs[t].name);
+            total += widths[t];
+        }
+        total += gap_px * (TAB_COUNT - 1);
+        tx = (SCREEN_WIDTH_F - (float)total) * 0.5f;
+        for (t = 0; t < TAB_COUNT; t++) {
+            float tx_end = tx + (float)widths[t] + (float)gap_px * 0.5f;
+            if (font_x < tx_end || t == TAB_COUNT - 1) {
+                s_tab = t;
+                s_sel = -1;
+                return 1;
+            }
+            tx += (float)widths[t] + (float)gap_px;
+        }
     }
     y0 = 78.0f;
     line_h = 15.0f;
     n = cur_item_count();
-    i = (int)((font_y - y0) / line_h);
+    i = (int)floorf((font_y - (y0 - 3.0f)) / line_h);
     if (i >= 0 && i < n) {
+        int id = s_tabs[s_tab].items[i].id;
         s_sel = i;
-        pc_settings_menu_confirm();
+        if (id != ITEM_BINDINGS && id != ITEM_TOUCH_HUD && font_x >= 180.0f && font_x < 230.0f) {
+            item_cycle(id, -1);
+            recompute_dirty();
+        } else {
+            pc_settings_menu_confirm();
+        }
         return 1;
     }
     max_items = 0;
@@ -853,7 +899,7 @@ int pc_settings_menu_pointer(float font_x, float font_y) {
         pc_settings_menu_confirm();
         return 1;
     }
-    if (font_y >= apy + line_h - 2.0f && font_y < apy + line_h * 2.0f + 4.0f) {
+    if (font_y >= apy + line_h - 2.0f && font_y < apy + line_h * 2.0f + 8.0f) {
         s_sel = idx_back();
         pc_settings_menu_confirm();
         return 1;

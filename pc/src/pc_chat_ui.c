@@ -16,6 +16,7 @@
 #include "pc_host_observer.h"
 #include "pc_remote_player.h"
 #include "pc_net_game.h"
+#include "pc_touch.h"
 
 #include "m_font.h"
 #include "m_rcp.h"
@@ -572,7 +573,7 @@ static void chat_draw_bubbles(GAME* game, float vl, float vr, uint32_t now) {
 }
 
 static void chat_draw_log(GAME* game, float vl, float vr, uint32_t now) {
-    float y = SCREEN_HEIGHT_F - 34.0f;
+    float y = (s_typing && pc_touch_enabled()) ? 84.0f : (SCREEN_HEIGHT_F - 34.0f);
     const float x = vl + 6.0f;
     int i;
     for (i = 0; i < PC_CHAT_LOG_SHOWN; i++) {
@@ -628,7 +629,7 @@ static void chat_draw_input(GAME* game, float vl, float vr, uint32_t now) {
     static const char say[] = { 'S', 'a', 'y', ':', 0 };
     char line[PC_CHAT_MAX_LEN + 2];
     char cnt[12];
-    const float y = SCREEN_HEIGHT_F - 19.0f;
+    const float y = pc_touch_enabled() ? 100.0f : (SCREEN_HEIGHT_F - 19.0f);
     const float x = vl + 6.0f;
     const float sw = (float)pc_text_width(say) * 0.75f + 4.0f;
     const float avail = (vr - vl) - 12.0f - sw - 30.0f;

@@ -19,6 +19,7 @@ extern "C" {
 #define PC_TYPING_CMD_UP        259
 #define PC_TYPING_CMD_DOWN      260
 #define PC_TYPING_CMD_ENTER     261
+#define PC_TYPING_CMD_END_EDIT  262
 
 typedef struct {
     int entries[PC_TYPING_QUEUE_SIZE];
