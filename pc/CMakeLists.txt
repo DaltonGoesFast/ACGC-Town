@@ -72,6 +72,11 @@ add_compile_options(
     -fno-strict-aliasing
     -fwrapv
 )
+# 32-bit System V aligns doubles to 4. The GC save layout needs 8, which is what
+# the Android abi check compiles with.
+if(CMAKE_SIZEOF_VOID_P EQUAL 4 AND UNIX AND NOT APPLE)
+    add_compile_options(-malign-double)
+endif()
 
 # =============================================================================
 # Include paths
@@ -533,21 +538,27 @@ extern \"C\" {
             set_source_files_properties("${data_src}" PROPERTIES
                 LANGUAGE CXX
                 COMPILE_DEFINITIONS "this=this_arg")
-            set_property(SOURCE "${data_src}" APPEND PROPERTY COMPILE_OPTIONS "-include" "${PC_CXX_LINKAGE_HEADER}")
+            set_property(SOURCE "${data_src}" APPEND PROPERTY COMPILE_OPTIONS
+                "-include" "${CMAKE_CURRENT_SOURCE_DIR}/include/pc_cxx_hide_this.h"
+                "-include" "${PC_CXX_LINKAGE_HEADER}")
         endif()
     endforeach()
 
     # jaudio file-format structs (include/jaudio_NES/bx.h, heapctrl.h) keep GameCube-sized 32-bit address fields
     # (JA_FPTR -> PcLowPtr<T>, a C++ type). The translation units that dereference those fields must therefore be C++;
     # their functions are declared extern "C" in the jaudio headers, so linkage to the C callers is unchanged.
-    foreach(ja_name bankread waveread bankdrv connect oneshot noteon driverinterface jamosc heapctrl
-                    channel driver memory system track rspsim streamctrl sub_sys)
     set_source_files_properties("${DECOMP_ROOT}/src/game/m_rcp.c" PROPERTIES
         LANGUAGE CXX
         COMPILE_DEFINITIONS "this=this_arg")
+    set_property(SOURCE "${DECOMP_ROOT}/src/game/m_rcp.c" APPEND PROPERTY COMPILE_OPTIONS
+        "-include" "${CMAKE_CURRENT_SOURCE_DIR}/include/pc_cxx_hide_this.h")
+    foreach(ja_name bankread waveread bankdrv connect oneshot noteon driverinterface jamosc heapctrl
+                    channel driver memory system track rspsim streamctrl sub_sys)
         set_source_files_properties("${DECOMP_ROOT}/src/static/jaudio_NES/internal/${ja_name}.c" PROPERTIES
             LANGUAGE CXX
             COMPILE_DEFINITIONS "this=this_arg")
+        set_property(SOURCE "${DECOMP_ROOT}/src/static/jaudio_NES/internal/${ja_name}.c" APPEND PROPERTY COMPILE_OPTIONS
+            "-include" "${CMAKE_CURRENT_SOURCE_DIR}/include/pc_cxx_hide_this.h")
     endforeach()
 endif()
 
@@ -606,7 +617,8 @@ if(PC_DRESSER_STORAGE_DEFAULT_ON)
     set_property(SOURCE ${CMAKE_CURRENT_SOURCE_DIR}/src/pc_net_game.c APPEND PROPERTY COMPILE_DEFINITIONS PC_DRESSER_STORAGE_DEFAULT_ON=1)
 endif()
 
-if(ANDROID)
+if(ANDROID OR NOT WIN32)
+    # The selftest is a Windows-only executable probe (windows.h). Linux and Android link a stub.
     list(REMOVE_ITEM PC_SOURCES "${CMAKE_CURRENT_SOURCE_DIR}/src/pc_lowaddr_selftest.cpp")
 endif()
 if(ANDROID)
@@ -668,7 +680,8 @@ endif()
 
 # Low-address 64-bit desktop: keep the image, heaps and stacks below 4 GB.
 # Android loads a shared library at a high address, so those flags do not apply there.
-if(PC_LOW_ADDRESS_64 AND NOT ANDROID)
+if(PC_LOW_ADDRESS_64 AND WIN32)
+    # Those flags are the MinGW linker. GNU ld on Linux rejects --image-base.
     target_link_options(ac_pc PRIVATE
         -Wl,--image-base=0x400000
         -Wl,--disable-dynamicbase

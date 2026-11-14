@@ -222,7 +222,8 @@ void pc_lowaddr_init(void) {
 
 #endif /* PC_LOW_ADDRESS_64 */
 
-#ifdef __ANDROID__
+#ifndef _WIN32
+/* The full probe is a Windows executable (pc_lowaddr_selftest.cpp). */
 int pc_lowaddr_selftest(void) {
     return 0;
 }

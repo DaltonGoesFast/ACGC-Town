@@ -37,6 +37,13 @@ static void second_game_main(GAME* game) {
   if (sound_ok == 2 && (contpad_ok || frame_count > 3)) {
     GAME_GOTO_NEXT(game, trademark, TRADEMARK);
   }
+#ifdef TARGET_PC
+  /* No sound device: the audio restart message never arrives, and this scene
+   * draws nothing. The title does not need that restart. */
+  else if (frame_count > 30) {
+    GAME_GOTO_NEXT(game, trademark, TRADEMARK);
+  }
+#endif
 
   frame_count++;
 }

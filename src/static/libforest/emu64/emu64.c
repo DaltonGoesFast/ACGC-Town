@@ -18,6 +18,7 @@
 
 #ifdef TARGET_PC
 #include "pc_platform.h"
+#include <sys/mman.h>
 #endif
 
 // this pragma may be unnecessary
@@ -4623,6 +4624,53 @@ void emu64::dl_G_MTX() {
     }
 }
 
+#ifdef TARGET_PC
+extern "C" void pc_diag_milestone(const char* msg);
+
+/* gsSPVertex writes into emu64::vertices[v0 .. v0+n). The Fold fault was that
+ * store: v0 underflows to a huge unsigned index (same address every run, because
+ * emu64_class is at a fixed offset in libmain). A bad source pointer is the same
+ * class of fault. Skip the command and log the Gfx word plus the segment table. */
+static int pc_vtx_span_mapped(const void* p, size_t bytes) {
+    uintptr_t addr, last, page;
+    size_t pages;
+    unsigned char vec[4];
+    if (p == NULL || bytes == 0) return 0;
+    addr = (uintptr_t)p;
+    if (addr < 0x10000ull) return 0;
+    if (addr + bytes < addr) return 0;
+    last = addr + bytes - 1ull;
+    page = addr & ~(uintptr_t)0xFFFu;
+    pages = (size_t)(((last - page) >> 12) + 1ull);
+    if (pages == 0 || pages > 4) return 0;
+    if (mincore((void*)page, pages << 12, vec) != 0) return 0;
+    return 1;
+}
+
+static void pc_vtx_skip(const char* why, u32 w0, u32 w1, u32 n, int vn, u32 v0, u32 base,
+                        uintptr_t resolved, const u32* segs_in) {
+    static int s_left = 8;
+    char segs[96];
+    char line[240];
+    u32 seg;
+    int i, p;
+    if (s_left <= 0) return;
+    s_left--;
+    seg = (w1 >> 24) & 0xFu;
+    p = 0;
+    segs[0] = 0;
+    if (segs_in != NULL) {
+        for (i = 0; i < EMU64_NUM_SEGMENTS && p < (int)sizeof(segs) - 12; i++) {
+            p += snprintf(segs + p, sizeof(segs) - (size_t)p, "%x ", segs_in[i]);
+        }
+    }
+    snprintf(line, sizeof(line),
+             "vtx %s w0=%08x w1=%08x n=%u vn=%d v0=%u seg=%u base=%08x ptr=%llx [%s]",
+             why, w0, w1, n, vn, v0, seg, base, (unsigned long long)resolved, segs);
+    pc_diag_milestone(line);
+}
+#endif
+
 void emu64::dl_G_VTX() {
     EMU64_TIMED_SEGMENT_BEGIN();
 
@@ -4630,6 +4678,18 @@ void emu64::dl_G_VTX() {
     u32 n = vtx_gfx->n; /* number of vertices */
     int vn = vtx_gfx->vn;
     u32 v0 = (vn >> 1) - n; /* first vertex to load */
+
+#ifdef TARGET_PC
+    /* N64 loads at most 32 verts. An underflowed v0 is a write off vertices[]. */
+    if (n == 0 || n > 32 || vn < (int)(n * 2u) || v0 >= VTX_COUNT || v0 + n > VTX_COUNT) {
+        pc_vtx_skip("index", this->gfx.words.w0, this->gfx.words.w1, n, vn, v0,
+                    ((this->gfx.words.w1 >> 24) & 0xFu) < EMU64_NUM_SEGMENTS
+                        ? this->segments[(this->gfx.words.w1 >> 24) & 0xFu] : 0u,
+                    0, this->segments);
+        EMU64_TIMED_SEGMENT_END(spvertex_time);
+        return;
+    }
+#endif
 
     this->total_vertices += n;
 
@@ -4646,7 +4706,11 @@ void emu64::dl_G_VTX() {
     if (this->disable_polygons == false) {
         Vtx* vtx_p = (Vtx*)this->seg2k0(this->gfx.dma.addr);
 #ifdef TARGET_PC
-        if (vtx_p == NULL) {
+        if (!pc_vtx_span_mapped(vtx_p, (size_t)n * sizeof(Vtx))) {
+            pc_vtx_skip("ptr", this->gfx.words.w0, this->gfx.words.w1, n, vn, v0,
+                        ((this->gfx.words.w1 >> 24) & 0xFu) < EMU64_NUM_SEGMENTS
+                            ? this->segments[(this->gfx.words.w1 >> 24) & 0xFu] : 0u,
+                        (uintptr_t)vtx_p, this->segments);
             EMU64_TIMED_SEGMENT_END(spvertex_time);
             return;
         }
