@@ -21,6 +21,7 @@ extern void pc_creator_menu_pointer(float fx, float fy);
 
 #include "game.h"
 #include "m_play.h"
+#include "m_scene_table.h"
 #include "m_player_lib.h"
 #include "m_msg.h"
 #include "m_field_info.h"
@@ -105,6 +106,7 @@ typedef struct {
 static MobileSheet s_sheet;
 static int s_pending_row = -1;
 
+static const char* action_word(void);
 static void mobile_sheet_layout(void);
 static int mobile_sheet_hit(float x, float y, int* key);
 static void mobile_sheet_handle_card(int slot);
@@ -327,17 +329,31 @@ static int keys_up(void) {
     return pc_play_online_menu_text_active();
 }
 
+/* The 3D picture is the full content rect (portrait Vert+). GC menus and dialogue
+ * are drawn into the centered 4:3 UI viewport (pc_layout_box stretch 2). */
+static void world_rect(int* x, int* y, int* w, int* h) {
+    if (g_pc_content_w < 2 || g_pc_content_h < 2) pc_layout_refresh();
+    *x = g_pc_content_x;
+    *y = g_pc_content_y;
+    *w = g_pc_content_w;
+    *h = g_pc_content_h;
+}
+
+static void gc_ui_rect(int* x, int* y, int* w, int* h) {
+    pc_layout_box(2, x, y, w, h);
+}
+
 static int in_picture(float x, float y) {
-    int bx = g_pc_content_x, by = g_pc_content_y, bw = g_pc_content_w, bh = g_pc_content_h;
-    pc_layout_box(2, &bx, &by, &bw, &bh);
+    int bx, by, bw, bh;
+    world_rect(&bx, &by, &bw, &bh);
     return x >= (float)bx && y >= (float)by &&
            x < (float)(bx + bw) &&
            y < (float)(by + bh);
 }
 
 static void to_font(float x, float y, float* fx, float* fy) {
-    int bx = g_pc_content_x, by = g_pc_content_y, bw = g_pc_content_w, bh = g_pc_content_h;
-    pc_layout_box(2, &bx, &by, &bw, &bh);
+    int bx, by, bw, bh;
+    gc_ui_rect(&bx, &by, &bw, &bh);
     if (bw < 1) bw = 1;
     if (bh < 1) bh = 1;
     *fx = (x - (float)bx) / (float)bw * 320.0f;
@@ -434,6 +450,18 @@ static int submenu_needs_dpad(void) {
             mt == mSM_OVL_CPEDIT || mt == mSM_OVL_MSCORE);
 }
 
+static int in_player_house(void) {
+    GAME_PLAY* play = get_game_play();
+    if (play == NULL) return 0;
+    return mSc_IS_SCENE_PLAYER_ROOM((int)play->scene_id);
+}
+
+/* The animal-logo actor covers both the opening logo and the title menu.
+ * Town HUD must stay down until that actor is gone. */
+static int title_presentation_up(void) {
+    return Common_Get(clip.animal_logo_clip) != NULL;
+}
+
 static void hud_build(Hud* h) {
     float W = (float)g_pc_window_w, H = (float)g_pc_window_h;
     float il = 0, it = 0, ir = 0, ib = 0;
@@ -444,7 +472,8 @@ static void hud_build(Hud* h) {
     pc_layout_insets(&in_l, &in_t, &in_r, &in_b);
     il = (float)in_l; it = (float)in_t; ir = (float)in_r; ib = (float)in_b;
 
-    town = !g_pc_paused && !g_pc_title_main_menu_visible && !pc_settings_menu_active() &&
+    town = !g_pc_paused && !g_pc_title_main_menu_visible && !title_presentation_up() &&
+           !pc_settings_menu_active() &&
            !pc_play_online_menu_active() && !pc_play_offline_menu_active() && !pc_creator_menu_active() &&
            !message_open() && !submenu_open() && !keys_up();
     menu = g_pc_paused || g_pc_title_main_menu_visible || pc_settings_menu_active() ||
@@ -454,7 +483,7 @@ static void hud_build(Hud* h) {
     else if (dialog) s_hud = HUD_DIALOG;
     else if (menu) s_hud = HUD_MENU;
     else if (town) s_hud = HUD_TOWN;
-    else s_hud = HUD_TOWN;
+    else s_hud = HUD_OFF;
     rad = 0.055f * (W < H ? W : H);
     if (rad < 36.0f) rad = 36.0f;
     if (rad > 68.0f) rad = 68.0f;
@@ -466,19 +495,25 @@ static void hud_build(Hud* h) {
     }
     h->show_keys = keys_up();
     h->show_nub = 0;
-    h->show_stick = !h->show_keys && town && (g_pc_settings.touch_stick || g_pc_settings.touch_virtual_pad);
-    /* Action, Back, Menu, Bag, Map, Cam, Tool, Emote, Chat are available in town */
-    h->show_action = !h->show_keys;
-    h->show_back = !h->show_keys;
-    h->show_menu = !h->show_keys;
+    /* The stick and A/B discs are the virtual pad. Pocket Camp play hides them. */
+    {
+        int vpad = g_pc_settings.touch_virtual_pad || g_pc_settings.touch_stick;
+        h->show_stick = !h->show_keys && town && vpad;
+        h->show_action = !h->show_keys && vpad;
+        h->show_back = !h->show_keys && vpad;
+        h->show_cam = !h->show_keys && town && vpad;
+        h->show_tool = !h->show_keys && town && vpad;
+        h->show_emote = !h->show_keys && town && vpad;
+        h->show_chat = !h->show_keys && town && vpad;
+        h->show_dpad = !h->show_keys && vpad && submenu_needs_dpad();
+    }
+    h->show_menu = !h->show_keys && town;
     h->show_quick = !h->show_keys && town;
-    h->show_cam = !h->show_keys && town;
-    h->show_tool = !h->show_keys && town;
-    h->show_emote = !h->show_keys && town;
-    h->show_chat = !h->show_keys && town;
-    h->show_close = h->show_keys || menu || dialog;
+    /* The title's own rows are the menu. A Back chip there sits on the logo. */
+    h->show_close = h->show_keys || dialog || g_pc_paused || pc_settings_menu_active() ||
+                    pc_play_online_menu_active() || pc_play_offline_menu_active() ||
+                    pc_creator_menu_active();
     h->show_context = 0;
-    h->show_dpad = !h->show_keys && submenu_needs_dpad();
     h->show_trigs = h->show_dpad;
 
     if (g_pc_layout_portrait) {
@@ -678,6 +713,20 @@ static void hud_build(Hud* h) {
         }
     }
 
+    if (town && !h->show_keys && !g_pc_settings.touch_virtual_pad && action_word() != NULL) {
+        /* Thumb chip on the bottom row, clear of the Items/Map column. */
+        h->show_context = 1;
+        h->ctx_r = rad * 0.72f;
+        h->ctx_x = (float)g_pc_content_x + (float)g_pc_content_w * 0.5f;
+        h->ctx_y = h->bag_y;
+        if (h->ctx_x < h->bag_x + h->qr + h->ctx_r + 18.0f) {
+            h->ctx_x = h->bag_x + h->qr + h->ctx_r + 18.0f;
+        }
+        if (h->ctx_x > W - ir - h->ctx_r - 16.0f) {
+            h->ctx_x = W - ir - h->ctx_r - 16.0f;
+        }
+    }
+
     if (g_pc_settings.touch_left_hand) {
         h->sx = W - h->sx; h->nx = W - h->nx; h->ax = W - h->ax;
         h->bx = W - h->bx; h->mx = W - h->mx;
@@ -695,7 +744,8 @@ static void hud_build(Hud* h) {
     if (!h->show_stick) { h->sx = -1000.0f; }
 
     h->show_storage = 0;
-    if (!h->show_keys && (pc_bedroom_is_in_bedroom() || pc_bedroom_is_in_lounge()) && !submenu_open()) {
+    if (!h->show_keys && in_player_house() &&
+        (pc_bedroom_is_in_bedroom() || pc_bedroom_is_in_lounge()) && !submenu_open()) {
         h->show_storage = 1;
         if (g_pc_layout_portrait) {
             h->storage_x = h->bag_x;
@@ -834,6 +884,7 @@ static int classify(float x, float y, Hud* h, int* key) {
 static int can_steer(void) {
     GAME_PLAY* play = get_game_play();
     if (play == NULL || message_open() || g_pc_paused || g_pc_title_main_menu_visible) return 0;
+    if (title_presentation_up()) return 0;
     if (pc_settings_menu_active() || pc_play_online_menu_active() || pc_play_offline_menu_active() || pc_creator_menu_active()) return 0;
     if (play->submenu.menu_type != 0 || play->submenu.start_refuse) return 0;
     return 1;
@@ -1846,6 +1897,10 @@ static void on_picture_release(float x, float y) {
     }
     if (pc_settings_menu_active()) { pc_settings_menu_pointer(fx, fy); return; }
     if (pc_creator_menu_active()) { pc_creator_menu_pointer(fx, fy); note_tap("creator"); return; }
+    if (title_presentation_up() && !g_pc_title_main_menu_visible) {
+        note_tap("logo");
+        return;
+    }
     if (g_pc_title_main_menu_visible) {
         int i = (int)((fy - 126.0f) / 18.0f);
         if (i >= 0 && i < 5 && fx > 30.0f && fx < 290.0f) {
@@ -3895,7 +3950,9 @@ static const char* action_word(void) {
     if (strcmp(s_action, "Next") == 0) return "Next";
     if (strcmp(s_action, "OK") == 0) return "OK";
     if (strcmp(s_action, "Use") == 0) return "Use";
-    return "Action";
+    if (strcmp(s_action, "Drop") == 0) return "Drop";
+    if (strcmp(s_action, "Select") == 0) return "Select";
+    return NULL;
 }
 
 static char s_toast_title[128] = {0};
@@ -4187,11 +4244,23 @@ void pc_touch_present(void) {
             draw_word_raw(labels[i], cx, cy, rad * 0.15f, 0.15f, 0.16f, 0.15f, 1.0f);
         }
     }
-    if (!g_pc_settings.touch_virtual_pad && g_pc_layout_portrait && h.choice_n == 0) {
+    if (s_hud == HUD_TOWN && !g_pc_settings.touch_virtual_pad && g_pc_layout_portrait && h.choice_n == 0) {
         char line[64];
+        float ui = fmaxf(1.0f, (float)g_pc_window_h / 1400.0f);
+        float pix = 4.6f * ui;
+        float scale = pix * 0.54f;
+        float ix = (float)g_pc_content_x + 18.0f * ui;
+        float iy = (float)g_pc_content_y + 18.0f * ui + 16.0f * scale;
+        float tw, pad;
+        int n;
         info_line(line, sizeof(line));
-        draw_left(line, (float)g_pc_content_x + 18.0f,
-                  (float)(g_pc_content_y + g_pc_content_h) + 42.0f, 3.2f);
+        n = (int)strlen(line);
+        if (n > 32) n = 32;
+        tw = (float)n * 7.2f * scale;
+        pad = 14.0f * ui;
+        round_rect(ix - pad, iy - 16.0f * scale - 6.0f, ix + tw + pad, iy + 16.0f * scale + 6.0f,
+                   16.0f * ui, 0.08f, 0.10f, 0.08f, 0.62f);
+        draw_str_left_raw(line, ix, iy, pix, 0.98f, 0.97f, 0.90f, 0.98f, 32);
     }
     if (h.show_keys && h.key_n > 0) {
         float tray_top = h.ky[0] - h.kh[0] * 0.65f - 8.0f;
