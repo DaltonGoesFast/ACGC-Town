@@ -637,6 +637,13 @@ extern void Na_Inst(u16 inst, u8* pData) {
 }
 
 static void Na_MelodyStart(u16 voice, s16 subTrack, const u8* pData) {
+#ifdef TARGET_PC
+    /* No audio device: the sequence bank never loads, and the copy below
+     * would read a null seq_data. Skip the chime instead of crashing. */
+    if (AG.groups[0].seq_data == NULL || AG.seq_header == NULL) {
+        return;
+    }
+#endif
     Nap_SetS8(NA_MAKE_COMMAND(0x06, 0x00, subTrack, 0x00), 1);
     s32 unused = Nap_SendStart();
     Nap_WaitVsync();

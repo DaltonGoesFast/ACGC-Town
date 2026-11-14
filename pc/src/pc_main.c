@@ -2072,6 +2072,8 @@ static int pc_game_main(int argc, char* argv[]) {
 #else
 int main(int argc, char* argv[]) {
 #endif
+    setvbuf(stdout, NULL, _IOLBF, 0);
+    setvbuf(stderr, NULL, _IOLBF, 0);
     pc_relaunch_forward_capture(argc, argv); /* M-C: the whitelisted display / diagnostic options are forwarded by a Play Online relaunch */
     for (int i = 1; i < argc; i++) {
         /* pc_log: -debug*, --debug*, -debug-list, -logtime, -logfile PATH (see pc_log.h). -debug-list exits 0 and a bad value exits 2 HERE,
@@ -3192,6 +3194,20 @@ int main(int argc, char* argv[]) {
     pc_lowaddr_init(); /* no-op unless built with PC_LOW_ADDRESS_64 */
     SDL_SetMainReady();
     pc_settings_load();
+    {
+        /* Desktop has no touchscreen. AC_TOUCH=1 runs the same tap path the phone uses, from the mouse. */
+        const char* ac_touch = getenv("AC_TOUCH");
+        if (ac_touch != NULL && ac_touch[0] == '1') g_pc_settings.touch_controls = 1;
+    }
+#ifndef __ANDROID__
+    /* Xvfb's GLX has no 3.3 core framebuffer. llvmpipe can still compile the
+     * 330 shaders if Mesa is asked for 4.5 before the first context. */
+    if (getenv("MESA_GL_VERSION_OVERRIDE") == NULL &&
+        (getenv("LIBGL_ALWAYS_SOFTWARE") != NULL || getenv("GALLIUM_DRIVER") != NULL)) {
+        setenv("MESA_GL_VERSION_OVERRIDE", "4.5", 0);
+        setenv("MESA_GLSL_VERSION_OVERRIDE", "450", 0);
+    }
+#endif
     pc_client_log_start(); /* hotfix 0.2.1: [Debug] client_log = 1 / AC_CLIENT_LOG=1 (default off) */
     if (g_pc_net_role == 1 && !g_pc_dedicated) {
         printf("[PC] host services: house sync %s (%s)\n", g_pc_house_sync ? "ON" : "off", s_house_sync_explicit ? "explicit option" : "default for every host; --no-house-sync disables");

@@ -76,9 +76,13 @@ static GLuint s_vertex_shader = 0;   /* shared by all programs */
 static char*  s_frag_base = NULL;    /* kept for variant generation */
 
 static GLuint compile_shader(GLenum type, const char* source) {
+    extern int pc_host_gl_alloc;
+    int prev = pc_host_gl_alloc;
+    pc_host_gl_alloc = 1;
     GLuint shader = glCreateShader(type);
     glShaderSource(shader, 1, &source, NULL);
     glCompileShader(shader);
+    pc_host_gl_alloc = prev;
 
     GLint success;
     glGetShaderiv(shader, GL_COMPILE_STATUS, &success);

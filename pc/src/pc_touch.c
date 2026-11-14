@@ -2099,6 +2099,33 @@ static void begin_move(float x, float y, int fresh) {
             s_intent.arrive = 8.0f;
         }
     }
+    /* A sign is only readable from its +Z side. The generic stand above walks to
+     * whichever side the player is already on, so put the stand back on the front. */
+    if (s_intent.kind == INTENT_READ_SIGN && player != NULL) {
+        float px = player->actor_class.world.position.x;
+        float pz = player->actor_class.world.position.z;
+        float dx = px - s_intent.face_x;
+        s_intent.force_walk = 1;
+        s_intent.face_lock = 0;
+        s_intent.vanilla_btn = 1;
+        if (pz > s_intent.face_z + 14.0f && fabsf(dx) < 28.0f) {
+            float dz = pz - s_intent.face_z;
+            float len = sqrtf(dx * dx + dz * dz);
+            if (len < 52.0f) {
+                s_intent.tx = px;
+                s_intent.tz = pz;
+                s_intent.arrive = 64.0f;
+            } else {
+                s_intent.tx = s_intent.face_x;
+                s_intent.tz = s_intent.face_z + 36.0f;
+                s_intent.arrive = 8.0f;
+            }
+        } else {
+            s_intent.tx = s_intent.face_x;
+            s_intent.tz = s_intent.face_z + 36.0f;
+            s_intent.arrive = 8.0f;
+        }
+    }
 
     s_target_x = s_intent.tx;
     s_target_z = s_intent.tz;

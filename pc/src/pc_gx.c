@@ -773,6 +773,8 @@ int pc_gx_draw_call_count = 0;
 /* Draws the deferred run. Must run before any GL call that bypasses the
  * dirty system (viewport, scissor, readpixels, raw texture binds, swap)
  * so the run renders with the state it was built under. */
+int pc_host_gl_alloc;
+
 void pc_gx_draw_pending(void) {
     int count = g_gx.pending_verts;
     if (!g_pc_gl_live) {
@@ -780,6 +782,11 @@ void pc_gx_draw_pending(void) {
         return;
     }
     if (count == 0) return;
+#ifndef __ANDROID__
+    /* llvmpipe JITs the bound program inside the draw. Those allocations
+     * must not come from the game heap. */
+    pc_host_gl_alloc = 1;
+#endif
 
     glBindVertexArray(g_gx.vao);
     glBindBuffer(GL_ARRAY_BUFFER, g_gx.vbo);
@@ -809,6 +816,9 @@ void pc_gx_draw_pending(void) {
         g_gx.current_vertex_idx = 0;
     }
     g_gx.pending_verts = 0;
+#ifndef __ANDROID__
+    pc_host_gl_alloc = 0;
+#endif
 }
 
 void pc_gx_flush_vertices(void) {

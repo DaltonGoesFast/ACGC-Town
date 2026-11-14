@@ -305,10 +305,34 @@ bool JKRHeap::isSubHeap(JKRHeap* heap) const {
     return false;
 }
 
+#ifdef TARGET_PC
+/* Set while a GL call may compile a shader. LLVM must not allocate from the
+ * game heap: those blocks are 4-byte aligned and get freed with the frame. */
+extern "C" int pc_host_gl_alloc;
+#include <stdlib.h>
+static void* pc_host_malloc(size_t byteCount) {
+    void* p = nullptr;
+    if (byteCount == 0) byteCount = 1;
+    if (posix_memalign(&p, 16, byteCount) != 0) return nullptr;
+    return p;
+}
+#endif
 void* operator new(size_t byteCount) {
+#ifdef TARGET_PC
+    /* Host libraries (Mesa/LLVM) call operator new before the game heap exists.
+     * A null return there is a crash inside the GL driver. */
+    if (pc_host_gl_alloc || JKRHeap::getCurrentHeap() == nullptr || byteCount == 0) {
+        return pc_host_malloc(byteCount);
+    }
+#endif
     return JKRHeap::alloc((u32)(uintptr_t)byteCount, 4, nullptr);
 }
 void* operator new(size_t byteCount, int alignment) {
+#ifdef TARGET_PC
+    if (pc_host_gl_alloc || JKRHeap::getCurrentHeap() == nullptr || byteCount == 0) {
+        return pc_host_malloc(byteCount);
+    }
+#endif
     return JKRHeap::alloc((u32)(uintptr_t)byteCount, alignment, nullptr);
 }
 void* operator new(size_t byteCount, JKRHeap* heap, int alignment) {
@@ -316,9 +340,19 @@ void* operator new(size_t byteCount, JKRHeap* heap, int alignment) {
 }
 
 void* operator new[](size_t byteCount) {
+#ifdef TARGET_PC
+    if (pc_host_gl_alloc || JKRHeap::getCurrentHeap() == nullptr || byteCount == 0) {
+        return pc_host_malloc(byteCount);
+    }
+#endif
     return JKRHeap::alloc((u32)(uintptr_t)byteCount, 4, nullptr);
 }
 void* operator new[](size_t byteCount, int alignment) {
+#ifdef TARGET_PC
+    if (pc_host_gl_alloc || JKRHeap::getCurrentHeap() == nullptr || byteCount == 0) {
+        return pc_host_malloc(byteCount);
+    }
+#endif
     return JKRHeap::alloc((u32)(uintptr_t)byteCount, alignment, nullptr);
 }
 void* operator new[](size_t byteCount, JKRHeap* heap, int alignment) {
@@ -326,21 +360,32 @@ void* operator new[](size_t byteCount, JKRHeap* heap, int alignment) {
 }
 
 // this is not needed without the other pragma and asm bs
-void operator delete(void* memory) {
+static void pc_operator_delete(void* memory) {
+    if (memory == nullptr) return;
+#ifdef TARGET_PC
+    /* Pointers from the pre-heap malloc fallback are not in any JKR arena. */
+    if (JKRHeap::findFromRoot(memory) == nullptr) {
+        free(memory);
+        return;
+    }
+#endif
     JKRHeap::free(memory, nullptr);
 }
+void operator delete(void* memory) {
+    pc_operator_delete(memory);
+}
 void operator delete[](void* memory) {
-    JKRHeap::free(memory, nullptr);
+    pc_operator_delete(memory);
 }
 #ifdef TARGET_PC
 /* C++14 sized deallocation - GCC 15 generates calls to these by default.
    Without these, sized delete falls through to CRT free() which crashes
    on pointers from the JKR heap (inside the game's arena memory). */
 void operator delete(void* memory, size_t) {
-    JKRHeap::free(memory, nullptr);
+    pc_operator_delete(memory);
 }
 void operator delete[](void* memory, size_t) {
-    JKRHeap::free(memory, nullptr);
+    pc_operator_delete(memory);
 }
 #endif
 
