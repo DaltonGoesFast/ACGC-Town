@@ -19,6 +19,11 @@ struct game_s;
 
 int pc_touch_enabled(void);
 
+/* Normalized finger position (0..1 of the drawable) to window pixels. */
+void pc_touch_finger_xy(float nx, float ny, float* x, float* y);
+/* Drop held fingers. Used when the activity pauses without a finger-up. */
+void pc_touch_cancel_fingers(void);
+
 void pc_touch_note_event(const SDL_Event* e);
 void pc_touch_pulse_b(void);
 

@@ -236,66 +236,92 @@ int pc_touch_take_title_tap(float* font_y) {
 
 static Uint32 s_last_finger_ms = 0;
 
-static void finger_set(SDL_FingerID id, float x, float y, int type) {
-    s_last_finger_ms = SDL_GetTicks();
-    int i, free_slot = -1;
-    for (i = 0; i < FINGERS; i++) {
-        if ((s_fin[i].down || s_fin[i].just_down || s_fin[i].just_up) && s_fin[i].id == id) {
-            s_fin[i].x = x;
-            s_fin[i].y = y;
-            if (type == SDL_FINGERDOWN) {
-                s_fin[i].ox = x;
-                s_fin[i].oy = y;
-                s_fin[i].t0 = SDL_GetTicks();
-                s_fin[i].down = 1;
-                s_fin[i].just_down = 1;
-                s_fin[i].just_up = 0;
-                s_fin[i].moved = 0;
-            } else if (type == SDL_FINGERUP) {
-                s_fin[i].down = 0;
-                s_fin[i].just_up = 1;
-            }
-            return;
-        }
-        if (!s_fin[i].down && !s_fin[i].just_down && !s_fin[i].just_up && free_slot < 0) free_slot = i;
-    }
-    if (type == SDL_FINGERDOWN && free_slot >= 0) {
-        memset(&s_fin[free_slot], 0, sizeof(s_fin[free_slot]));
-        s_fin[free_slot].id = id;
-        s_fin[free_slot].x = x;
-        s_fin[free_slot].y = y;
-        s_fin[free_slot].ox = x;
-        s_fin[free_slot].oy = y;
-        s_fin[free_slot].t0 = SDL_GetTicks();
-        s_fin[free_slot].down = 1;
-        s_fin[free_slot].just_down = 1;
-        s_fin[free_slot].key = -1;
-    }
+enum { TOUCH_Q = 64, TEV_DOWN = 1, TEV_UP = 2, TEV_MOVE = 3 };
+typedef struct {
+    Uint32 t;
+    SDL_FingerID id;
+    int kind;
+    float x, y;
+} TouchEv;
+static TouchEv s_tev[TOUCH_Q];
+static int s_tev_r = 0, s_tev_w = 0;
+
+/* Normalized 0..1 across the GL drawable, which is the same space the HUD is laid out in. */
+void pc_touch_finger_xy(float nx, float ny, float* x, float* y) {
+    int dw = 0, dh = 0;
+    if (g_pc_window != NULL) SDL_GL_GetDrawableSize(g_pc_window, &dw, &dh);
+    if (dw < 2) dw = g_pc_window_w;
+    if (dh < 2) dh = g_pc_window_h;
+    if (nx < 0.0f) nx = 0.0f;
+    if (ny < 0.0f) ny = 0.0f;
+    if (nx > 1.0f) nx = 1.0f;
+    if (ny > 1.0f) ny = 1.0f;
+    if (x) *x = nx * (float)dw;
+    if (y) *y = ny * (float)dh;
+}
+
+static void touch_q_push(Uint32 t, SDL_FingerID id, int kind, float x, float y) {
+    int next = (s_tev_w + 1) % TOUCH_Q;
+    if (next == s_tev_r) s_tev_r = (s_tev_r + 1) % TOUCH_Q; /* drop the oldest, keep order */
+    s_tev[s_tev_w].t = t;
+    s_tev[s_tev_w].id = id;
+    s_tev[s_tev_w].kind = kind;
+    s_tev[s_tev_w].x = x;
+    s_tev[s_tev_w].y = y;
+    s_tev_w = next;
+}
+
+static int touch_q_pop(TouchEv* out) {
+    if (s_tev_r == s_tev_w) return 0;
+    *out = s_tev[s_tev_r];
+    s_tev_r = (s_tev_r + 1) % TOUCH_Q;
+    return 1;
+}
+
+static int mouse_from_touch(const SDL_Event* e) {
+    if (e->type == SDL_MOUSEBUTTONDOWN || e->type == SDL_MOUSEBUTTONUP) return e->button.which == SDL_TOUCH_MOUSEID;
+    if (e->type == SDL_MOUSEMOTION) return e->motion.which == SDL_TOUCH_MOUSEID;
+    return 0;
 }
 
 void pc_touch_note_event(const SDL_Event* e) {
     float x, y;
-    if (e == NULL || g_pc_window_w < 2 || g_pc_window_h < 2) return;
+    int kind;
+    if (e == NULL) return;
+    if (mouse_from_touch(e)) return; /* hint should already suppress these */
     if (e->type == SDL_FINGERDOWN || e->type == SDL_FINGERUP || e->type == SDL_FINGERMOTION) {
-        x = e->tfinger.x * (float)g_pc_window_w;
-        y = e->tfinger.y * (float)g_pc_window_h;
-        finger_set(e->tfinger.fingerId, x, y, e->type);
-        if (s_logged < 6 && e->type != SDL_FINGERMOTION) {
+        pc_touch_finger_xy(e->tfinger.x, e->tfinger.y, &x, &y);
+        kind = (e->type == SDL_FINGERDOWN) ? TEV_DOWN : (e->type == SDL_FINGERUP) ? TEV_UP : TEV_MOVE;
+        s_last_finger_ms = e->tfinger.timestamp ? e->tfinger.timestamp : SDL_GetTicks();
+        touch_q_push(s_last_finger_ms, e->tfinger.fingerId, kind, x, y);
+        if (s_logged < 8 && e->type != SDL_FINGERMOTION) {
             char line[96];
             s_logged++;
-            snprintf(line, sizeof(line), "touch %s id=%lld x=%.3f y=%.3f",
-                     e->type == SDL_FINGERDOWN ? "down" : "up",
-                     (long long)e->tfinger.fingerId, e->tfinger.x, e->tfinger.y);
+            snprintf(line, sizeof(line), "touch %s id=%lld x=%.0f y=%.0f",
+                     kind == TEV_DOWN ? "down" : "up",
+                     (long long)e->tfinger.fingerId, x, y);
             pc_diag_milestone(line);
         }
         return;
     }
-    if (e->type == SDL_MOUSEBUTTONDOWN && e->button.button == SDL_BUTTON_LEFT && s_logged < 6) {
+    if (e->type == SDL_MOUSEBUTTONDOWN && e->button.button == SDL_BUTTON_LEFT && s_logged < 8) {
         char line[96];
         s_logged++;
         snprintf(line, sizeof(line), "touch mouse down x=%d y=%d", e->button.x, e->button.y);
         pc_diag_milestone(line);
     }
+}
+
+void pc_touch_cancel_fingers(void) {
+    int i;
+    s_tev_r = s_tev_w = 0;
+    for (i = 0; i < FINGERS; i++) memset(&s_fin[i], 0, sizeof(s_fin[i]));
+    s_mouse_was_down = 0;
+    s_drag_active = 0;
+    s_drag_moved = 0;
+    s_drag_slot = -1;
+    s_stick_slot = -1;
+    s_have_target = 0;
 }
 
 static GAME_PLAY* get_game_play(void) {
@@ -2192,6 +2218,300 @@ static int handle_claim_modal_tap(float tx, float ty) {
     return 1;
 }
 
+static void touch_dispatch_edges(Hud* hud, float tap_slop) {
+    int i;
+/* 1. Process new finger-down events */
+for (i = 0; i < FINGERS; i++) {
+    Finger* f = &s_fin[i];
+    if (!f->just_down) continue;
+    f->just_down = 0;
+
+    if (pc_bedroom_claim_prompt_active()) {
+        f->hit = HIT_SHEET_BODY;
+        f->just_up = 0;
+        handle_claim_modal_tap(f->ox, f->oy);
+        continue;
+    }
+
+    f->hit = classify(f->ox, f->oy, &hud, &f->key);
+
+    if (f->hit == HIT_SHEET_CLOSE) {
+        latch_button(PAD_BUTTON_B, "B");
+        s_sheet.active = 0;
+        s_sheet.swap_mode = 0;
+        pc_touch_buzz();
+        note_tap("sheet_close");
+    } else if (f->hit == HIT_SHEET_BELLS) {
+        mobile_sheet_handle_bells();
+    } else if (f->hit == HIT_SHEET_TAB) {
+        mobile_sheet_handle_tab(f->key);
+    } else if (f->hit == HIT_SHEET_CARD) {
+        mobile_sheet_handle_card(f->key);
+    } else if (f->hit == HIT_SHEET_ACT) {
+        mobile_sheet_handle_act(f->key);
+    } else if (f->hit == HIT_KEY) {
+        if (f->key >= 0 && f->key < hud->key_n) {
+            type_char(hud->kc[f->key]);
+        }
+    } else if (f->hit == HIT_CHOICE) {
+        pick_choice(f->key);
+        pc_touch_buzz();
+    } else if (f->hit == HIT_SUB_TAB) {
+        handle_sub_tab_tap(f->key);
+        pc_touch_buzz();
+    } else if (f->hit == HIT_NUB) {
+        g_pc_settings.touch_stick = !g_pc_settings.touch_stick;
+        pc_settings_save();
+        pc_touch_buzz();
+        pc_diag_milestone(g_pc_settings.touch_stick ? "touch stick shown" : "touch stick hidden");
+    } else if (f->hit == HIT_MENU) {
+        pc_touch_buzz();
+        pc_diag_milestone("touch menu");
+        if (g_pc_title_main_menu_visible && !pc_settings_menu_active() && !pc_play_online_menu_active() && !pc_play_offline_menu_active())
+            latch_button(PAD_BUTTON_START, "Start");
+        else if (message_open() || submenu_open() || pc_settings_menu_active() || pc_play_online_menu_active() || pc_play_offline_menu_active())
+            latch_button(PAD_BUTTON_B, "B");
+        else if (g_pc_paused) pause_key(SDLK_ESCAPE);
+        else pc_pause_menu_toggle();
+    } else if (f->hit == HIT_CLOSE) {
+        pc_diag_milestone("touch close");
+        note_tap("close");
+        cancel_keys_or_close();
+    } else if (f->hit == HIT_ACTION || f->hit == HIT_CONTEXT) {
+        latch_button(PAD_BUTTON_A, "A");
+        pc_touch_buzz();
+        pc_diag_milestone("touch action");
+        note_tap("action");
+    } else if (f->hit == HIT_BACK) {
+        latch_button(PAD_BUTTON_B, "B");
+        pc_touch_buzz();
+        pc_diag_milestone("touch back");
+        note_tap("back");
+        if (g_pc_paused) pause_key(SDLK_ESCAPE);
+    } else if (f->hit == HIT_STORAGE) {
+        pc_touch_buzz();
+        pc_diag_milestone("touch storage");
+        if (!submenu_open() && get_game_play() != NULL) {
+            pc_cloud_storage_client_open(NULL);
+            pc_dresser_ui_begin(NULL);
+            mSM_open_submenu(&get_game_play()->submenu, mSM_OVL_INVENTORY, mSM_IV_OPEN_HANIWA_ENTRUST, 0);
+        }
+    } else if (f->hit == HIT_STOR_PREV) {
+        pc_touch_buzz();
+        pc_cloud_storage_client_prev_page();
+        pc_dresser_ui_note_input();
+        sAdo_SysTrgStart(NA_SE_CURSOL);
+    } else if (f->hit == HIT_STOR_NEXT) {
+        pc_touch_buzz();
+        pc_cloud_storage_client_next_page();
+        pc_dresser_ui_note_input();
+        sAdo_SysTrgStart(NA_SE_CURSOL);
+    } else if (f->hit == HIT_BAG) {
+        s_have_target = 0;
+        latch_button(PAD_BUTTON_Y, "Y");
+        pc_touch_buzz();
+        pc_diag_milestone("touch inventory");
+    } else if (f->hit == HIT_MAP) {
+        s_have_target = 0;
+        latch_button(PAD_BUTTON_X, "X");
+        pc_touch_buzz();
+        pc_diag_milestone("touch map");
+    } else if (f->hit == HIT_CHAT) {
+        s_have_target = 0;
+        pc_touch_buzz();
+        pc_chat_touch_open();
+        note_tap("chat");
+    } else if (f->hit == HIT_TOOL || f->hit == HIT_EMOTE) {
+        pc_touch_buzz();
+    } else if (f->hit == HIT_DPAD_UP) {
+        latch_button(PAD_BUTTON_UP, "Up");
+        pc_touch_buzz();
+    } else if (f->hit == HIT_DPAD_DOWN) {
+        latch_button(PAD_BUTTON_DOWN, "Down");
+        pc_touch_buzz();
+    } else if (f->hit == HIT_DPAD_LEFT) {
+        latch_button(PAD_BUTTON_LEFT, "Left");
+        pc_touch_buzz();
+    } else if (f->hit == HIT_DPAD_RIGHT) {
+        latch_button(PAD_BUTTON_RIGHT, "Right");
+        pc_touch_buzz();
+    } else if (f->hit == HIT_TRIG_L) {
+        latch_button(PAD_TRIGGER_L, "L");
+        pc_touch_buzz();
+    } else if (f->hit == HIT_TRIG_R) {
+        latch_button(PAD_TRIGGER_R, "R");
+        pc_touch_buzz();
+    } else if (f->hit == HIT_STICK) {
+        s_stick_slot = i;
+        s_stick_kx = hud->sx;
+        s_stick_ky = hud->sy;
+        s_have_target = 0;
+        s_drag_active = 0;
+        pc_touch_buzz();
+    } else if (f->hit == HIT_PICTURE) {
+        if (can_steer() && s_drag_slot < 0) {
+            s_drag_slot = i;
+            s_drag_active = 1;
+            s_drag_ox = f->ox;
+            s_drag_oy = f->oy;
+            s_drag_cx = f->x;
+            s_drag_cy = f->y;
+            s_drag_t0 = f->t0;
+            s_drag_moved = 0;
+        }
+    }
+}
+
+/* 4. Process finger-up events */
+for (i = 0; i < FINGERS; i++) {
+    Finger* f = &s_fin[i];
+    float dx, dy, dist;
+    Uint32 dt;
+    if (!f->just_up) continue;
+    f->just_up = 0;
+    dx = f->x - f->ox;
+    dy = f->y - f->oy;
+    dist = hypotf(dx, dy);
+    dt = SDL_GetTicks() - f->t0;
+
+    if (f->hit == HIT_TITLE) {
+        if (!f->moved && dist < tap_slop && f->key >= 0 && f->key < s_tcard.n) {
+            char line[64];
+            s_title_valid = 1;
+            s_title_life = 3;
+            s_title_y = 135.0f + (float)f->key * 18.0f;
+            /* The logo actor confirms this row itself. Do not also hold A for three frames. */
+            snprintf(line, sizeof(line), "touch title row %d %s", f->key,
+                     s_tcard.label[f->key] != NULL ? s_tcard.label[f->key] : "");
+            pc_diag_milestone(line);
+            note_tap("title");
+            pc_touch_buzz();
+        }
+    } else if (f->hit == HIT_STICK && s_stick_slot == i) {
+        s_stick_slot = -1;
+        s_stick_kx = 0.0f;
+        s_stick_ky = 0.0f;
+    } else if (f->hit == HIT_TOOL) {
+        if (!f->moved && dist < tap_slop) {
+            equip_next_tool();
+        }
+    } else if (f->hit == HIT_CAM) {
+        if (dx > 25.0f) {
+            GAME_PLAY* play = get_game_play();
+            if (play != NULL) {
+                play->camera.indoor_direction_addition_idx = 2;
+                sAdo_SysTrgStart(NA_SE_CAMERA_MOVE1);
+                pc_touch_buzz();
+                pc_diag_milestone("cam rotate right");
+            }
+        } else if (dx < -25.0f) {
+            GAME_PLAY* play = get_game_play();
+            if (play != NULL) {
+                play->camera.indoor_direction_addition_idx = 0;
+                sAdo_SysTrgStart(NA_SE_CAMERA_MOVE1);
+                pc_touch_buzz();
+                pc_diag_milestone("cam rotate left");
+            }
+        } else {
+            pc_touch_cam_cycle();
+        }
+    } else if (f->hit == HIT_PICTURE) {
+        if (s_drag_slot == i) {
+            if (!f->moved && (!s_drag_moved || (dt < 240 && dist < tap_slop))) {
+                if (can_steer()) begin_move(f->ox, f->oy, 1);
+                else on_picture_release(f->ox, f->oy);
+            }
+            s_drag_active = 0;
+            s_drag_moved = 0;
+            s_drag_slot = -1;
+        } else if (!can_steer() && !f->moved) {
+            if (dist < tap_slop) {
+                on_picture_release(f->ox, f->oy);
+            } else if (submenu_open() && !s_sheet.active && dist > 45.0f) {
+                if (fabsf(dx) > fabsf(dy)) {
+                    s_swipe = (dx > 0.0f) ? 1 : -1;
+                } else {
+                    s_swipe = (dy < 0.0f) ? 2 : -2;
+                }
+                pc_touch_buzz();
+                pc_diag_milestone("submenu swipe");
+            } else if (s_hud == HUD_MENU && fabsf(dy) > 52.0f && fabsf(dy) > fabsf(dx)) {
+                s_swipe = (dy < 0.0f) ? 70 : -70;
+                pc_diag_milestone("swipe");
+            }
+        }
+    }
+
+    f->hit = HIT_NONE;
+    f->key = -1;
+    f->moved = 0;
+}
+
+}
+
+static Finger* finger_by_id(SDL_FingerID id, int* index, int alloc) {
+    int i, free_slot = -1;
+    for (i = 0; i < FINGERS - 1; i++) {
+        if (s_fin[i].id == id && (s_fin[i].down || s_fin[i].just_down || s_fin[i].just_up)) {
+            if (index) *index = i;
+            return &s_fin[i];
+        }
+        if (!s_fin[i].down && !s_fin[i].just_down && !s_fin[i].just_up && free_slot < 0) free_slot = i;
+    }
+    if (!alloc || free_slot < 0) return NULL;
+    memset(&s_fin[free_slot], 0, sizeof(s_fin[free_slot]));
+    s_fin[free_slot].id = id;
+    s_fin[free_slot].key = -1;
+    s_fin[free_slot].hit = HIT_NONE;
+    if (index) *index = free_slot;
+    return &s_fin[free_slot];
+}
+
+/* Replay queued finger events in timestamp order. A second tap is not merged into the first. */
+static void touch_replay_queue(Hud* hud, float tap_slop) {
+    TouchEv ev;
+    while (touch_q_pop(&ev)) {
+        Finger* f;
+        if (ev.kind == TEV_MOVE) {
+            f = finger_by_id(ev.id, NULL, 0);
+            if (f != NULL && f->down) { f->x = ev.x; f->y = ev.y; }
+            continue;
+        }
+        if (ev.kind == TEV_DOWN) {
+            f = finger_by_id(ev.id, NULL, 0);
+            if (f != NULL && (f->just_down || f->down)) {
+                if (f->just_down) touch_dispatch_edges(hud, tap_slop);
+                f->down = 0;
+                f->just_up = 1;
+                touch_dispatch_edges(hud, tap_slop);
+            }
+            f = finger_by_id(ev.id, NULL, 1);
+            if (f == NULL) continue;
+            f->id = ev.id;
+            f->x = f->ox = ev.x;
+            f->y = f->oy = ev.y;
+            f->t0 = ev.t;
+            f->down = 1;
+            f->just_down = 1;
+            f->just_up = 0;
+            f->moved = 0;
+            f->hit = HIT_NONE;
+            f->key = -1;
+            touch_dispatch_edges(hud, tap_slop);
+            continue;
+        }
+        f = finger_by_id(ev.id, NULL, 0);
+        if (f == NULL) continue;
+        f->x = ev.x;
+        f->y = ev.y;
+        if (f->just_down) touch_dispatch_edges(hud, tap_slop);
+        f->down = 0;
+        f->just_up = 1;
+        touch_dispatch_edges(hud, tap_slop);
+    }
+    touch_dispatch_edges(hud, tap_slop); /* mouse slot, if a real click is waiting */
+}
+
 void pc_touch_apply(unsigned short* buttons, signed char* stick_x, signed char* stick_y,
                     signed char* cstick_x, signed char* cstick_y,
                     int* wheel_hold, int* emote_hold, int* pointer_x, int* pointer_y) {
@@ -2250,147 +2570,7 @@ void pc_touch_apply(unsigned short* buttons, signed char* stick_x, signed char* 
         s_pending_row = -1;
     }
 
-    /* 1. Process new finger-down events */
-    for (i = 0; i < FINGERS; i++) {
-        Finger* f = &s_fin[i];
-        if (!f->just_down) continue;
-        f->just_down = 0;
-
-        if (pc_bedroom_claim_prompt_active()) {
-            f->hit = HIT_SHEET_BODY;
-            f->just_up = 0;
-            handle_claim_modal_tap(f->ox, f->oy);
-            continue;
-        }
-
-        f->hit = classify(f->ox, f->oy, &hud, &f->key);
-
-        if (f->hit == HIT_SHEET_CLOSE) {
-            latch_button(PAD_BUTTON_B, "B");
-            s_sheet.active = 0;
-            s_sheet.swap_mode = 0;
-            pc_touch_buzz();
-            note_tap("sheet_close");
-        } else if (f->hit == HIT_SHEET_BELLS) {
-            mobile_sheet_handle_bells();
-        } else if (f->hit == HIT_SHEET_TAB) {
-            mobile_sheet_handle_tab(f->key);
-        } else if (f->hit == HIT_SHEET_CARD) {
-            mobile_sheet_handle_card(f->key);
-        } else if (f->hit == HIT_SHEET_ACT) {
-            mobile_sheet_handle_act(f->key);
-        } else if (f->hit == HIT_KEY) {
-            if (f->key >= 0 && f->key < hud.key_n) {
-                type_char(hud.kc[f->key]);
-            }
-        } else if (f->hit == HIT_CHOICE) {
-            pick_choice(f->key);
-            pc_touch_buzz();
-        } else if (f->hit == HIT_SUB_TAB) {
-            handle_sub_tab_tap(f->key);
-            pc_touch_buzz();
-        } else if (f->hit == HIT_NUB) {
-            g_pc_settings.touch_stick = !g_pc_settings.touch_stick;
-            pc_settings_save();
-            pc_touch_buzz();
-            pc_diag_milestone(g_pc_settings.touch_stick ? "touch stick shown" : "touch stick hidden");
-        } else if (f->hit == HIT_MENU) {
-            pc_touch_buzz();
-            pc_diag_milestone("touch menu");
-            if (g_pc_title_main_menu_visible && !pc_settings_menu_active() && !pc_play_online_menu_active() && !pc_play_offline_menu_active())
-                latch_button(PAD_BUTTON_START, "Start");
-            else if (message_open() || submenu_open() || pc_settings_menu_active() || pc_play_online_menu_active() || pc_play_offline_menu_active())
-                latch_button(PAD_BUTTON_B, "B");
-            else if (g_pc_paused) pause_key(SDLK_ESCAPE);
-            else pc_pause_menu_toggle();
-        } else if (f->hit == HIT_CLOSE) {
-            pc_diag_milestone("touch close");
-            note_tap("close");
-            cancel_keys_or_close();
-        } else if (f->hit == HIT_ACTION || f->hit == HIT_CONTEXT) {
-            latch_button(PAD_BUTTON_A, "A");
-            pc_touch_buzz();
-            pc_diag_milestone("touch action");
-            note_tap("action");
-        } else if (f->hit == HIT_BACK) {
-            latch_button(PAD_BUTTON_B, "B");
-            pc_touch_buzz();
-            pc_diag_milestone("touch back");
-            note_tap("back");
-            if (g_pc_paused) pause_key(SDLK_ESCAPE);
-        } else if (f->hit == HIT_STORAGE) {
-            pc_touch_buzz();
-            pc_diag_milestone("touch storage");
-            if (!submenu_open() && get_game_play() != NULL) {
-                pc_cloud_storage_client_open(NULL);
-                pc_dresser_ui_begin(NULL);
-                mSM_open_submenu(&get_game_play()->submenu, mSM_OVL_INVENTORY, mSM_IV_OPEN_HANIWA_ENTRUST, 0);
-            }
-        } else if (f->hit == HIT_STOR_PREV) {
-            pc_touch_buzz();
-            pc_cloud_storage_client_prev_page();
-            pc_dresser_ui_note_input();
-            sAdo_SysTrgStart(NA_SE_CURSOL);
-        } else if (f->hit == HIT_STOR_NEXT) {
-            pc_touch_buzz();
-            pc_cloud_storage_client_next_page();
-            pc_dresser_ui_note_input();
-            sAdo_SysTrgStart(NA_SE_CURSOL);
-        } else if (f->hit == HIT_BAG) {
-            s_have_target = 0;
-            latch_button(PAD_BUTTON_Y, "Y");
-            pc_touch_buzz();
-            pc_diag_milestone("touch inventory");
-        } else if (f->hit == HIT_MAP) {
-            s_have_target = 0;
-            latch_button(PAD_BUTTON_X, "X");
-            pc_touch_buzz();
-            pc_diag_milestone("touch map");
-        } else if (f->hit == HIT_CHAT) {
-            s_have_target = 0;
-            pc_touch_buzz();
-            pc_chat_touch_open();
-            note_tap("chat");
-        } else if (f->hit == HIT_TOOL || f->hit == HIT_EMOTE) {
-            pc_touch_buzz();
-        } else if (f->hit == HIT_DPAD_UP) {
-            latch_button(PAD_BUTTON_UP, "Up");
-            pc_touch_buzz();
-        } else if (f->hit == HIT_DPAD_DOWN) {
-            latch_button(PAD_BUTTON_DOWN, "Down");
-            pc_touch_buzz();
-        } else if (f->hit == HIT_DPAD_LEFT) {
-            latch_button(PAD_BUTTON_LEFT, "Left");
-            pc_touch_buzz();
-        } else if (f->hit == HIT_DPAD_RIGHT) {
-            latch_button(PAD_BUTTON_RIGHT, "Right");
-            pc_touch_buzz();
-        } else if (f->hit == HIT_TRIG_L) {
-            latch_button(PAD_TRIGGER_L, "L");
-            pc_touch_buzz();
-        } else if (f->hit == HIT_TRIG_R) {
-            latch_button(PAD_TRIGGER_R, "R");
-            pc_touch_buzz();
-        } else if (f->hit == HIT_STICK) {
-            s_stick_slot = i;
-            s_stick_kx = hud.sx;
-            s_stick_ky = hud.sy;
-            s_have_target = 0;
-            s_drag_active = 0;
-            pc_touch_buzz();
-        } else if (f->hit == HIT_PICTURE) {
-            if (can_steer() && s_drag_slot < 0) {
-                s_drag_slot = i;
-                s_drag_active = 1;
-                s_drag_ox = f->ox;
-                s_drag_oy = f->oy;
-                s_drag_cx = f->x;
-                s_drag_cy = f->y;
-                s_drag_t0 = f->t0;
-                s_drag_moved = 0;
-            }
-        }
-    }
+    touch_replay_queue(&hud, tap_slop);
 
     /* 2. Check if two fingers are simultaneously in HIT_PICTURE for 2-finger camera gestures */
     for (i = 0; i < FINGERS; i++) {
@@ -2576,90 +2756,6 @@ void pc_touch_apply(unsigned short* buttons, signed char* stick_x, signed char* 
         }
     }
 
-    /* 4. Process finger-up events */
-    for (i = 0; i < FINGERS; i++) {
-        Finger* f = &s_fin[i];
-        float dx, dy, dist;
-        Uint32 dt;
-        if (!f->just_up) continue;
-        f->just_up = 0;
-        dx = f->x - f->ox;
-        dy = f->y - f->oy;
-        dist = hypotf(dx, dy);
-        dt = SDL_GetTicks() - f->t0;
-
-        if (f->hit == HIT_TITLE) {
-            if (!f->moved && dist < tap_slop && f->key >= 0 && f->key < s_tcard.n) {
-                char line[64];
-                s_title_valid = 1;
-                s_title_life = 3;
-                s_title_y = 135.0f + (float)f->key * 18.0f;
-                latch_button(PAD_BUTTON_A, "A");
-                snprintf(line, sizeof(line), "touch title row %d %s", f->key,
-                         s_tcard.label[f->key] != NULL ? s_tcard.label[f->key] : "");
-                pc_diag_milestone(line);
-                note_tap("title");
-                pc_touch_buzz();
-            }
-        } else if (f->hit == HIT_STICK && s_stick_slot == i) {
-            s_stick_slot = -1;
-            s_stick_kx = 0.0f;
-            s_stick_ky = 0.0f;
-        } else if (f->hit == HIT_TOOL) {
-            if (!f->moved && dist < tap_slop) {
-                equip_next_tool();
-            }
-        } else if (f->hit == HIT_CAM) {
-            if (dx > 25.0f) {
-                GAME_PLAY* play = get_game_play();
-                if (play != NULL) {
-                    play->camera.indoor_direction_addition_idx = 2;
-                    sAdo_SysTrgStart(NA_SE_CAMERA_MOVE1);
-                    pc_touch_buzz();
-                    pc_diag_milestone("cam rotate right");
-                }
-            } else if (dx < -25.0f) {
-                GAME_PLAY* play = get_game_play();
-                if (play != NULL) {
-                    play->camera.indoor_direction_addition_idx = 0;
-                    sAdo_SysTrgStart(NA_SE_CAMERA_MOVE1);
-                    pc_touch_buzz();
-                    pc_diag_milestone("cam rotate left");
-                }
-            } else {
-                pc_touch_cam_cycle();
-            }
-        } else if (f->hit == HIT_PICTURE) {
-            if (s_drag_slot == i) {
-                if (!f->moved && (!s_drag_moved || (dt < 240 && dist < tap_slop))) {
-                    if (can_steer()) begin_move(f->ox, f->oy, 1);
-                    else on_picture_release(f->ox, f->oy);
-                }
-                s_drag_active = 0;
-                s_drag_moved = 0;
-                s_drag_slot = -1;
-            } else if (!can_steer() && !f->moved) {
-                if (dist < tap_slop) {
-                    on_picture_release(f->ox, f->oy);
-                } else if (submenu_open() && !s_sheet.active && dist > 45.0f) {
-                    if (fabsf(dx) > fabsf(dy)) {
-                        s_swipe = (dx > 0.0f) ? 1 : -1;
-                    } else {
-                        s_swipe = (dy < 0.0f) ? 2 : -2;
-                    }
-                    pc_touch_buzz();
-                    pc_diag_milestone("submenu swipe");
-                } else if (s_hud == HUD_MENU && fabsf(dy) > 52.0f && fabsf(dy) > fabsf(dx)) {
-                    s_swipe = (dy < 0.0f) ? 70 : -70;
-                    pc_diag_milestone("swipe");
-                }
-            }
-        }
-
-        f->hit = HIT_NONE;
-        f->key = -1;
-        f->moved = 0;
-    }
 
     if (s_pulse_a) { latch_button(PAD_BUTTON_A, "A"); s_pulse_a = 0; pc_touch_buzz(); }
     if (s_pulse_b) { latch_button(PAD_BUTTON_B, "B"); s_pulse_b = 0; pc_touch_buzz(); }

@@ -275,6 +275,9 @@ void pc_platform_init(void) {
 #ifdef __ANDROID__
     SDL_SetHint(SDL_HINT_ANDROID_BLOCK_ON_PAUSE, "1"); /* the loop waits while stopped; the GL context is kept and rebound on resume */
 #endif
+    /* A finger must not also arrive as a mouse click, and a mouse click must not also arrive as a finger. */
+    SDL_SetHint(SDL_HINT_TOUCH_MOUSE_EVENTS, "0");
+    SDL_SetHint(SDL_HINT_MOUSE_TOUCH_EVENTS, "0");
     if (SDL_Init(g_pc_headless ? (SDL_INIT_TIMER | SDL_INIT_EVENTS)
                                : (SDL_INIT_VIDEO | SDL_INIT_GAMECONTROLLER | SDL_INIT_AUDIO | SDL_INIT_TIMER)) < 0) {
         char msg[256];
@@ -444,14 +447,16 @@ void pc_platform_shutdown(void) {
 int g_pc_content_x = 0, g_pc_content_y = 0, g_pc_content_w = PC_SCREEN_WIDTH, g_pc_content_h = PC_SCREEN_HEIGHT;
 int g_pc_layout_portrait = 0;
 
+static int s_insets_cached = 0;
+
 void pc_layout_insets(int* l, int* t, int* r, int* b) {
-    static int s_cached = 0, s_l = 0, s_t = 0, s_r = 0, s_b = 0;
+    static int s_l = 0, s_t = 0, s_r = 0, s_b = 0;
     static Uint32 s_last_ms = 0;
     Uint32 now = SDL_GetTicks();
-    if (!s_cached || now - s_last_ms > 1000u) {
+    if (!s_insets_cached || now - s_last_ms > 200u) {
         FILE* f = fopen("safe_insets.txt", "r");
         s_last_ms = now;
-        s_cached = 1;
+        s_insets_cached = 1;
         s_l = s_t = s_r = s_b = 0;
         if (f != NULL) {
             if (fscanf(f, "%d %d %d %d", &s_l, &s_t, &s_r, &s_b) != 4) s_l = s_t = s_r = s_b = 0;
@@ -461,6 +466,25 @@ void pc_layout_insets(int* l, int* t, int* r, int* b) {
             if (s_r < 0) s_r = 0;
             if (s_b < 0) s_b = 0;
         }
+#ifdef __ANDROID__
+        /* The status bar is already outside the SDL surface when the window is
+         * shorter than the display. Applying that inset again shifts every tap
+         * by the bar height (the 63px gap). */
+        if (g_pc_window != NULL && g_pc_window_w > 2 && g_pc_window_h > 2) {
+            int display = SDL_GetWindowDisplayIndex(g_pc_window);
+            SDL_Rect bounds;
+            if (display >= 0 && SDL_GetDisplayBounds(display, &bounds) == 0) {
+                if (s_t + s_b > 0 && bounds.h >= g_pc_window_h + s_t + s_b - 8) {
+                    s_t = 0;
+                    s_b = 0;
+                }
+                if (s_l + s_r > 0 && bounds.w >= g_pc_window_w + s_l + s_r - 8) {
+                    s_l = 0;
+                    s_r = 0;
+                }
+            }
+        }
+#endif
     }
     *l = s_l;
     *t = s_t;
@@ -622,6 +646,7 @@ void pc_platform_update_window_size(void) {
     SDL_GL_GetDrawableSize(g_pc_window, &g_pc_window_w, &g_pc_window_h);
     if (g_pc_window_w <= 0) g_pc_window_w = PC_SCREEN_WIDTH;
     if (g_pc_window_h <= 0) g_pc_window_h = PC_SCREEN_HEIGHT;
+    s_insets_cached = 0; /* fold/unfold and the IME resize the window */
     pc_layout_refresh();
 }
 
@@ -845,6 +870,7 @@ int pc_platform_poll_events(void) {
                  * SDL_HINT_ANDROID_BLOCK_ON_PAUSE waits inside SDL until the surface is back, which is the multi-second
                  * idle gap when the activity pauses (a redundant orientation request used to cause that). */
                 pc_diag_milestone("app background");
+                pc_touch_cancel_fingers(); /* a missing finger-up must not leave a stick held */
                 pc_save_flush_background();
                 break;
             case SDL_APP_DIDENTERFOREGROUND:

@@ -179,13 +179,18 @@ static int s_ime_miss = 0;
 
 static void ime_place_rect(void) {
     SDL_Rect r;
-    if (g_pc_window == NULL || g_pc_window_w < 2 || g_pc_window_h < 2) return;
-    /* Sit the field in the upper third so the name bubble stays above the keyboard. */
-    r.w = g_pc_window_w * 2 / 3;
+    int dw = 0, dh = 0;
+    if (g_pc_window == NULL) return;
+    SDL_GL_GetDrawableSize(g_pc_window, &dw, &dh);
+    if (dw < 2) dw = g_pc_window_w;
+    if (dh < 2) dh = g_pc_window_h;
+    if (dw < 2 || dh < 2) return;
+    /* Same drawable the finger converter uses. Keep the field in the upper third. */
+    r.w = dw * 2 / 3;
     if (r.w < 1) r.w = 1;
     r.h = 72;
-    r.x = (g_pc_window_w - r.w) / 2;
-    r.y = g_pc_window_h / 5;
+    r.x = (dw - r.w) / 2;
+    r.y = dh / 5;
     SDL_SetTextInputRect(&r);
 }
 
