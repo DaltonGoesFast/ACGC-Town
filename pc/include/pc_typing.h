@@ -39,12 +39,19 @@ int  pc_utf8_to_game_code(const char* text);
 void pc_typing_handle_event(const SDL_Event* event);
 void pc_typing_update(void);
 
+/* 1 while the system keyboard is standing in for the GameCube keyboard. */
+int pc_typing_hide_gc_keyboard(void);
+/* 1 when the system keyboard did not appear and the drawn keys should show. */
+int pc_typing_use_drawn_keys(void);
+
 #else
 
 #define g_pc_typing_mode   0
 #define g_pc_editor_active 0
 static inline void pc_typing_handle_event(const SDL_Event* event) { (void)event; }
 static inline void pc_typing_update(void) {}
+static inline int pc_typing_hide_gc_keyboard(void) { return 0; }
+static inline int pc_typing_use_drawn_keys(void) { return 0; }
 
 #endif /* KEYBOARD_TYPING */
 

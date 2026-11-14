@@ -25,6 +25,10 @@ void pc_touch_pulse_b(void);
 /* 1 if a title-menu row was tapped this frame. font_y is in the 240-tall font space. */
 int pc_touch_take_title_tap(float* font_y);
 
+/* 1 while the touch layer is drawing the phone title card. The GameCube title
+ * strings stay hidden so they do not sit under the buttons. */
+int pc_touch_title_card_active(void);
+
 int pc_touch_finger_count(void);
 int pc_touch_hud_mode(void);
 void pc_touch_hud_state(char* buf, size_t n);

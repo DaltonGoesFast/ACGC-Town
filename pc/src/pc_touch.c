@@ -45,6 +45,7 @@ extern void pc_creator_menu_pointer(float fx, float fy);
 #include "m_birthday_ovl.h"
 #include "m_item_name.h"
 #include "m_font.h"
+#include "m_editor_ovl.h"
 #include "dataobject.h"
 #include "audio.h"
 #include "audio_defs.h"
@@ -70,7 +71,8 @@ enum { HIT_NONE = 0, HIT_PICTURE, HIT_STICK, HIT_NUB, HIT_ACTION, HIT_BACK, HIT_
        HIT_SHEET_CLOSE, HIT_SHEET_BELLS, HIT_SHEET_TAB, HIT_SHEET_CARD, HIT_SHEET_ACT, HIT_SHEET_BODY, HIT_CAM,
        HIT_STORAGE, HIT_STOR_PREV, HIT_STOR_NEXT,
        HIT_TOOL, HIT_EMOTE, HIT_CHAT,
-       HIT_DPAD_UP, HIT_DPAD_DOWN, HIT_DPAD_LEFT, HIT_DPAD_RIGHT, HIT_TRIG_L, HIT_TRIG_R };
+       HIT_DPAD_UP, HIT_DPAD_DOWN, HIT_DPAD_LEFT, HIT_DPAD_RIGHT, HIT_TRIG_L, HIT_TRIG_R,
+       HIT_TITLE };
 
 typedef struct {
     int active;            /* 1 if drawer is visible */
@@ -232,7 +234,10 @@ int pc_touch_take_title_tap(float* font_y) {
     return 1;
 }
 
+static Uint32 s_last_finger_ms = 0;
+
 static void finger_set(SDL_FingerID id, float x, float y, int type) {
+    s_last_finger_ms = SDL_GetTicks();
     int i, free_slot = -1;
     for (i = 0; i < FINGERS; i++) {
         if ((s_fin[i].down || s_fin[i].just_down || s_fin[i].just_up) && s_fin[i].id == id) {
@@ -316,7 +321,7 @@ static int submenu_open(void) {
 
 static int keys_up(void) {
 #ifdef KEYBOARD_TYPING
-    if (g_pc_editor_active && g_pc_settings.touch_keyboard) {
+    if (g_pc_editor_active && g_pc_settings.touch_keyboard && pc_typing_use_drawn_keys()) {
         GAME_PLAY* play = get_game_play();
         if (play != NULL && play->submenu.menu_type == mSM_OVL_EDITOR &&
             play->submenu.overlay != NULL &&
@@ -324,9 +329,16 @@ static int keys_up(void) {
             return 1;
         }
     }
-    if (pc_chat_typing() && g_pc_settings.touch_keyboard) return 1;
+    if (pc_chat_typing() && g_pc_settings.touch_keyboard) {
+        if (g_pc_window != NULL && SDL_IsScreenKeyboardShown(g_pc_window)) return 0;
+        return 1;
+    }
 #endif
-    return pc_play_online_menu_text_active();
+    if (pc_play_online_menu_text_active()) {
+        if (g_pc_window != NULL && SDL_IsScreenKeyboardShown(g_pc_window)) return 0;
+        return 1;
+    }
+    return 0;
 }
 
 /* The 3D picture is the full content rect (portrait Vert+). GC menus and dialogue
@@ -460,6 +472,104 @@ static int in_player_house(void) {
  * Town HUD must stay down until that actor is gone. */
 static int title_presentation_up(void) {
     return Common_Get(clip.animal_logo_clip) != NULL;
+}
+
+/* Same ids and order as aAL_pc_menu_build in ac_animal_logo.c. A tap reports
+ * the row index; the logo actor confirms that row. */
+enum {
+    TITLE_ITEM_START = 0,
+    TITLE_ITEM_OPTIONS = 1,
+    TITLE_ITEM_QUIT = 2,
+    TITLE_ITEM_GUEST = 3,
+    TITLE_ITEM_ONLINE = 4,
+    TITLE_ITEM_OFFLINE = 5
+};
+
+typedef struct {
+    int active;
+    int n;
+    int item[5];
+    const char* label[5];
+    float cx, bw, bh;
+    float cy[5];
+} TitleCard;
+
+static TitleCard s_tcard;
+
+static const char* title_item_label(int item) {
+    extern const char* pc_guest_title_label(void);
+    switch (item) {
+    case TITLE_ITEM_START: return "Start Game";
+    case TITLE_ITEM_OPTIONS: return "Options";
+    case TITLE_ITEM_QUIT: return "Quit Game";
+    case TITLE_ITEM_GUEST: return pc_guest_title_label();
+    case TITLE_ITEM_ONLINE: return "Play Online";
+    case TITLE_ITEM_OFFLINE: return "Play Offline";
+    default: return "Play";
+    }
+}
+
+static void title_card_layout(void) {
+    extern int pc_guest_title_item_visible(void);
+    int items[5];
+    int n = 0;
+    int i;
+    float W, H, bw, bh, gap, total, top, bottom, min_top;
+    int il = 0, it = 0, ir = 0, ib = 0;
+    memset(&s_tcard, 0, sizeof(s_tcard));
+    if (!pc_touch_enabled() || !g_pc_title_main_menu_visible) return;
+    if (pc_settings_menu_active() || pc_play_online_menu_active() ||
+        pc_play_offline_menu_active() || pc_creator_menu_active()) return;
+    if (!pc_guest_title_item_visible() && !pc_play_online_menu_available()) {
+        items[n++] = TITLE_ITEM_START;
+    }
+    if (pc_guest_title_item_visible()) {
+        items[n++] = TITLE_ITEM_GUEST;
+    } else if (pc_play_online_menu_available()) {
+        items[n++] = TITLE_ITEM_OFFLINE;
+        items[n++] = TITLE_ITEM_ONLINE;
+    }
+    items[n++] = TITLE_ITEM_OPTIONS;
+    items[n++] = TITLE_ITEM_QUIT;
+
+    W = (float)g_pc_window_w;
+    H = (float)g_pc_window_h;
+    if (W < 2.0f || H < 2.0f) return;
+    pc_layout_insets(&il, &it, &ir, &ib);
+    bw = fminf((W - (float)il - (float)ir) * 0.88f, 720.0f);
+    if (bw < 240.0f) bw = W - 32.0f;
+    bh = fminf(100.0f, fmaxf(68.0f, H * 0.070f));
+    gap = fmaxf(14.0f, bh * 0.20f);
+    total = (float)n * bh + (float)(n - 1) * gap;
+    bottom = H - (float)ib - 24.0f;
+    top = bottom - total;
+    /* The logo sits in the middle of the picture. Keep the stack below it. */
+    min_top = (float)g_pc_content_y + (float)g_pc_content_h * 0.52f;
+    if (top < min_top && bottom - min_top > (float)n * 56.0f) {
+        float room = bottom - min_top;
+        gap = 14.0f;
+        bh = (room - (float)(n - 1) * gap) / (float)n;
+        if (bh > 100.0f) bh = 100.0f;
+        if (bh < 56.0f) bh = 56.0f;
+        total = (float)n * bh + (float)(n - 1) * gap;
+        top = bottom - total;
+    }
+    if (top < (float)it + 8.0f) top = (float)it + 8.0f;
+
+    s_tcard.active = 1;
+    s_tcard.n = n;
+    s_tcard.cx = (float)il + (W - (float)il - (float)ir) * 0.5f;
+    s_tcard.bw = bw;
+    s_tcard.bh = bh;
+    for (i = 0; i < n; i++) {
+        s_tcard.item[i] = items[i];
+        s_tcard.label[i] = title_item_label(items[i]);
+        s_tcard.cy[i] = top + bh * 0.5f + (float)i * (bh + gap);
+    }
+}
+
+int pc_touch_title_card_active(void) {
+    return s_tcard.active;
 }
 
 static void hud_build(Hud* h) {
@@ -741,6 +851,19 @@ static void hud_build(Hud* h) {
         h->ctx_x = W - h->ctx_x;
         for (int i = 0; i < h->sub_tab_n; i++) h->sub_tab_x[i] = W - h->sub_tab_x[i];
     }
+    if (h->show_close) {
+        /* "Back" is wider than the disc. Keep the whole word inside the window,
+         * below the status bar, on either hand. */
+        float half = h->close_r * 1.45f;
+        float minx = half + 10.0f;
+        float maxx = W - half - 10.0f;
+        float miny = h->close_r + 40.0f;
+        if (minx > maxx) { minx = h->close_r + 8.0f; maxx = W - h->close_r - 8.0f; }
+        if (h->close_x < minx) h->close_x = minx;
+        if (h->close_x > maxx) h->close_x = maxx;
+        if (it + h->close_r + 12.0f > miny) miny = (float)it + h->close_r + 12.0f;
+        if (h->close_y < miny) h->close_y = miny;
+    }
     if (!h->show_stick) { h->sx = -1000.0f; }
 
     h->show_storage = 0;
@@ -768,6 +891,7 @@ static void hud_build(Hud* h) {
     }
 
     mobile_sheet_layout();
+    title_card_layout();
     if (s_sheet.active) {
         h->show_action = 0;
         h->show_back = 0;
@@ -798,6 +922,14 @@ static int hit_rect_center(float x, float y, float cx, float cy, float w, float 
 static int classify(float x, float y, Hud* h, int* key) {
     int i;
     *key = -1;
+    if (s_tcard.active) {
+        for (i = 0; i < s_tcard.n; i++) {
+            if (hit_rect_center(x, y, s_tcard.cx, s_tcard.cy[i], s_tcard.bw, s_tcard.bh)) {
+                *key = i;
+                return HIT_TITLE;
+            }
+        }
+    }
     if (s_sheet.active) {
         int sh = mobile_sheet_hit(x, y, key);
         if (sh != HIT_NONE) return sh;
@@ -1902,6 +2034,11 @@ static void on_picture_release(float x, float y) {
         return;
     }
     if (g_pc_title_main_menu_visible) {
+        /* Phone buttons own these rows. A miss on the logo must not pick a font row. */
+        if (s_tcard.active) {
+            note_tap("title-miss");
+            return;
+        }
         int i = (int)((fy - 126.0f) / 18.0f);
         if (i >= 0 && i < 5 && fx > 30.0f && fx < 290.0f) {
             char line[64];
@@ -1982,6 +2119,10 @@ static void sync_mouse_slot(void) {
             any_touch = 1;
             break;
         }
+    }
+    /* A finger also raises the mouse button. Ignore that echo so one tap is one key. */
+    if (!any_touch && s_last_finger_ms != 0 && SDL_GetTicks() - s_last_finger_ms < 500u) {
+        any_touch = 1;
     }
     if (SDL_GetNumTouchDevices() > 0 && !any_touch) {
         SDL_TouchID tid = SDL_GetTouchDevice(0);
@@ -2447,7 +2588,20 @@ void pc_touch_apply(unsigned short* buttons, signed char* stick_x, signed char* 
         dist = hypotf(dx, dy);
         dt = SDL_GetTicks() - f->t0;
 
-        if (f->hit == HIT_STICK && s_stick_slot == i) {
+        if (f->hit == HIT_TITLE) {
+            if (!f->moved && dist < tap_slop && f->key >= 0 && f->key < s_tcard.n) {
+                char line[64];
+                s_title_valid = 1;
+                s_title_life = 3;
+                s_title_y = 135.0f + (float)f->key * 18.0f;
+                latch_button(PAD_BUTTON_A, "A");
+                snprintf(line, sizeof(line), "touch title row %d %s", f->key,
+                         s_tcard.label[f->key] != NULL ? s_tcard.label[f->key] : "");
+                pc_diag_milestone(line);
+                note_tap("title");
+                pc_touch_buzz();
+            }
+        } else if (f->hit == HIT_STICK && s_stick_slot == i) {
             s_stick_slot = -1;
             s_stick_kx = 0.0f;
             s_stick_ky = 0.0f;
@@ -4044,6 +4198,67 @@ static void pc_bedroom_draw_claim_modal(void) {
     draw_str_raw("CANCEL", cancel_cx, btn_y, 1.8f * ui, 0.25f, 0.26f, 0.24f, 0.98f, 12);
 }
 
+static void draw_ime_line(void) {
+    GAME_PLAY* play;
+    mED_Ovl_c* ed;
+    char buf[24];
+    int i, n, j;
+    float cx, cy, pix;
+    static char last[24];
+    if (!pc_typing_hide_gc_keyboard()) return;
+    play = get_game_play();
+    if (play == NULL || play->submenu.overlay == NULL) return;
+    ed = play->submenu.overlay->editor_ovl;
+    if (ed == NULL || ed->input_str == NULL) return;
+    n = ed->input_length;
+    if (n < 0) n = 0;
+    if (n > 16) n = 16;
+    j = 0;
+    for (i = 0; i < n && j < (int)sizeof(buf) - 1; i++) {
+        unsigned char c = ed->input_str[i];
+        if (c >= 32 && c < 127) buf[j++] = (char)c;
+    }
+    buf[j] = 0;
+    if (strcmp(buf, last) != 0) {
+        char line[48];
+        snprintf(last, sizeof(last), "%s", buf);
+        snprintf(line, sizeof(line), "name now [%s]", buf);
+        pc_diag_milestone(line);
+    }
+    cx = (float)g_pc_window_w * 0.5f;
+    cy = (float)g_pc_content_y + (float)g_pc_content_h * 0.38f;
+    pix = fmaxf(3.2f, (float)g_pc_window_h / 420.0f);
+    if (j == 0) draw_text_ac("|", cx, cy, pix, 1.0f, 0.95f, 0.55f, 1.0f, 1, 4);
+    else draw_text_ac(buf, cx, cy, pix, 1.0f, 0.95f, 0.55f, 1.0f, 1, 16);
+}
+
+static void draw_title_card(void) {
+    int i;
+    if (!s_tcard.active) return;
+    for (i = 0; i < s_tcard.n; i++) {
+        float r, g, b, tr, tg, tb;
+        float pix;
+        int item = s_tcard.item[i];
+        const char* label = s_tcard.label[i] != NULL ? s_tcard.label[i] : "";
+        int len = (int)strlen(label);
+        if (item == TITLE_ITEM_OFFLINE || item == TITLE_ITEM_START) {
+            r = 0.30f; g = 0.66f; b = 0.40f; tr = tg = tb = 1.0f;
+        } else if (item == TITLE_ITEM_ONLINE || item == TITLE_ITEM_GUEST) {
+            r = 0.26f; g = 0.50f; b = 0.78f; tr = tg = tb = 1.0f;
+        } else if (item == TITLE_ITEM_QUIT) {
+            r = 0.78f; g = 0.38f; b = 0.34f; tr = tg = tb = 1.0f;
+        } else {
+            r = 0.96f; g = 0.93f; b = 0.86f; tr = 0.18f; tg = 0.18f; tb = 0.16f;
+        }
+        pill_button_shadow(s_tcard.cx, s_tcard.cy[i], s_tcard.bw, s_tcard.bh, r, g, b, 1.0f);
+        pix = s_tcard.bh * 0.040f;
+        if (pix < 2.6f) pix = 2.6f;
+        if (pix > 5.4f) pix = 5.4f;
+        if (len > 16) pix *= 16.0f / (float)len;
+        draw_text_ac(label, s_tcard.cx, s_tcard.cy[i], pix, tr, tg, tb, 1.0f, 1, 36);
+    }
+}
+
 void pc_touch_present(void) {
     Hud h;
     int i;
@@ -4325,6 +4540,8 @@ void pc_touch_present(void) {
         pc_bedroom_draw_claim_modal();
     }
     draw_toast_banner();
+    draw_title_card();
+    draw_ime_line();
     if (s_nvert < 3) { pc_gx_external_gl_done(); return; }
     glDisable(GL_DEPTH_TEST);
     glDisable(GL_CULL_FACE);
