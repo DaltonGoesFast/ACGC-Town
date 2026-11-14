@@ -545,6 +545,14 @@ extern int goto_other_scene(GAME_PLAY* play, Door_data_c* door_data, int update_
 
             restore_fgdata_all(play);
             play->game.pad_initialized = FALSE;
+#ifdef TARGET_PC
+            {
+                /* Drop the walk, the A/B latch, and door targets. A leftover museum
+                 * tap was walking back out of the door on the next scene. */
+                extern void pc_touch_reset_all(const char* reason);
+                pc_touch_reset_all("scene");
+            }
+#endif
             res = 1; // success
         } else {
             res = 2; // already changing scenes

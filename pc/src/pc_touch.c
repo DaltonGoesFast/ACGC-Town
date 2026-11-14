@@ -209,6 +209,10 @@ static int s_slide = 0;
 static SDL_Haptic* s_haptic = NULL;
 static int s_haptic_tried = 0;
 static int s_running = 0;
+/* Frames that must not also hold B or the stick. Covers the 3-frame A latch. */
+static int s_quiet_b = 0;
+/* After a door scene change, ignore new door taps so the exit is not immediately re-triggered. */
+static int s_door_block = 0;
 static int s_drag_logged = 0;
 static int s_tap_logged = 0;
 static Uint32 s_last_tap_ms = 0;
@@ -345,6 +349,8 @@ void pc_touch_reset_all(const char* reason) {
     s_latch_frames = 0;
     s_pulse_a = 0;
     s_pulse_b = 0;
+    s_quiet_b = 0;
+    s_door_block = 50;
     s_drag_active = 0;
     s_drag_moved = 0;
     s_drag_slot = -1;
@@ -1220,6 +1226,7 @@ static int intent_steer(signed char* stick_x, signed char* stick_y) {
         if (s_intent.act_frames == 1) {
             if (s_intent.vanilla_btn == 1 || s_intent.vanilla_btn == 3) {
                 s_pulse_a = 1;
+                s_quiet_b = 4; /* this frame plus the 3-frame A latch: B and the stick stay up */
                 pc_diag_milestone(s_intent.vanilla_btn == 3 ? "vanilla A net" : "vanilla A");
             } else if (s_intent.vanilla_btn == 2) {
                 s_pulse_b = 1;
@@ -1240,10 +1247,10 @@ static int intent_steer(signed char* stick_x, signed char* stick_y) {
             return 0;
         }
         s_have_target = 1;
-        /* Walk-in doors (Nook's, museum, police, tent) request the door themselves while the player is moving. */
-        if (s_intent.vanilla_btn == 0 && s_intent.act_frames < 28) {
-            return stick_world_dir(play, s_intent.face_x - player->actor_class.world.position.x,
-                                   s_intent.face_z - player->actor_class.world.position.z, 0.35f, stick_x, stick_y);
+        /* Walk-in doors fire when the player walks from the stand spot into the door. */
+        if (s_intent.vanilla_btn == 0 && s_intent.act_frames < 24 && s_intent.face_lock) {
+            return stick_world_dir(play, s_intent.face_x - s_intent.tx, s_intent.face_z - s_intent.tz,
+                                   0.55f, stick_x, stick_y);
         }
         return 0;
     }
@@ -1297,6 +1304,11 @@ static int intent_steer(signed char* stick_x, signed char* stick_y) {
             s_intent.act_frames = 0;
         }
         s_have_target = 1;
+        /* Stop on the stand spot. The next frame faces the target and pulses A.
+         * Walking onward carries a sign or a door through to the wrong side. */
+        if (s_intent.kind == INTENT_SHAKE_TREE || s_intent.kind == INTENT_CHOP_TREE ||
+            s_intent.kind == INTENT_READ_SIGN || s_intent.kind == INTENT_DOOR ||
+            s_intent.kind == INTENT_OPEN) return 0;
         return stick_world_dir(play, s_intent.face_x - px, s_intent.face_z - pz, 0.4f, stick_x, stick_y);
     }
 
@@ -1890,17 +1902,19 @@ static void door_apply_stand(ACTOR* b) {
         case mAc_PROFILE_DUMP:
             ox = 0.0f; oz = 50.0f; face = 180.0f; walk = 0; break;
         case mAc_PROFILE_HOUSE:
-            /* One tile south of the door, facing it, so item_in_front is the house. A decides home / away / asleep. */
-            ox = 0.0f; oz = 40.0f; face = 180.0f; walk = 0; break;
+            /* South of the door, close enough that the 20-unit forward probe lands on the house tile. */
+            ox = 0.0f; oz = 28.0f; face = 180.0f; walk = 0; break;
         default:
             ox = 0.0f; oz = 48.0f; face = 180.0f; walk = 0; break;
     }
     s_intent.tx = b->world.position.x + ox;
     s_intent.tz = b->world.position.z + oz;
     s_intent.face_lock = 1;
-    s_intent.face_angle = (s16)DEG2SHORT_ANGLE(face);
+    /* Face from the stand spot toward the building, the same atan the player uses. */
+    s_intent.face_angle = atans_table(b->world.position.z - s_intent.tz, b->world.position.x - s_intent.tx);
+    (void)face;
     s_intent.vanilla_btn = walk ? 0 : 1;
-    s_intent.arrive = (b->id == mAc_PROFILE_HOUSE) ? 8.0f : 10.0f;
+    s_intent.arrive = (b->id == mAc_PROFILE_HOUSE) ? 6.0f : 10.0f;
     s_intent.force_walk = 1;
 }
 
@@ -1922,6 +1936,7 @@ static void begin_move(float x, float y, int fresh) {
     player = (play != NULL) ? get_player_actor_withoutCheck(play) : NULL;
     resolve_world_hit(x, y, wx, wz, &hit);
 
+    if ((hit.kind == INTENT_DOOR || hit.kind == INTENT_OPEN) && s_door_block > 0) return;
     if (hit.kind == INTENT_PITFALL_REFUSE) {
         intent_fail("Careful!");
         return;
@@ -1962,14 +1977,24 @@ static void begin_move(float x, float y, int fresh) {
             s_intent.arrive = TOUCH_ARRIVE_TALK;
             break;
         case INTENT_READ_SIGN:
-            /* South of the sign, facing it. A reads. B would pick the board up. */
+            /* A signboard is read from its +Z side, within 55 units, facing the board.
+             * Face with the game's own atan each frame (face_lock stays clear). */
             s_intent.tx = hit.face_x;
-            s_intent.tz = hit.face_z + 40.0f;
-            s_intent.face_lock = 1;
-            s_intent.face_angle = (s16)DEG2SHORT_ANGLE(180.0f);
-            s_intent.arrive = 12.0f;
+            s_intent.tz = hit.face_z + 36.0f;
+            s_intent.face_lock = 0;
+            s_intent.arrive = 8.0f;
             s_intent.vanilla_btn = 1;
             s_intent.force_walk = 1;
+            if (player != NULL && player->actor_class.world.position.z > hit.face_z + 14.0f) {
+                float dx = player->actor_class.world.position.x - hit.face_x;
+                float dz = player->actor_class.world.position.z - hit.face_z;
+                float len = sqrtf(dx * dx + dz * dz);
+                if (len < 52.0f && fabsf(dx) < 28.0f) {
+                    s_intent.tx = player->actor_class.world.position.x;
+                    s_intent.tz = player->actor_class.world.position.z;
+                    s_intent.arrive = 64.0f;
+                }
+            }
             break;
         case INTENT_PICKUP:
         case INTENT_PULL_WEED:
@@ -1977,11 +2002,13 @@ static void begin_move(float x, float y, int fresh) {
             s_intent.vanilla_btn = 2;
             break;
         case INTENT_SHAKE_TREE:
-            s_intent.arrive = TOUCH_ARRIVE_TREE;
+            s_intent.arrive = 8.0f;
+            s_intent.force_walk = 1;
             break;
         case INTENT_CHOP_TREE:
-            s_intent.arrive = TOUCH_ARRIVE_TOOL;
+            s_intent.arrive = 8.0f;
             s_intent.need_tool = mPlib_PC_TOOL_AXE;
+            s_intent.force_walk = 1;
             break;
         case INTENT_DIG:
         case INTENT_HIT_ROCK:
@@ -2051,6 +2078,25 @@ static void begin_move(float x, float y, int fresh) {
         if (s_intent.kind == INTENT_NONE) {
             intent_fail("Can't reach");
             return;
+        }
+    }
+    /* Vanilla shake looks at a neighboring unit within 40 units, faced within 45 degrees.
+     * Stand 26 units from the trunk. If already inside that range, do not start another walk. */
+    if ((s_intent.kind == INTENT_SHAKE_TREE || s_intent.kind == INTENT_CHOP_TREE) && player != NULL) {
+        float px = player->actor_class.world.position.x;
+        float pz = player->actor_class.world.position.z;
+        float dx = px - s_intent.face_x;
+        float dz = pz - s_intent.face_z;
+        float len = sqrtf(dx * dx + dz * dz);
+        s_intent.force_walk = 1;
+        if (len <= 34.0f) {
+            s_intent.tx = px;
+            s_intent.tz = pz;
+            s_intent.arrive = 64.0f;
+        } else if (len > 1.0f) {
+            s_intent.tx = s_intent.face_x + (dx / len) * 26.0f;
+            s_intent.tz = s_intent.face_z + (dz / len) * 26.0f;
+            s_intent.arrive = 8.0f;
         }
     }
 
@@ -3025,6 +3071,15 @@ void pc_touch_apply(unsigned short* buttons, signed char* stick_x, signed char* 
     float tap_slop = fmaxf(34.0f, 0.038f * min_dim);
 
     if (s_title_life > 0 && --s_title_life == 0) s_title_valid = 0;
+    /* PADRead can run several times in one frame. Count the door cooldown once. */
+    {
+        extern u32 pc_frame_counter;
+        static u32 s_block_frame = 0xffffffffu;
+        if (s_door_block > 0 && s_block_frame != pc_frame_counter) {
+            s_block_frame = pc_frame_counter;
+            s_door_block--;
+        }
+    }
     refresh_action_label();
     if (pc_bedroom_claim_prompt_active()) {
         if (buttons != NULL) {
@@ -3499,8 +3554,22 @@ touch_edge_pass:
     }
     if (s_intent.kind != INTENT_NONE && stick_x && stick_y && *stick_x == 0 && *stick_y == 0)
         (void)intent_steer(stick_x, stick_y);
-    if (s_running && s_have_target && can_steer() && buttons != NULL) *buttons |= PAD_BUTTON_B;
+    if (s_running && s_have_target && can_steer() && buttons != NULL && s_quiet_b == 0)
+        *buttons |= PAD_BUTTON_B;
     if (!s_have_target) s_running = 0;
+    /* A is a 3-frame latch. Drop B and the stick for that whole window so a run does not ride along. */
+    if (s_quiet_b > 0) {
+        extern u32 pc_frame_counter;
+        static u32 s_quiet_frame = 0xffffffffu;
+        if (s_quiet_frame != pc_frame_counter) {
+            s_quiet_frame = pc_frame_counter;
+            s_quiet_b--;
+        }
+        s_running = 0;
+        if (buttons != NULL) *buttons = (unsigned short)(*buttons & ~PAD_BUTTON_B);
+        if (stick_x != NULL) *stick_x = 0;
+        if (stick_y != NULL) *stick_y = 0;
+    }
 }
 
 void pc_touch_draw(struct game_s* game) { (void)game; }
