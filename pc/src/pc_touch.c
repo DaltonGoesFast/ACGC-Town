@@ -343,8 +343,19 @@ static int finger_to_window(const SDL_Event* e, float* x, float* y) {
     return 1;
 }
 
-/* Same letterboxed picture rect as menu hit-tests and font mapping (layout_box stretch 2). */
-static void picture_rect(int* bx, int* by, int* bw, int* bh) {
+/* Gameplay view: full content rect (Vert+ / Hor+), not the 4:3 pillarbox. Tap-to-move uses this. */
+static void world_rect(int* bx, int* by, int* bw, int* bh) {
+    if (g_pc_content_w < 2 || g_pc_content_h < 2) pc_layout_refresh();
+    *bx = g_pc_content_x;
+    *by = g_pc_content_y;
+    *bw = g_pc_content_w;
+    *bh = g_pc_content_h;
+    if (*bw < 1) *bw = 1;
+    if (*bh < 1) *bh = 1;
+}
+
+/* 4:3 menu/UI letterbox (layout_box stretch 2) for font-space hit tests only. */
+static void menu_rect(int* bx, int* by, int* bw, int* bh) {
     *bx = g_pc_content_x;
     *by = g_pc_content_y;
     *bw = g_pc_content_w;
@@ -356,7 +367,7 @@ static void picture_rect(int* bx, int* by, int* bw, int* bh) {
 
 static void window_to_font(float x, float y, float* fx, float* fy) {
     int bx, by, bw, bh;
-    picture_rect(&bx, &by, &bw, &bh);
+    menu_rect(&bx, &by, &bw, &bh);
     *fx = (x - (float)bx) / (float)bw * 320.0f;
     *fy = (y - (float)by) / (float)bh * 240.0f;
 }
@@ -428,7 +439,7 @@ static int keys_up(void) {
 
 static int in_picture(float x, float y) {
     int bx, by, bw, bh;
-    picture_rect(&bx, &by, &bw, &bh);
+    world_rect(&bx, &by, &bw, &bh);
     return x >= (float)bx && y >= (float)by &&
            x < (float)(bx + bw) &&
            y < (float)(by + bh);
@@ -1043,7 +1054,7 @@ static int tap_to_world(float wx, float wy, float* out_x, float* out_z) {
 
     {
         int bx, by, bw, bh;
-        picture_rect(&bx, &by, &bw, &bh);
+        world_rect(&bx, &by, &bw, &bh);
         fov = play->camera.perspective.fov_y;
         if (fov < 5.0f || fov > 170.0f) fov = 45.0f;
 
