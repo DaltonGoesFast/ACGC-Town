@@ -37,6 +37,8 @@ void pc_touch_apply(unsigned short* buttons, signed char* stick_x, signed char* 
 void pc_touch_draw(struct game_s* game);
 void pc_touch_present(void);
 int pc_touch_sheet_top_y(void);
+/* 1 while a touch action is on its vanilla press and holding a facing. */
+int pc_touch_locked_facing(short* angle);
 
 void pc_touch_show_toast(const char* text);
 void pc_touch_show_toast_ex(const char* title, const char* subtitle, uint32_t duration_ms);
