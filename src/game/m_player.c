@@ -37,6 +37,7 @@
                                      * own catch-interception seams. */
 #include "pc_pvp_authority.h"
 #include "pc_bedroom.h" /* player-vs-player tool hits: puppet filter (axe), victim reaction + attacker contact hooks */
+#include "ac_mailbox.h" /* semantic touch: mailbox open request */
 static void Player_actor_pc_pvp_pre(ACTOR* actorx, GAME* game);
 static void Player_actor_pc_pvp_post(ACTOR* actorx, GAME* game);
 #endif
@@ -1896,6 +1897,216 @@ int PC_Test_ForceRequestDigScoop(GAME* game, const xyz_t* pos, mActor_name_t ite
  * Player_actor_ChangeFGNumber_Remove_grass() and its network seam) is the ordinary per-frame player update. */
 int PC_Test_ForceRequestRemoveGrass(GAME* game, const xyz_t* target_pos, const xyz_t* grass_pos) {
     return Player_actor_request_main_remove_grass(game, target_pos, grass_pos);
+}
+
+/* Semantic touch: pocket tool match for auto-equip. Golden variants count. */
+static int mPlib_PC_item_is_tool_kind(mActor_name_t item, int tool_kind) {
+    switch (tool_kind) {
+        case mPlib_PC_TOOL_AXE:
+            return IS_ITEM_AXE(item) || (item) == ITM_GOLDEN_AXE;
+        case mPlib_PC_TOOL_NET:
+            return (item) == ITM_NET || (item) == ITM_GOLDEN_NET;
+        case mPlib_PC_TOOL_ROD:
+            return (item) == ITM_ROD || (item) == ITM_GOLDEN_ROD;
+        case mPlib_PC_TOOL_SHOVEL:
+            return ITEM_IS_SCOOP(item) || ITEM_IS_GOLD_SCOOP(item);
+        default:
+            return FALSE;
+    }
+}
+
+int mPlib_PC_TouchHasToolInPockets(int tool_kind) {
+    Private_c* priv = Common_Get(now_private);
+    int i;
+    if (priv == NULL || tool_kind == mPlib_PC_TOOL_NONE) return 0;
+    if (mPlib_PC_item_is_tool_kind(priv->equipment, tool_kind)) return 1;
+    for (i = 0; i < mPr_POCKETS_SLOT_COUNT; i++) {
+        if (mPr_GET_ITEM_COND(priv->inventory.item_conditions, i) == mPr_ITEM_COND_NORMAL &&
+            mPlib_PC_item_is_tool_kind(priv->inventory.pockets[i], tool_kind)) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+int mPlib_PC_TouchHoldingTool(GAME* game, int tool_kind) {
+    PLAYER_ACTOR* player = GET_PLAYER_ACTOR_GAME(game);
+    Private_c* priv = Common_Get(now_private);
+    if (player == NULL || priv == NULL) return 0;
+    if (!mPlib_PC_item_is_tool_kind(priv->equipment, tool_kind)) return 0;
+    switch (tool_kind) {
+        case mPlib_PC_TOOL_AXE:
+            return mPlayer_ITEM_IS_AXE(player->item_kind);
+        case mPlib_PC_TOOL_NET:
+            return mPlayer_ITEM_IS_NET(player->item_kind);
+        case mPlib_PC_TOOL_ROD:
+            return mPlayer_ITEM_IS_ROD(player->item_kind);
+        case mPlib_PC_TOOL_SHOVEL:
+            return mPlayer_ITEM_IS_SHOVEL(player->item_kind);
+        default:
+            return 0;
+    }
+}
+
+/* Same pocket swap + takeout path as the tool wheel / D-pad cycle. */
+int mPlib_PC_TouchEquipTool(GAME* game, int tool_kind) {
+    Private_c* priv = Common_Get(now_private);
+    mActor_name_t held;
+    int i;
+    if (game == NULL || priv == NULL || tool_kind == mPlib_PC_TOOL_NONE) return 0;
+    if (mPlib_PC_TouchHoldingTool(game, tool_kind)) return 1;
+    if (mPlib_PC_item_is_tool_kind(priv->equipment, tool_kind)) {
+        return Player_actor_request_main_takeout_item(game, mPlayer_REQUEST_PRIORITY_37);
+    }
+    held = priv->equipment;
+    for (i = 0; i < mPr_POCKETS_SLOT_COUNT; i++) {
+        mActor_name_t slot_item = priv->inventory.pockets[i];
+        if (mPr_GET_ITEM_COND(priv->inventory.item_conditions, i) != mPr_ITEM_COND_NORMAL) continue;
+        if (!mPlib_PC_item_is_tool_kind(slot_item, tool_kind)) continue;
+        if (held != EMPTY_NO && !(held >= ITM_MY_ORG_UMBRELLA0 && held <= ITM_MY_ORG_UMBRELLA7)) {
+            mPr_SetPossessionItem(priv, i, held, 0);
+        } else {
+            mPr_SetPossessionItem(priv, i, EMPTY_NO, 0);
+        }
+        priv->equipment = slot_item;
+        return Player_actor_request_main_takeout_item(game, mPlayer_REQUEST_PRIORITY_37);
+    }
+    return 0;
+}
+
+static void mPlib_PC_face_xz(ACTOR* actorx, float tx, float tz) {
+    s16 ang;
+    if (actorx == NULL) return;
+    ang = atans_table(tz - actorx->world.position.z, tx - actorx->world.position.x);
+    actorx->shape_info.rotation.y = ang;
+    actorx->world.angle.y = ang;
+}
+
+int mPlib_PC_TouchBusy(GAME* game) {
+    PLAYER_ACTOR* player = GET_PLAYER_ACTOR_GAME(game);
+    int idx;
+    if (player == NULL) return 1;
+    idx = player->now_main_index;
+    if (idx == mPlayer_INDEX_WAIT || idx == mPlayer_INDEX_WALK || idx == mPlayer_INDEX_RUN ||
+        idx == mPlayer_INDEX_DASH || idx == mPlayer_INDEX_TURN_DASH) {
+        return 0;
+    }
+    return 1;
+}
+
+int mPlib_PC_TouchRequestTalk(GAME* game, ACTOR* talk_actor) {
+    if (game == NULL || talk_actor == NULL) return 0;
+    return mPlib_request_main_talk_type1(game, talk_actor, TRUE, FALSE);
+}
+
+int mPlib_PC_TouchRequestPickup(GAME* game, mActor_name_t item, const xyz_t* target_pos, const xyz_t* item_pos,
+                                int signboard_flag) {
+    mActor_name_t changed;
+    int slot_idx;
+    if (game == NULL || target_pos == NULL || item_pos == NULL) return 0;
+    changed = signboard_flag ? ITM_SIGNBOARD : item;
+    slot_idx = mPlib_Get_space_putin_item_forTICKET(&changed);
+    if (slot_idx < 0) {
+        Player_actor_Request_main_refuse_pickup_all(game, FALSE);
+        return 0;
+    }
+    mPlib_PC_face_xz(GET_PLAYER_ACTOR_GAME_ACTOR(game), target_pos->x, target_pos->z);
+    return Player_actor_request_main_pickup(game, changed, target_pos, item_pos, slot_idx, signboard_flag);
+}
+
+int mPlib_PC_TouchRequestRemoveGrass(GAME* game, const xyz_t* target_pos, const xyz_t* grass_pos) {
+    if (game == NULL || target_pos == NULL || grass_pos == NULL) return 0;
+    mPlib_PC_face_xz(GET_PLAYER_ACTOR_GAME_ACTOR(game), target_pos->x, target_pos->z);
+    return Player_actor_request_main_remove_grass(game, target_pos, grass_pos);
+}
+
+int mPlib_PC_TouchRequestShakeTree(GAME* game, const xyz_t* target_pos, mActor_name_t item, int tree_ut_x,
+                                   int tree_ut_z) {
+    if (game == NULL || target_pos == NULL) return 0;
+    mPlib_PC_face_xz(GET_PLAYER_ACTOR_GAME_ACTOR(game), target_pos->x, target_pos->z);
+    return Player_actor_request_main_shake_tree_all(game, target_pos, item, tree_ut_x, tree_ut_z,
+                                                    mPlayer_REQUEST_PRIORITY_5);
+}
+
+int mPlib_PC_TouchRequestSwingAxe(GAME* game, xyz_t* target_pos, mActor_name_t item, int tree_ut_x, int tree_ut_z) {
+    mActor_name_t damage_itemNo;
+    if (game == NULL || target_pos == NULL) return 0;
+    if (!mPlib_PC_TouchHoldingTool(game, mPlib_PC_TOOL_AXE)) return 0;
+    mPlib_PC_face_xz(GET_PLAYER_ACTOR_GAME_ACTOR(game), target_pos->x, target_pos->z);
+    damage_itemNo = Player_actor_GetitemNo_forDamageAxe(Player_actor_Get_ItemNoSubmenu(), FALSE);
+    if (damage_itemNo == EMPTY_NO) {
+        return Player_actor_request_main_broken_axe_type_swing(game, target_pos, item, tree_ut_x, tree_ut_z,
+                                                               mPlayer_REQUEST_PRIORITY_4);
+    }
+    return Player_actor_request_main_swing_axe_all(game, target_pos, item, damage_itemNo, tree_ut_x, tree_ut_z,
+                                                   mPlayer_REQUEST_PRIORITY_4);
+}
+
+int mPlib_PC_TouchRequestDig(GAME* game, const xyz_t* target_pos, mActor_name_t item) {
+    if (game == NULL || target_pos == NULL) return 0;
+    if (!mPlib_PC_TouchHoldingTool(game, mPlib_PC_TOOL_SHOVEL)) return 0;
+    mPlib_PC_face_xz(GET_PLAYER_ACTOR_GAME_ACTOR(game), target_pos->x, target_pos->z);
+    return Player_actor_request_main_dig_scoop_all(game, target_pos, item, mPlayer_REQUEST_PRIORITY_4);
+}
+
+int mPlib_PC_TouchRequestHitRock(GAME* game, const xyz_t* target_pos, mActor_name_t item) {
+    if (game == NULL || target_pos == NULL) return 0;
+    if (!mPlib_PC_TouchHoldingTool(game, mPlib_PC_TOOL_SHOVEL)) return 0;
+    mPlib_PC_face_xz(GET_PLAYER_ACTOR_GAME_ACTOR(game), target_pos->x, target_pos->z);
+    /* Rock hit is the shovel reflect-scoop request (same branch as vanilla rock hits). */
+    return Player_actor_request_main_reflect_scoop_all(game, target_pos, item, NULL, mPlayer_REQUEST_PRIORITY_4);
+}
+
+int mPlib_PC_TouchRequestSwingNet(GAME* game) {
+    if (game == NULL) return 0;
+    if (!mPlib_PC_TouchHoldingTool(game, mPlib_PC_TOOL_NET)) return 0;
+    return Player_actor_request_main_swing_net(game, mPlayer_REQUEST_PRIORITY_22);
+}
+
+int mPlib_PC_TouchRequestCastRod(GAME* game, const xyz_t* bobber_pos) {
+    if (game == NULL || bobber_pos == NULL) return 0;
+    if (!mPlib_PC_TouchHoldingTool(game, mPlib_PC_TOOL_ROD)) return 0;
+    mPlib_PC_face_xz(GET_PLAYER_ACTOR_GAME_ACTOR(game), bobber_pos->x, bobber_pos->z);
+    return Player_actor_request_main_cast_rod(game, bobber_pos, mPlayer_REQUEST_PRIORITY_21);
+}
+
+int mPlib_PC_TouchRequestMailbox(GAME* game, ACTOR* mailbox_actor) {
+    MAILBOX_ACTOR* mbx;
+    static s16 angle[] = { DEG2SHORT_ANGLE2(-135.0f), DEG2SHORT_ANGLE2(135.0f) };
+    static f32 posX[] = { 24.0f, -24.0f };
+    xyz_t pos;
+    int idx;
+    if (game == NULL || mailbox_actor == NULL) return 0;
+    if (mailbox_actor->id != mAc_PROFILE_MAILBOX) return 0;
+    mbx = (MAILBOX_ACTOR*)mailbox_actor;
+    idx = mbx->arrange_idx & 1;
+    pos.x = mailbox_actor->world.position.x + posX[idx];
+    pos.y = mailbox_actor->world.position.y;
+    pos.z = mailbox_actor->world.position.z + 24.0f;
+    mbx->req = aMBX_REQUEST_OPEN;
+    return mPlib_request_main_mail_jump_type1(game, &pos, angle[idx]);
+}
+
+int mPlib_PC_TouchRequestDoor(GAME* game, const xyz_t* pos, s16 angle_y, void* door_label) {
+    if (game == NULL || pos == NULL) return 0;
+    mPlib_PC_face_xz(GET_PLAYER_ACTOR_GAME_ACTOR(game), pos->x, pos->z);
+    if (door_label != NULL) {
+        if (mPlib_request_main_door_type1(game, pos, angle_y, 0, door_label)) return 1;
+        if (mPlib_request_main_door_type2(game, pos, angle_y, 0, door_label)) return 1;
+    }
+    return Player_actor_request_main_knock_door(game, pos, angle_y, mPlayer_REQUEST_PRIORITY_4);
+}
+
+int mPlib_PC_TouchRequestPickupFurniture(GAME* game, mActor_name_t item, const xyz_t* item_pos) {
+    int slot_idx;
+    if (game == NULL || item_pos == NULL) return 0;
+    slot_idx = mPr_GetPossessionItemIdxWithCond(Now_Private, EMPTY_NO, mPr_ITEM_COND_NORMAL);
+    if (slot_idx < 0) {
+        Player_actor_Request_main_refuse_pickup_all(game, FALSE);
+        return 0;
+    }
+    mPlib_PC_face_xz(GET_PLAYER_ACTOR_GAME_ACTOR(game), item_pos->x, item_pos->z);
+    return Player_actor_request_main_pickup_furniture(game, slot_idx, item, item_pos);
 }
 
 /* PUPPET ACTION_EXT real-process verification (worker P2), TEST-ONLY: the only caller is pc_net_game.c's pcnetgame_aext_test_hook()

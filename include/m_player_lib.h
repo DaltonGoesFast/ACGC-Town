@@ -72,6 +72,37 @@ extern int PC_Test_ForceRequestDigScoop(GAME* game, const xyz_t* pos, mActor_nam
 /* WEEDS real-client verification, TEST-ONLY (--force-weed-pull): thin pass-through to the REAL Player_actor_request_main_remove_grass()
  * (m_player_main_remove_grass.c_inc, same translation unit as the definition in m_player.c). */
 extern int PC_Test_ForceRequestRemoveGrass(GAME* game, const xyz_t* target_pos, const xyz_t* grass_pos);
+
+/* Semantic touch (pc_touch.c): thin TARGET_PC wrappers around existing player requests.
+ * Only the touch intent layer should call these while a world intent is active. Idle / pad
+ * play stays on the vanilla A path. No network protocol changes. */
+enum {
+    mPlib_PC_TOOL_NONE = 0,
+    mPlib_PC_TOOL_AXE,
+    mPlib_PC_TOOL_NET,
+    mPlib_PC_TOOL_ROD,
+    mPlib_PC_TOOL_SHOVEL
+};
+
+extern int mPlib_PC_TouchEquipTool(GAME* game, int tool_kind);
+extern int mPlib_PC_TouchHoldingTool(GAME* game, int tool_kind);
+extern int mPlib_PC_TouchHasToolInPockets(int tool_kind);
+extern int mPlib_PC_TouchRequestTalk(GAME* game, ACTOR* talk_actor);
+extern int mPlib_PC_TouchRequestPickup(GAME* game, mActor_name_t item, const xyz_t* target_pos,
+                                       const xyz_t* item_pos, int signboard_flag);
+extern int mPlib_PC_TouchRequestRemoveGrass(GAME* game, const xyz_t* target_pos, const xyz_t* grass_pos);
+extern int mPlib_PC_TouchRequestShakeTree(GAME* game, const xyz_t* target_pos, mActor_name_t item,
+                                          int tree_ut_x, int tree_ut_z);
+extern int mPlib_PC_TouchRequestSwingAxe(GAME* game, xyz_t* target_pos, mActor_name_t item,
+                                         int tree_ut_x, int tree_ut_z);
+extern int mPlib_PC_TouchRequestDig(GAME* game, const xyz_t* target_pos, mActor_name_t item);
+extern int mPlib_PC_TouchRequestHitRock(GAME* game, const xyz_t* target_pos, mActor_name_t item);
+extern int mPlib_PC_TouchRequestSwingNet(GAME* game);
+extern int mPlib_PC_TouchRequestCastRod(GAME* game, const xyz_t* bobber_pos);
+extern int mPlib_PC_TouchRequestMailbox(GAME* game, ACTOR* mailbox_actor);
+extern int mPlib_PC_TouchRequestDoor(GAME* game, const xyz_t* pos, s16 angle_y, void* door_label);
+extern int mPlib_PC_TouchRequestPickupFurniture(GAME* game, mActor_name_t item, const xyz_t* item_pos);
+extern int mPlib_PC_TouchBusy(GAME* game);
 #endif
 extern void mPlib_Set_unable_wade(int v);
 extern int mPlib_Get_unable_wade(void);

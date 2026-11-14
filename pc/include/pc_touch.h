@@ -1,11 +1,10 @@
 /* pc_touch.h - Pocket Camp-style touch. Original drawing only (soft discs, no Nintendo art).
  *
- * Tap the ground to walk, tap a person or object to walk there and interact, tap a menu
- * row to select and confirm it, tap dialogue to advance. A rounded menu button, a back
- * button, and a contextual action button sit in the spare band under the picture on a
- * tall screen and float at the edges otherwise. The stick and the face buttons are a
- * fallback: hidden while tap-to-move is in use, revealed from a small nub.
- * Nothing here is sent on the network. It only fills the local pad. */
+ * Tap ground to walk (press-drag steers; farther = faster). Tap a named world target to run
+ * a semantic TouchIntent: preview → approach → auto-equip → one vanilla request (no A retry).
+ * Tap a menu row to select/confirm; tap dialogue to advance. HUD discs (Back / Bag / Map /
+ * Action) sit under the picture on a tall screen or float at the edges. Virtual pad is
+ * optional. Nothing here is sent on the network — local pad only. */
 #ifndef PC_TOUCH_H
 #define PC_TOUCH_H
 
