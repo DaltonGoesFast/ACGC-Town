@@ -422,6 +422,16 @@ void pc_gx_begin_frame(void) {
     pc_emu64_frame_cull_rejected = 0;
     pc_gx_draw_call_count = 0;
     g_pc_widescreen_stretch = 0;
+#ifdef PC_ENHANCEMENTS
+    /* Character creator is a menu over the train scene: keep the whole frame in
+     * centered 4:3 so portrait Vert+ does not squash the UI / touch targets. */
+    {
+        extern int pc_creator_menu_active(void);
+        if (pc_creator_menu_active()) {
+            g_pc_widescreen_stretch = 2;
+        }
+    }
+#endif
     pc_gx_draw_pending();
     /* glClear respects write masks — must enable all before clearing */
     glDepthMask(GL_TRUE);

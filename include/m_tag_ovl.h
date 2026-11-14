@@ -298,6 +298,10 @@ extern int mTG_mark_mainX(Submenu*, const mSM_MenuInfo_c*, int, int, int, int*);
 extern void mTG_tag_ovl_construct(Submenu* submenu);
 extern void mTG_tag_ovl_destruct(Submenu* submenu);
 
+/* Touch / mobile UI: readable labels for the tiny in-game item command cloud (Grab / Open / Quit, …). */
+extern int mTG_tag_menu_lines(int type);
+extern int mTG_tag_menu_label(int type, int row, char* out, int out_n);
+
 #ifdef __cplusplus
 }
 #endif

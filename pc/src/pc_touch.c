@@ -94,11 +94,13 @@ typedef struct {
     /* Detail banner layout */
     float detail_x0, detail_y0, detail_x1, detail_y1;
 
-    /* Action bar buttons */
+    /* Action bar buttons (also used for the native item-command cloud: Grab / Open / Quit, …) */
     int num_actions;
-    const char* action_labels[4];
-    int action_ids[4]; /* 10: Equip, 11: Unequip, 12: Wear, 13: Eat, 14: Plant, 15: Release, 16: Deposit, 2: Drop, 3: Swap, 4: Cancel/Close */
-    float act_cx[4], act_cy[4], act_w[4], act_h[4];
+    int tag_menu; /* 1 = native tag submenu open; big buttons replace the pocket grid */
+    const char* action_labels[6];
+    char action_label_bufs[6][20];
+    int action_ids[6]; /* 10: Equip … 18: Use, 2: Drop, 3: Swap, 4: Cancel, 5: Pockets, 100+row: tag option */
+    float act_cx[6], act_cy[6], act_w[6], act_h[6];
 } MobileSheet;
 
 static MobileSheet s_sheet;
@@ -536,7 +538,8 @@ static int submenu_needs_dpad(void) {
     return (mt == mSM_OVL_BOARD || mt == mSM_OVL_DIARY || mt == mSM_OVL_CALENDAR ||
             mt == mSM_OVL_CATALOG || mt == mSM_OVL_NEEDLEWORK || mt == mSM_OVL_DESIGN ||
             mt == mSM_OVL_CPORIGINAL || mt == mSM_OVL_MUSIC || mt == mSM_OVL_CPMAIL ||
-            mt == mSM_OVL_CPEDIT || mt == mSM_OVL_MSCORE);
+            mt == mSM_OVL_CPEDIT || mt == mSM_OVL_MSCORE ||
+            mt == mSM_OVL_LEDIT || mt == mSM_OVL_EDITOR);
 }
 
 static void hud_build(Hud* h) {
@@ -574,14 +577,15 @@ static void hud_build(Hud* h) {
     h->show_stick = !h->show_keys && town && (g_pc_settings.touch_stick || g_pc_settings.touch_virtual_pad);
     /* Action, Back, Menu, Bag, Map, Cam, Tool, Emote, Chat are available in town */
     h->show_action = !h->show_keys;
-    h->show_back = !h->show_keys;
-    h->show_menu = !h->show_keys;
+    h->show_back = !h->show_keys && !pc_creator_menu_active();
+    h->show_menu = !h->show_keys && !pc_creator_menu_active();
     h->show_quick = !h->show_keys && town;
     h->show_cam = !h->show_keys && town;
     h->show_tool = !h->show_keys && town;
     h->show_emote = !h->show_keys && town;
     h->show_chat = !h->show_keys && town;
-    h->show_close = h->show_keys || menu || dialog;
+    /* Creator: keep Action for Confirm; hide Close/Back so they do not cancel name entry. */
+    h->show_close = (h->show_keys || menu || dialog) && !pc_creator_menu_active();
     h->show_context = 0;
     h->show_dpad = !h->show_keys && submenu_needs_dpad();
     h->show_trigs = h->show_dpad;
@@ -3123,6 +3127,21 @@ static void mobile_sheet_compute_dims(float W, float H, float* out_ui, float* ou
     if (out_act_h) *out_act_h = act_h;
 }
 
+/* Active native item-command cloud (Grab / Open / Quit, …), or NULL. */
+static mTG_tag_c* mobile_sheet_select_tag(void) {
+    GAME_PLAY* play = get_game_play();
+    mTG_Ovl_c* tovl;
+    mTG_tag_c* tag;
+    if (play == NULL || play->submenu.overlay == NULL) return NULL;
+    tovl = play->submenu.overlay->tag_ovl;
+    if (tovl == NULL) return NULL;
+    if (tovl->sel_tag_idx < 0 || tovl->sel_tag_idx >= mTG_TAG_NUM) return NULL;
+    tag = &tovl->tags[tovl->sel_tag_idx];
+    if (tag->type == mTG_TYPE_NONE) return NULL;
+    if (mTG_tag_menu_lines(tag->type) <= 0) return NULL;
+    return tag;
+}
+
 static int mobile_sheet_should_show(void) {
     GAME_PLAY* play = get_game_play();
     if (!g_pc_layout_portrait || pc_creator_menu_active() || keys_up()) return 0;
@@ -3130,8 +3149,8 @@ static int mobile_sheet_should_show(void) {
     if (play->submenu.menu_type != mSM_OVL_INVENTORY || play->submenu.param0 != mSM_IV_OPEN_NORMAL) return 0;
     if (pc_dresser_ui_active() || pc_dresser_ui_basket()) return 0;
     if (play->submenu.overlay == NULL || play->submenu.overlay->inventory_ovl == NULL) return 0;
-    if (play->submenu.overlay->tag_ovl != NULL && play->submenu.overlay->tag_ovl->tags[0].type != mTG_TYPE_NONE) return 0;
-    if (!submenu_hand_is_empty(&play->submenu)) return 0;
+    /* Keep the sheet up while the tiny Grab/Open/Quit cloud is open so we can mirror it with big buttons. */
+    if (!submenu_hand_is_empty(&play->submenu) && mobile_sheet_select_tag() == NULL) return 0;
     return 1;
 }
 
@@ -3241,21 +3260,49 @@ static void mobile_sheet_layout(void) {
     s_sheet.detail_y1 = cur_y + detail_h;
     cur_y += detail_h + 10.0f * ui;
 
-    /* Action bar */
+    /* Action bar — or full-height mirror of the native Grab/Open/Quit cloud */
     {
         float act_cy = cur_y + act_h * 0.5f;
         float act_w, act_margin, act_gap, act_step;
         Private_c* priv = Now_Private;
         mActor_name_t item = EMPTY_NO;
+        mTG_tag_c* sel_tag = mobile_sheet_select_tag();
 
         if (act_cy + act_h * 0.5f > H - 8.0f * ui) act_cy = H - 8.0f * ui - act_h * 0.5f;
 
         s_sheet.num_actions = 0;
+        s_sheet.tag_menu = 0;
         if (priv != NULL && s_sheet.sel_slot >= 0 && s_sheet.sel_slot < 15) {
             item = priv->inventory.pockets[s_sheet.sel_slot];
         }
 
-        if (s_sheet.current_tab == 1) {
+        if (sel_tag != NULL) {
+            int n = mTG_tag_menu_lines(sel_tag->type);
+            float top = s_sheet.tab_cy[0] + s_sheet.tab_h[0] * 0.5f + 8.0f * ui;
+            float bot = H - 14.0f * ui;
+            float gap, bh;
+            if (n > 6) n = 6;
+            if (n < 1) n = 1;
+            /* Leave a title row, then stack the native options as large tap targets. */
+            top += 36.0f * ui;
+            gap = 12.0f * ui;
+            bh = (bot - top - (float)(n - 1) * gap) / (float)n;
+            if (bh < 52.0f * ui) bh = 52.0f * ui;
+            s_sheet.tag_menu = 1;
+            s_sheet.num_actions = n;
+            for (i = 0; i < n; i++) {
+                if (!mTG_tag_menu_label(sel_tag->type, i, s_sheet.action_label_bufs[i],
+                                        (int)sizeof(s_sheet.action_label_bufs[i]))) {
+                    snprintf(s_sheet.action_label_bufs[i], sizeof(s_sheet.action_label_bufs[i]), "OPTION %d", i + 1);
+                }
+                s_sheet.action_labels[i] = s_sheet.action_label_bufs[i];
+                s_sheet.action_ids[i] = 100 + i;
+                s_sheet.act_cx[i] = W * 0.5f;
+                s_sheet.act_cy[i] = top + bh * 0.5f + (float)i * (bh + gap);
+                s_sheet.act_w[i] = W - 2.0f * margin_x;
+                s_sheet.act_h[i] = bh;
+            }
+        } else if (s_sheet.current_tab == 1) {
             Mail_c* sel_m = (priv != NULL && s_sheet.sel_mail >= 0 && s_sheet.sel_mail < 10)
                             ? &priv->mail[s_sheet.sel_mail] : NULL;
             if (sel_m != NULL && !mMl_check_not_used_mail(sel_m)) {
@@ -3326,7 +3373,7 @@ static void mobile_sheet_layout(void) {
             s_sheet.act_h[0] = act_h;
         }
 
-        if (s_sheet.num_actions > 0) {
+        if (s_sheet.num_actions > 0 && !s_sheet.tag_menu) {
             act_margin = margin_x;
             act_gap = 10.0f * ui;
             act_w = (W - 2.0f * act_margin - (float)(s_sheet.num_actions - 1) * act_gap) / (float)s_sheet.num_actions;
@@ -3351,6 +3398,17 @@ static int mobile_sheet_hit(float x, float y, int* key) {
     if (x >= s_sheet.close_cx - s_sheet.close_w * 0.5f && x <= s_sheet.close_cx + s_sheet.close_w * 0.5f &&
         y >= s_sheet.close_cy - s_sheet.close_h * 0.5f && y <= s_sheet.close_cy + s_sheet.close_h * 0.5f) {
         return HIT_SHEET_CLOSE;
+    }
+    /* Tag submenu: only Close + the big option buttons (skip bells/tabs/cards). */
+    if (s_sheet.tag_menu) {
+        for (i = 0; i < s_sheet.num_actions; i++) {
+            if (x >= s_sheet.act_cx[i] - s_sheet.act_w[i] * 0.5f && x <= s_sheet.act_cx[i] + s_sheet.act_w[i] * 0.5f &&
+                y >= s_sheet.act_cy[i] - s_sheet.act_h[i] * 0.5f && y <= s_sheet.act_cy[i] + s_sheet.act_h[i] * 0.5f) {
+                *key = s_sheet.action_ids[i];
+                return HIT_SHEET_ACT;
+            }
+        }
+        return HIT_SHEET_BODY;
     }
     if (x >= s_sheet.bells_cx - s_sheet.bells_w * 0.5f && x <= s_sheet.bells_cx + s_sheet.bells_w * 0.5f &&
         y >= s_sheet.bells_cy - s_sheet.bells_h * 0.5f && y <= s_sheet.bells_cy + s_sheet.bells_h * 0.5f) {
@@ -3461,6 +3519,19 @@ static void mobile_sheet_handle_card(int slot) {
 static void mobile_sheet_handle_act(int act_id) {
     Private_c* priv = Now_Private;
     if (priv == NULL) return;
+    if (act_id >= 100 && act_id < 106) { /* Native tag cloud option (Grab / Open / Quit, …) */
+        GAME_PLAY* play = get_game_play();
+        mTG_tag_c* tag = mobile_sheet_select_tag();
+        int row = act_id - 100;
+        if (play != NULL && tag != NULL && row >= 0 && row < mTG_tag_menu_lines(tag->type)) {
+            tag->tag_row = row;
+            s_pulse_a = 1;
+            s_pending_row = -1;
+            pc_touch_buzz();
+            note_tap("sheet_tag_option");
+        }
+        return;
+    }
     if (act_id == 10) { /* EQUIP */
         if (s_sheet.sel_slot >= 0 && s_sheet.sel_slot < 15) {
             mActor_name_t it = priv->inventory.pockets[s_sheet.sel_slot];
@@ -3757,17 +3828,19 @@ static void mobile_sheet_draw(void) {
         draw_text_ac(buf, margin_x + 4.0f * ui, s_sheet.close_cy, 3.3f * ui, 0.22f, 0.26f, 0.24f, 1.0f, 0, 22);
     }
 
-    /* Bells button */
-    pill_button_shadow(s_sheet.bells_cx, s_sheet.bells_cy, s_sheet.bells_w, s_sheet.bells_h, 0.98f, 0.82f, 0.20f, 1.0f);
-    snprintf(buf, sizeof(buf), "$ %u", (unsigned int)priv->inventory.wallet);
-    draw_str_raw(buf, s_sheet.bells_cx, s_sheet.bells_cy, 3.0f * ui, 0.18f, 0.16f, 0.05f, 1.0f, 14);
+    /* Bells button (hidden while choosing a tag action) */
+    if (!s_sheet.tag_menu) {
+        pill_button_shadow(s_sheet.bells_cx, s_sheet.bells_cy, s_sheet.bells_w, s_sheet.bells_h, 0.98f, 0.82f, 0.20f, 1.0f);
+        snprintf(buf, sizeof(buf), "$ %u", (unsigned int)priv->inventory.wallet);
+        draw_str_raw(buf, s_sheet.bells_cx, s_sheet.bells_cy, 3.0f * ui, 0.18f, 0.16f, 0.05f, 1.0f, 14);
+    }
 
-    /* Close button */
+    /* Close / Cancel button */
     pill_button_shadow(s_sheet.close_cx, s_sheet.close_cy, s_sheet.close_w, s_sheet.close_h, 0.92f, 0.40f, 0.35f, 1.0f);
-    draw_str_raw("CLOSE", s_sheet.close_cx, s_sheet.close_cy, 3.0f * ui, 1.0f, 1.0f, 1.0f, 1.0f, 6);
+    draw_str_raw(s_sheet.tag_menu ? "CANCEL" : "CLOSE", s_sheet.close_cx, s_sheet.close_cy, 3.0f * ui, 1.0f, 1.0f, 1.0f, 1.0f, 6);
 
-    /* Category Tabs */
-    {
+    /* Category Tabs (hidden while mirroring the native item-command cloud) */
+    if (!s_sheet.tag_menu) {
         static const char* tab_names[5] = { "POCKETS", "LETTERS", "FISH", "BUGS", "MISSIONS" };
         for (i = 0; i < 5; i++) {
             int active = (s_sheet.current_tab == i);
@@ -3781,6 +3854,48 @@ static void mobile_sheet_draw(void) {
                 draw_str_raw(tab_names[i], cx, cy, 2.5f * ui, 0.42f, 0.40f, 0.38f, 1.0f, 9);
             }
         }
+    }
+
+    /* Native item submenu: big finger-friendly buttons instead of the tiny Grab/Open/Quit cloud */
+    if (s_sheet.tag_menu) {
+        mTG_tag_c* tag0;
+        char iname[36];
+        float title_y = (s_sheet.num_actions > 0)
+                            ? (s_sheet.act_cy[0] - s_sheet.act_h[0] * 0.5f - 22.0f * ui)
+                            : (s_sheet.tab_cy[0] + 40.0f * ui);
+        GAME_PLAY* play = get_game_play();
+        iname[0] = 0;
+        if (play != NULL && play->submenu.overlay != NULL && play->submenu.overlay->tag_ovl != NULL) {
+            tag0 = &play->submenu.overlay->tag_ovl->tags[0];
+            get_clean_string(tag0->str0, mTG_TAG_SEL_STRING_LEN, iname, (int)sizeof(iname));
+        }
+        if (iname[0] != 0) {
+            draw_str_raw(iname, W * 0.5f, title_y, 3.2f * ui, 0.22f, 0.26f, 0.24f, 1.0f, 22);
+        } else {
+            draw_str_raw("CHOOSE AN ACTION", W * 0.5f, title_y, 3.0f * ui, 0.35f, 0.35f, 0.32f, 1.0f, 20);
+        }
+        for (i = 0; i < s_sheet.num_actions; i++) {
+            float cx = s_sheet.act_cx[i], cy = s_sheet.act_cy[i];
+            float aw = s_sheet.act_w[i], ah = s_sheet.act_h[i];
+            const char* lab = s_sheet.action_labels[i];
+            float br = 0.20f, bg = 0.72f, bb = 0.42f, tr = 1.0f, tg = 1.0f, tb = 1.0f;
+            int is_quit = 0;
+            if (lab != NULL) {
+                if (strcmp(lab, "Quit") == 0 || strcmp(lab, "No") == 0 ||
+                    strcmp(lab, "Never mind") == 0 || strcmp(lab, "Cancel") == 0) {
+                    is_quit = 1;
+                }
+            }
+            if (is_quit) {
+                br = 0.52f; bg = 0.55f; bb = 0.58f;
+            } else if (lab != NULL && (strcmp(lab, "Drop") == 0 || strncmp(lab, "Throw", 5) == 0 ||
+                                       strcmp(lab, "Sell") == 0 || strcmp(lab, "Sell All") == 0)) {
+                br = 0.90f; bg = 0.35f; bb = 0.32f;
+            }
+            pill_button_shadow(cx, cy, aw, ah, br, bg, bb, 1.0f);
+            draw_str_raw(lab != NULL ? lab : "?", cx, cy, 3.6f * ui, tr, tg, tb, 1.0f, 18);
+        }
+        return;
     }
 
     /* Tab Content */

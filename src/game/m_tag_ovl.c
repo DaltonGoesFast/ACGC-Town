@@ -9885,3 +9885,51 @@ extern void mTG_tag_ovl_construct(Submenu* submenu) {
 extern void mTG_tag_ovl_destruct(Submenu* submenu) {
     submenu->overlay->tag_ovl = NULL;
 }
+
+extern int mTG_tag_menu_lines(int type) {
+    if (type <= mTG_TYPE_NONE || type >= (int)ARRAY_COUNT(mTG_label_table)) {
+        return 0;
+    }
+    /* Price entry is not a tap-list of commands. */
+    if (type == mTG_TYPE_HANIWA_PRICE) {
+        return 0;
+    }
+    if (mTG_label_table[type].words == NULL) {
+        return 0;
+    }
+    return mTG_label_table[type].lines;
+}
+
+extern int mTG_tag_menu_label(int type, int row, char* out, int out_n) {
+    mTG_tag_word_c* word;
+    int i;
+    int len = 0;
+
+    if (out == NULL || out_n <= 0) {
+        return 0;
+    }
+    out[0] = '\0';
+    if (type <= mTG_TYPE_NONE || type >= (int)ARRAY_COUNT(mTG_label_table)) {
+        return 0;
+    }
+    if (row < 0 || row >= mTG_label_table[type].lines || mTG_label_table[type].words == NULL) {
+        return 0;
+    }
+    word = mTG_label_table[type].words[row];
+    if (word == NULL) {
+        return 0;
+    }
+    for (i = 0; i < mTG_TAG_STR_LEN && len + 1 < out_n; i++) {
+        u8 c = word->str[i];
+        if (c >= 32 && c <= 126) {
+            out[len++] = (char)c;
+        } else if (c == 0) {
+            break;
+        }
+    }
+    while (len > 0 && out[len - 1] == ' ') {
+        len--;
+    }
+    out[len] = '\0';
+    return len > 0;
+}

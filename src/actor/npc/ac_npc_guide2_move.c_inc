@@ -472,11 +472,13 @@ static void aNG2_pc_apply_model(NPC_GUIDE2_ACTOR* guide2, GAME_PLAY* play) {
 }
 
 static int aNG2_pc_is_placeholder_name(const u8* name) {
-    static const u8 s_placeholder[PLAYER_NAME_LEN] = { 'N', 'e', 'w', 'P', 'l', 'r', ' ', ' ' };
+    static const u8 s_placeholder_plr[PLAYER_NAME_LEN] = { 'N', 'e', 'w', 'P', 'l', 'r', ' ', ' ' };
+    static const u8 s_placeholder_char[PLAYER_NAME_LEN] = { 'N', 'e', 'w', 'C', 'h', 'a', 'r', ' ' };
     int i;
     int any_non_space = 0;
 
-    if (mem_cmp((u8*)name, (u8*)s_placeholder, PLAYER_NAME_LEN) == TRUE) {
+    if (mem_cmp((u8*)name, (u8*)s_placeholder_plr, PLAYER_NAME_LEN) == TRUE ||
+        mem_cmp((u8*)name, (u8*)s_placeholder_char, PLAYER_NAME_LEN) == TRUE) {
         return 1;
     }
     for (i = 0; i < PLAYER_NAME_LEN; i++) {
@@ -577,6 +579,7 @@ static void aNG2_pc_creator_move(NPC_GUIDE2_ACTOR* guide2, GAME_PLAY* play) {
         s_pc_creator.touch_confirm = 0;
         if (!s_pc_creator.name_entered || aNG2_check_pname() == FALSE) {
             s_pc_creator.row = aNG2_PC_ROW_NAME;
+            s_pc_creator.name_error = 1;
             aNG2_pc_open_name_editor(play);
         } else {
             s_pc_creator.active = 0;
@@ -664,6 +667,7 @@ static void aNG2_pc_creator_move(NPC_GUIDE2_ACTOR* guide2, GAME_PLAY* play) {
             if (chkTrigger(BUTTON_A)) {
                 if (!s_pc_creator.name_entered || aNG2_check_pname() == FALSE) {
                     s_pc_creator.row = aNG2_PC_ROW_NAME;
+                    s_pc_creator.name_error = 1;
                     aNG2_pc_open_name_editor(play);
                 } else {
                     s_pc_creator.active = 0;
@@ -678,6 +682,7 @@ static void aNG2_pc_creator_move(NPC_GUIDE2_ACTOR* guide2, GAME_PLAY* play) {
     if (chkTrigger(BUTTON_START) && s_pc_creator.row != aNG2_PC_ROW_CONFIRM) {
         if (!s_pc_creator.name_entered || aNG2_check_pname() == FALSE) {
             s_pc_creator.row = aNG2_PC_ROW_NAME;
+            s_pc_creator.name_error = 1;
             aNG2_pc_open_name_editor(play);
         } else {
             s_pc_creator.active = 0;
@@ -709,6 +714,8 @@ static void aNG2_pc_creator_draw(NPC_GUIDE2_ACTOR* guide2, GAME_PLAY* play) {
     char line[64];
     int r, g, b, a;
     int shirt_idx;
+    /* Game font: ASCII '/' is a music note, '['/']' are accented letters. Use the real slash glyph. */
+    const char slash = (char)CHAR_FORWARD_SLASH;
 
     if (play->submenu.open_flag != FALSE || guide2->action == aNG2_ACTION_SCENE_CHANGE_WAIT) {
         return;
@@ -717,8 +724,8 @@ static void aNG2_pc_creator_draw(NPC_GUIDE2_ACTOR* guide2, GAME_PLAY* play) {
     mFont_SetMatrix(play->game.graph, mFont_MODE_FONT);
     pc_menu_dim_rect(play->game.graph, 150);
 
-    /* Render the live 3D player model preview on the right half of the screen */
-    pc_player_preview_draw(gs, 0, 248.0f, 186.0f, 96.0f);
+    /* In-scene player actor is the live preview (see aNG2_pc_creator_move). The FONT-list
+     * overlay model was drawing a huge glitched double on portrait Vert+ — leave it out. */
 
     pc_menu_draw_centered(gs, "- Create Your Character -", 22.0f, 255, 240, 150, 255, 1.05f);
 
@@ -741,7 +748,7 @@ static void aNG2_pc_creator_draw(NPC_GUIDE2_ACTOR* guide2, GAME_PLAY* play) {
                       (s_pc_creator.row == aNG2_PC_ROW_GENDER) ? 1.0f : 0.9f);
 
     /* Row 2: Face */
-    snprintf(line, sizeof(line), "Face:  < Style %d / 8 >", (int)(Now_Private->face + 1));
+    snprintf(line, sizeof(line), "Face:  < Style %d %c 8 >", (int)(Now_Private->face + 1), slash);
     pc_menu_row_colors(s_pc_creator.row == aNG2_PC_ROW_FACE, &r, &g, &b, &a);
     pc_menu_draw_left(gs, line, 20.0f, 112.0f, r, g, b, a,
                       (s_pc_creator.row == aNG2_PC_ROW_FACE) ? 1.0f : 0.9f);
@@ -750,22 +757,26 @@ static void aNG2_pc_creator_draw(NPC_GUIDE2_ACTOR* guide2, GAME_PLAY* play) {
     mIN_copy_name_str(raw_shirt, (mActor_name_t)s_pc_creator.shirt);
     aNG2_pc_format_game_str(shirt_buf, sizeof(shirt_buf), raw_shirt, mIN_ITEM_NAME_LEN);
     shirt_idx = (int)(s_pc_creator.shirt - ITM_CLOTH000) + 1;
-    snprintf(line, sizeof(line), "Shirt: < %d/16 %s >", shirt_idx, shirt_buf);
+    snprintf(line, sizeof(line), "Shirt: < %d%c16 %s >", shirt_idx, slash, shirt_buf);
     pc_menu_row_colors(s_pc_creator.row == aNG2_PC_ROW_SHIRT, &r, &g, &b, &a);
     pc_menu_draw_left(gs, line, 20.0f, 140.0f, r, g, b, a,
                       (s_pc_creator.row == aNG2_PC_ROW_SHIRT) ? 0.95f : 0.85f);
 
-    /* Row 4: Confirm & Arrive in Town */
+    /* Row 4: Confirm & Arrive in Town (parentheses: '['/']' are accented glyphs in this font) */
     pc_menu_row_colors(s_pc_creator.row == aNG2_PC_ROW_CONFIRM, &r, &g, &b, &a);
-    pc_menu_draw_left(gs, "[ Confirm & Arrive in Town ]", 20.0f, 174.0f, r, g, b, a,
+    pc_menu_draw_left(gs, "( Confirm & Arrive in Town )", 20.0f, 174.0f, r, g, b, a,
                       (s_pc_creator.row == aNG2_PC_ROW_CONFIRM) ? 1.0f : 0.9f);
 
     if (s_pc_creator.name_error) {
         pc_menu_draw_centered(gs, "Please enter a valid, unique name (1-8 chars).",
                               202.0f, 255, 100, 100, 255, 0.85f);
+    } else if (!s_pc_creator.name_entered) {
+        pc_menu_draw_centered(gs, "Tap Name (or press A), then Confirm to arrive.",
+                              202.0f, 255, 220, 140, 255, 0.85f);
     }
-    pc_menu_draw_centered(gs, "Up/Down: Select   Left/Right: Change   A/Start: Confirm",
-                          218.0f, 200, 200, 200, 230, 0.78f);
+    snprintf(line, sizeof(line), "Up%cDown: Select   Left%cRight: Change   A%cStart: Confirm",
+             slash, slash, slash);
+    pc_menu_draw_centered(gs, line, 218.0f, 200, 200, 200, 230, 0.78f);
 
     mFont_UnSetMatrix(play->game.graph, mFont_MODE_FONT);
 }
