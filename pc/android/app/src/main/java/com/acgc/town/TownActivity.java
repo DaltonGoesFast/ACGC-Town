@@ -32,6 +32,7 @@ public class TownActivity extends SDLActivity {
         Log.i("ACGC", "TownActivity start, rom=" + new File(getFilesDir(), "gafe01.iso").getAbsolutePath());
         super.onCreate(savedInstanceState);
         SafeInsets.install(this);
+        GestureExclusion.install(this);
     }
 
     @Override

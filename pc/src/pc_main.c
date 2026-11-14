@@ -272,6 +272,9 @@ void pc_platform_init(void) {
     if (g_pc_dedicated && !g_pc_headless) {
         pc_dedicated_pre_sdl_init(); /* --dedicated: dummy audio driver, selected BEFORE SDL_Init reads the driver choice */
     }
+    /* Keep finger and mouse streams separate so one tap is not delivered twice. */
+    SDL_SetHint(SDL_HINT_TOUCH_MOUSE_EVENTS, "0");
+    SDL_SetHint(SDL_HINT_MOUSE_TOUCH_EVENTS, "0");
 #ifdef __ANDROID__
     SDL_SetHint(SDL_HINT_ANDROID_BLOCK_ON_PAUSE, "1"); /* the loop waits while stopped; the GL context is kept and rebound on resume */
 #endif
@@ -444,28 +447,36 @@ void pc_platform_shutdown(void) {
 int g_pc_content_x = 0, g_pc_content_y = 0, g_pc_content_w = PC_SCREEN_WIDTH, g_pc_content_h = PC_SCREEN_HEIGHT;
 int g_pc_layout_portrait = 0;
 
+static int s_inset_cached = 0, s_inset_l = 0, s_inset_t = 0, s_inset_r = 0, s_inset_b = 0;
+static Uint32 s_inset_last_ms = 0;
+
+void pc_layout_insets_invalidate(void) {
+    s_inset_cached = 0;
+    s_inset_last_ms = 0;
+}
+
 void pc_layout_insets(int* l, int* t, int* r, int* b) {
-    static int s_cached = 0, s_l = 0, s_t = 0, s_r = 0, s_b = 0;
-    static Uint32 s_last_ms = 0;
     Uint32 now = SDL_GetTicks();
-    if (!s_cached || now - s_last_ms > 1000u) {
+    /* Re-read at least once a second, and immediately after invalidate (fold / resize). */
+    if (!s_inset_cached || now - s_inset_last_ms > 1000u) {
         FILE* f = fopen("safe_insets.txt", "r");
-        s_last_ms = now;
-        s_cached = 1;
-        s_l = s_t = s_r = s_b = 0;
+        s_inset_last_ms = now;
+        s_inset_cached = 1;
+        s_inset_l = s_inset_t = s_inset_r = s_inset_b = 0;
         if (f != NULL) {
-            if (fscanf(f, "%d %d %d %d", &s_l, &s_t, &s_r, &s_b) != 4) s_l = s_t = s_r = s_b = 0;
+            if (fscanf(f, "%d %d %d %d", &s_inset_l, &s_inset_t, &s_inset_r, &s_inset_b) != 4)
+                s_inset_l = s_inset_t = s_inset_r = s_inset_b = 0;
             fclose(f);
-            if (s_l < 0) s_l = 0;
-            if (s_t < 0) s_t = 0;
-            if (s_r < 0) s_r = 0;
-            if (s_b < 0) s_b = 0;
+            if (s_inset_l < 0) s_inset_l = 0;
+            if (s_inset_t < 0) s_inset_t = 0;
+            if (s_inset_r < 0) s_inset_r = 0;
+            if (s_inset_b < 0) s_inset_b = 0;
         }
     }
-    *l = s_l;
-    *t = s_t;
-    *r = s_r;
-    *b = s_b;
+    *l = s_inset_l;
+    *t = s_inset_t;
+    *r = s_inset_r;
+    *b = s_inset_b;
 }
 
 void pc_layout_refresh(void) {
@@ -616,12 +627,14 @@ void pc_platform_update_window_size(void) {
     if (g_pc_window == NULL) {
         if (g_pc_window_w <= 0) g_pc_window_w = PC_SCREEN_WIDTH;
         if (g_pc_window_h <= 0) g_pc_window_h = PC_SCREEN_HEIGHT;
+        pc_layout_insets_invalidate();
         pc_layout_refresh();
         return;
     }
     SDL_GL_GetDrawableSize(g_pc_window, &g_pc_window_w, &g_pc_window_h);
     if (g_pc_window_w <= 0) g_pc_window_w = PC_SCREEN_WIDTH;
     if (g_pc_window_h <= 0) g_pc_window_h = PC_SCREEN_HEIGHT;
+    pc_layout_insets_invalidate();
     pc_layout_refresh();
 }
 
@@ -845,17 +858,21 @@ int pc_platform_poll_events(void) {
                  * SDL_HINT_ANDROID_BLOCK_ON_PAUSE waits inside SDL until the surface is back, which is the multi-second
                  * idle gap when the activity pauses (a redundant orientation request used to cause that). */
                 pc_diag_milestone("app background");
+                pc_touch_reset_all("background");
                 pc_save_flush_background();
                 break;
             case SDL_APP_DIDENTERFOREGROUND:
                 pc_diag_milestone("app foreground");
+                pc_touch_reset_all("foreground");
                 if (g_pc_window != NULL && g_pc_gl_context != NULL) {
                     SDL_GL_MakeCurrent(g_pc_window, g_pc_gl_context);
                 }
                 break;
             case SDL_WINDOWEVENT:
                 if (event.window.event == SDL_WINDOWEVENT_SIZE_CHANGED) {
+                    pc_layout_insets_invalidate();
                     pc_platform_update_window_size();
+                    pc_touch_reset_all("resize");
                 }
                 break;
             case SDL_KEYDOWN:

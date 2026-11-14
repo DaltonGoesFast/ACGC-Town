@@ -167,11 +167,29 @@ void pc_typing_handle_event(const SDL_Event* event) {
 }
 
 void pc_typing_update(void) {
+#ifdef __ANDROID__
+    /* Mirror the Play Online IP field: open the system IME while the letter/name editor is live. */
+    static int s_editor_was = 0;
+    if (g_pc_editor_active && !s_editor_was) {
+        g_pc_typing_mode = 1;
+        SDL_StartTextInput();
+        pc_typing_queue_clear();
+    }
+    if (g_pc_typing_mode && !g_pc_editor_active) {
+        g_pc_typing_mode = 0;
+        SDL_StopTextInput();
+        pc_typing_queue_clear();
+        s_editor_was = 0;
+    } else {
+        s_editor_was = g_pc_editor_active;
+    }
+#else
     if (g_pc_typing_mode && !g_pc_editor_active) {
         g_pc_typing_mode = 0;
         SDL_StopTextInput();
         pc_typing_queue_clear();
     }
+#endif
 }
 
 #endif /* KEYBOARD_TYPING */

@@ -32,6 +32,7 @@ public final class SafeInsets {
             View decor = activity.getWindow().getDecorView();
             decor.setOnApplyWindowInsetsListener((v, insets) -> {
                 write(activity, insets);
+                /* Fold / cutout change: native re-reads safe_insets.txt on next invalidate/resize. */
                 return insets;
             });
             decor.post(() -> write(activity, decor.getRootWindowInsets()));

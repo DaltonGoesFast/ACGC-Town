@@ -20,6 +20,8 @@ struct game_s;
 int pc_touch_enabled(void);
 
 void pc_touch_note_event(const SDL_Event* e);
+/* Clear all finger/mouse/latch/drag state (pause, resume, resize). reason may be NULL. */
+void pc_touch_reset_all(const char* reason);
 void pc_touch_pulse_b(void);
 
 /* 1 if a title-menu row was tapped this frame. font_y is in the 240-tall font space. */

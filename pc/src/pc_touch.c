@@ -50,7 +50,6 @@ extern void pc_creator_menu_pointer(float fx, float fy);
 #include "m_collision_bg.h"
 #include <dolphin/pad.h>
 
-extern void pc_layout_insets(int* l, int* t, int* r, int* b);
 
 #include <math.h>
 #include <stdio.h>
@@ -169,6 +168,43 @@ typedef struct {
 } Finger;
 static Finger s_fin[FINGERS];
 static int s_mouse_was_down = 0;
+
+/* Ordered finger events so rapid same-finger taps are not merged into one just_down/up. */
+enum { TOUCH_Q = 64 };
+typedef struct {
+    SDL_FingerID id;
+    int type; /* SDL_FINGERDOWN / UP / MOTION */
+    float x, y;
+    Uint32 t;
+} TouchQEv;
+static TouchQEv s_tq[TOUCH_Q];
+static int s_tq_r = 0, s_tq_w = 0, s_tq_n = 0;
+
+static void touch_q_clear(void) {
+    s_tq_r = s_tq_w = s_tq_n = 0;
+}
+
+static void touch_q_push(SDL_FingerID id, int type, float x, float y) {
+    if (s_tq_n >= TOUCH_Q) {
+        s_tq_r = (s_tq_r + 1) % TOUCH_Q;
+        s_tq_n--;
+    }
+    s_tq[s_tq_w].id = id;
+    s_tq[s_tq_w].type = type;
+    s_tq[s_tq_w].x = x;
+    s_tq[s_tq_w].y = y;
+    s_tq[s_tq_w].t = SDL_GetTicks();
+    s_tq_w = (s_tq_w + 1) % TOUCH_Q;
+    s_tq_n++;
+}
+
+static int touch_q_pop(TouchQEv* out) {
+    if (s_tq_n <= 0 || out == NULL) return 0;
+    *out = s_tq[s_tq_r];
+    s_tq_r = (s_tq_r + 1) % TOUCH_Q;
+    s_tq_n--;
+    return 1;
+}
 static int s_kb_mode = 0; /* 0: abc, 1: ABC, 2: 123/sym */
 static int s_drag_slot = -1;
 static int s_stick_slot = -1;
@@ -223,6 +259,39 @@ void pc_touch_hud_state(char* buf, size_t n) {
 
 void pc_touch_pulse_b(void) { s_pulse_b = 1; }
 
+void pc_touch_reset_all(const char* reason) {
+    int i;
+    memset(s_fin, 0, sizeof(s_fin));
+    for (i = 0; i < FINGERS; i++) s_fin[i].key = -1;
+    touch_q_clear();
+    s_mouse_was_down = 0;
+    s_latch = 0;
+    s_latch_frames = 0;
+    s_pulse_a = 0;
+    s_pulse_b = 0;
+    s_drag_active = 0;
+    s_drag_moved = 0;
+    s_drag_slot = -1;
+    s_stick_slot = -1;
+    s_stick_kx = 0.0f;
+    s_stick_ky = 0.0f;
+    s_have_target = 0;
+    s_running = 0;
+    s_cam_two_finger_was = 0;
+    s_cam_prev_dist = 0.0f;
+    s_cam_accum_pinch = 0.0f;
+    s_cam_accum_dx = 0.0f;
+    s_cam_accum_dy = 0.0f;
+    s_cam_pulse_timer = 0;
+    s_cam_pulse_x = 0;
+    s_cam_pulse_y = 0;
+    if (reason != NULL && reason[0] != '\0') {
+        char line[80];
+        snprintf(line, sizeof(line), "touch reset (%s)", reason);
+        pc_diag_milestone(line);
+    }
+}
+
 int pc_touch_take_title_tap(float* font_y) {
     if (!s_title_valid) return 0;
     s_title_valid = 0;
@@ -266,13 +335,38 @@ static void finger_set(SDL_FingerID id, float x, float y, int type) {
     }
 }
 
+/* Drawable pixels from an SDL finger event (normalized 0..1). */
+static int finger_to_window(const SDL_Event* e, float* x, float* y) {
+    if (e == NULL || x == NULL || y == NULL || g_pc_window_w < 2 || g_pc_window_h < 2) return 0;
+    *x = e->tfinger.x * (float)g_pc_window_w;
+    *y = e->tfinger.y * (float)g_pc_window_h;
+    return 1;
+}
+
+/* Same letterboxed picture rect as menu hit-tests and font mapping (layout_box stretch 2). */
+static void picture_rect(int* bx, int* by, int* bw, int* bh) {
+    *bx = g_pc_content_x;
+    *by = g_pc_content_y;
+    *bw = g_pc_content_w;
+    *bh = g_pc_content_h;
+    pc_layout_box(2, bx, by, bw, bh);
+    if (*bw < 1) *bw = 1;
+    if (*bh < 1) *bh = 1;
+}
+
+static void window_to_font(float x, float y, float* fx, float* fy) {
+    int bx, by, bw, bh;
+    picture_rect(&bx, &by, &bw, &bh);
+    *fx = (x - (float)bx) / (float)bw * 320.0f;
+    *fy = (y - (float)by) / (float)bh * 240.0f;
+}
+
 void pc_touch_note_event(const SDL_Event* e) {
     float x, y;
     if (e == NULL || g_pc_window_w < 2 || g_pc_window_h < 2) return;
     if (e->type == SDL_FINGERDOWN || e->type == SDL_FINGERUP || e->type == SDL_FINGERMOTION) {
-        x = e->tfinger.x * (float)g_pc_window_w;
-        y = e->tfinger.y * (float)g_pc_window_h;
-        finger_set(e->tfinger.fingerId, x, y, e->type);
+        if (!finger_to_window(e, &x, &y)) return;
+        touch_q_push(e->tfinger.fingerId, e->type, x, y);
         if (s_logged < 6 && e->type != SDL_FINGERMOTION) {
             char line[96];
             s_logged++;
@@ -313,6 +407,10 @@ static int submenu_open(void) {
 }
 
 static int keys_up(void) {
+#ifdef __ANDROID__
+    /* System IME only: never show the in-game soft QWERTY (avoids double letters with SDL_StartTextInput). */
+    return 0;
+#else
 #ifdef KEYBOARD_TYPING
     if (g_pc_editor_active && g_pc_settings.touch_keyboard) {
         GAME_PLAY* play = get_game_play();
@@ -325,23 +423,19 @@ static int keys_up(void) {
     if (pc_chat_typing() && g_pc_settings.touch_keyboard) return 1;
 #endif
     return pc_play_online_menu_text_active();
+#endif
 }
 
 static int in_picture(float x, float y) {
-    int bx = g_pc_content_x, by = g_pc_content_y, bw = g_pc_content_w, bh = g_pc_content_h;
-    pc_layout_box(2, &bx, &by, &bw, &bh);
+    int bx, by, bw, bh;
+    picture_rect(&bx, &by, &bw, &bh);
     return x >= (float)bx && y >= (float)by &&
            x < (float)(bx + bw) &&
            y < (float)(by + bh);
 }
 
 static void to_font(float x, float y, float* fx, float* fy) {
-    int bx = g_pc_content_x, by = g_pc_content_y, bw = g_pc_content_w, bh = g_pc_content_h;
-    pc_layout_box(2, &bx, &by, &bw, &bh);
-    if (bw < 1) bw = 1;
-    if (bh < 1) bh = 1;
-    *fx = (x - (float)bx) / (float)bw * 320.0f;
-    *fy = (y - (float)by) / (float)bh * 240.0f;
+    window_to_font(x, y, fx, fy);
 }
 
 static void place_keys(Hud* h, float top, float bottom, float left, float right) {
@@ -733,6 +827,37 @@ static void hud_build(Hud* h) {
         h->show_dpad = 0;
         h->show_trigs = 0;
     }
+#ifdef __ANDROID__
+    /* Corner HUD discs → system gesture exclusion (Java reads gesture_exclusion.txt). */
+    {
+        FILE* gf = fopen("gesture_exclusion.txt", "w");
+        if (gf != NULL) {
+            int n = 0;
+            float rects[10][4];
+            #define ADD_DISC(show, cx, cy, rad) do { \
+                if ((show) && n < 10) { \
+                    float rr = (rad) * 1.25f; \
+                    rects[n][0] = (cx) - rr; rects[n][1] = (cy) - rr; \
+                    rects[n][2] = (cx) + rr; rects[n][3] = (cy) + rr; \
+                    n++; \
+                } \
+            } while (0)
+            ADD_DISC(h->show_action, h->ax, h->ay, h->ar);
+            ADD_DISC(h->show_back, h->bx, h->by, h->br);
+            ADD_DISC(h->show_menu, h->mx, h->my, h->mr);
+            ADD_DISC(h->show_quick, h->bag_x, h->bag_y, h->qr);
+            ADD_DISC(h->show_quick, h->map_x, h->map_y, h->qr);
+            ADD_DISC(h->show_close, h->close_x, h->close_y, h->close_r);
+            #undef ADD_DISC
+            fprintf(gf, "%d\n", n);
+            for (int ri = 0; ri < n; ri++) {
+                fprintf(gf, "%.0f %.0f %.0f %.0f\n",
+                        rects[ri][0], rects[ri][1], rects[ri][2], rects[ri][3]);
+            }
+            fclose(gf);
+        }
+    }
+#endif
 }
 
 static int hit_disc(float x, float y, float cx, float cy, float r) {
@@ -916,25 +1041,29 @@ static int tap_to_world(float wx, float wy, float* out_x, float* out_z) {
     player = get_player_actor_withoutCheck(play);
     if (player == NULL) return 0;
 
-    fov = play->camera.perspective.fov_y;
-    if (fov < 5.0f || fov > 170.0f) fov = 45.0f;
+    {
+        int bx, by, bw, bh;
+        picture_rect(&bx, &by, &bw, &bh);
+        fov = play->camera.perspective.fov_y;
+        if (fov < 5.0f || fov > 170.0f) fov = 45.0f;
 
-    base_aspect = 4.0f / 3.0f;
-    cur_aspect = (float)g_pc_content_w / (float)g_pc_content_h;
-    base_tan_y = tanf(fov * 0.5f * 3.14159265f / 180.0f);
+        base_aspect = 4.0f / 3.0f;
+        cur_aspect = (float)bw / (float)bh;
+        base_tan_y = tanf(fov * 0.5f * 3.14159265f / 180.0f);
 
-    if (cur_aspect < base_aspect - 0.001f) {
-        /* Portrait / Vert+: horizontal FOV is fixed to 4:3 base, vertical FOV expands */
-        tan_x = base_tan_y * base_aspect;
-        tan_y = tan_x / cur_aspect;
-    } else {
-        /* Landscape / Hor+: vertical FOV is fixed, horizontal FOV expands */
-        tan_y = base_tan_y;
-        tan_x = base_tan_y * cur_aspect;
+        if (cur_aspect < base_aspect - 0.001f) {
+            /* Portrait / Vert+: horizontal FOV is fixed to 4:3 base, vertical FOV expands */
+            tan_x = base_tan_y * base_aspect;
+            tan_y = tan_x / cur_aspect;
+        } else {
+            /* Landscape / Hor+: vertical FOV is fixed, horizontal FOV expands */
+            tan_y = base_tan_y;
+            tan_x = base_tan_y * cur_aspect;
+        }
+
+        nx = ((wx - (float)bx) / (float)bw) * 2.0f - 1.0f;
+        ny = 1.0f - ((wy - (float)by) / (float)bh) * 2.0f;
     }
-
-    nx = ((wx - (float)g_pc_content_x) / (float)g_pc_content_w) * 2.0f - 1.0f;
-    ny = 1.0f - ((wy - (float)g_pc_content_y) / (float)g_pc_content_h) * 2.0f;
 
     fx = play->camera.lookat.center.x - play->camera.lookat.eye.x;
     fy = play->camera.lookat.center.y - play->camera.lookat.eye.y;
@@ -2054,6 +2183,17 @@ void pc_touch_apply(unsigned short* buttons, signed char* stick_x, signed char* 
         s_pending_row = -1;
     }
 
+    /* Apply queued finger edges one at a time so rapid same-finger taps are not collapsed. */
+touch_edge_pass:
+    {
+        TouchQEv ev;
+        while (touch_q_pop(&ev)) {
+            finger_set(ev.id, ev.x, ev.y, ev.type);
+            if (ev.type == SDL_FINGERDOWN || ev.type == SDL_FINGERUP)
+                break;
+        }
+    }
+
     /* 1. Process new finger-down events */
     for (i = 0; i < FINGERS; i++) {
         Finger* f = &s_fin[i];
@@ -2195,6 +2335,79 @@ void pc_touch_apply(unsigned short* buttons, signed char* stick_x, signed char* 
             }
         }
     }
+
+    /* 1b. Finger-ups for this edge (before camera/held so a same-frame tap completes). */
+    for (i = 0; i < FINGERS; i++) {
+        Finger* f = &s_fin[i];
+        float dx, dy, dist;
+        Uint32 dt;
+        if (!f->just_up) continue;
+        f->just_up = 0;
+        dx = f->x - f->ox;
+        dy = f->y - f->oy;
+        dist = hypotf(dx, dy);
+        dt = SDL_GetTicks() - f->t0;
+
+        if (f->hit == HIT_STICK && s_stick_slot == i) {
+            s_stick_slot = -1;
+            s_stick_kx = 0.0f;
+            s_stick_ky = 0.0f;
+        } else if (f->hit == HIT_TOOL) {
+            if (!f->moved && dist < tap_slop) {
+                equip_next_tool();
+            }
+        } else if (f->hit == HIT_CAM) {
+            if (dx > 25.0f) {
+                GAME_PLAY* play = get_game_play();
+                if (play != NULL) {
+                    play->camera.indoor_direction_addition_idx = 2;
+                    sAdo_SysTrgStart(NA_SE_CAMERA_MOVE1);
+                    pc_touch_buzz();
+                    pc_diag_milestone("cam rotate right");
+                }
+            } else if (dx < -25.0f) {
+                GAME_PLAY* play = get_game_play();
+                if (play != NULL) {
+                    play->camera.indoor_direction_addition_idx = 0;
+                    sAdo_SysTrgStart(NA_SE_CAMERA_MOVE1);
+                    pc_touch_buzz();
+                    pc_diag_milestone("cam rotate left");
+                }
+            } else {
+                pc_touch_cam_cycle();
+            }
+        } else if (f->hit == HIT_PICTURE) {
+            if (s_drag_slot == i) {
+                if (!f->moved && (!s_drag_moved || (dt < 240 && dist < tap_slop))) {
+                    if (can_steer()) begin_move(f->ox, f->oy, 1);
+                    else on_picture_release(f->ox, f->oy);
+                }
+                s_drag_active = 0;
+                s_drag_moved = 0;
+                s_drag_slot = -1;
+            } else if (!can_steer() && !f->moved) {
+                if (dist < tap_slop) {
+                    on_picture_release(f->ox, f->oy);
+                } else if (submenu_open() && !s_sheet.active && dist > 45.0f) {
+                    if (fabsf(dx) > fabsf(dy)) {
+                        s_swipe = (dx > 0.0f) ? 1 : -1;
+                    } else {
+                        s_swipe = (dy < 0.0f) ? 2 : -2;
+                    }
+                    pc_touch_buzz();
+                    pc_diag_milestone("submenu swipe");
+                } else if (s_hud == HUD_MENU && fabsf(dy) > 52.0f && fabsf(dy) > fabsf(dx)) {
+                    s_swipe = (dy < 0.0f) ? 70 : -70;
+                    pc_diag_milestone("swipe");
+                }
+            }
+        }
+
+        f->hit = HIT_NONE;
+        f->key = -1;
+        f->moved = 0;
+    }
+    if (s_tq_n > 0) goto touch_edge_pass;
 
     /* 2. Check if two fingers are simultaneously in HIT_PICTURE for 2-finger camera gestures */
     for (i = 0; i < FINGERS; i++) {
@@ -2378,78 +2591,6 @@ void pc_touch_apply(unsigned short* buttons, signed char* stick_x, signed char* 
                 }
             }
         }
-    }
-
-    /* 4. Process finger-up events */
-    for (i = 0; i < FINGERS; i++) {
-        Finger* f = &s_fin[i];
-        float dx, dy, dist;
-        Uint32 dt;
-        if (!f->just_up) continue;
-        f->just_up = 0;
-        dx = f->x - f->ox;
-        dy = f->y - f->oy;
-        dist = hypotf(dx, dy);
-        dt = SDL_GetTicks() - f->t0;
-
-        if (f->hit == HIT_STICK && s_stick_slot == i) {
-            s_stick_slot = -1;
-            s_stick_kx = 0.0f;
-            s_stick_ky = 0.0f;
-        } else if (f->hit == HIT_TOOL) {
-            if (!f->moved && dist < tap_slop) {
-                equip_next_tool();
-            }
-        } else if (f->hit == HIT_CAM) {
-            if (dx > 25.0f) {
-                GAME_PLAY* play = get_game_play();
-                if (play != NULL) {
-                    play->camera.indoor_direction_addition_idx = 2;
-                    sAdo_SysTrgStart(NA_SE_CAMERA_MOVE1);
-                    pc_touch_buzz();
-                    pc_diag_milestone("cam rotate right");
-                }
-            } else if (dx < -25.0f) {
-                GAME_PLAY* play = get_game_play();
-                if (play != NULL) {
-                    play->camera.indoor_direction_addition_idx = 0;
-                    sAdo_SysTrgStart(NA_SE_CAMERA_MOVE1);
-                    pc_touch_buzz();
-                    pc_diag_milestone("cam rotate left");
-                }
-            } else {
-                pc_touch_cam_cycle();
-            }
-        } else if (f->hit == HIT_PICTURE) {
-            if (s_drag_slot == i) {
-                if (!f->moved && (!s_drag_moved || (dt < 240 && dist < tap_slop))) {
-                    if (can_steer()) begin_move(f->ox, f->oy, 1);
-                    else on_picture_release(f->ox, f->oy);
-                }
-                s_drag_active = 0;
-                s_drag_moved = 0;
-                s_drag_slot = -1;
-            } else if (!can_steer() && !f->moved) {
-                if (dist < tap_slop) {
-                    on_picture_release(f->ox, f->oy);
-                } else if (submenu_open() && !s_sheet.active && dist > 45.0f) {
-                    if (fabsf(dx) > fabsf(dy)) {
-                        s_swipe = (dx > 0.0f) ? 1 : -1;
-                    } else {
-                        s_swipe = (dy < 0.0f) ? 2 : -2;
-                    }
-                    pc_touch_buzz();
-                    pc_diag_milestone("submenu swipe");
-                } else if (s_hud == HUD_MENU && fabsf(dy) > 52.0f && fabsf(dy) > fabsf(dx)) {
-                    s_swipe = (dy < 0.0f) ? 70 : -70;
-                    pc_diag_milestone("swipe");
-                }
-            }
-        }
-
-        f->hit = HIT_NONE;
-        f->key = -1;
-        f->moved = 0;
     }
 
     if (s_pulse_a) { latch_button(PAD_BUTTON_A, "A"); s_pulse_a = 0; pc_touch_buzz(); }
