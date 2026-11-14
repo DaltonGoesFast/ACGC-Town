@@ -3,6 +3,7 @@ package com.acgc.town;
 import android.app.Activity;
 import android.os.Build;
 import android.util.Log;
+import android.graphics.Insets;
 import android.view.DisplayCutout;
 import android.view.View;
 import android.view.WindowInsets;
@@ -18,10 +19,7 @@ public final class SafeInsets {
     public static void install(Activity activity) {
         try {
             WindowManager.LayoutParams lp = activity.getWindow().getAttributes();
-            if (Build.VERSION.SDK_INT >= 30) {
-                lp.layoutInDisplayCutoutMode = WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_ALWAYS;
-                activity.getWindow().setAttributes(lp);
-            } else if (Build.VERSION.SDK_INT >= 28) {
+            if (Build.VERSION.SDK_INT >= 28) {
                 lp.layoutInDisplayCutoutMode = WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_SHORT_EDGES;
                 activity.getWindow().setAttributes(lp);
             }
@@ -48,6 +46,10 @@ public final class SafeInsets {
                 top = insets.getSystemWindowInsetTop();
                 right = insets.getSystemWindowInsetRight();
                 bottom = insets.getSystemWindowInsetBottom();
+                if (Build.VERSION.SDK_INT >= 30) {
+                    Insets ime = insets.getInsets(WindowInsets.Type.ime());
+                    if (ime != null) bottom = Math.max(bottom, ime.bottom);
+                }
                 if (Build.VERSION.SDK_INT >= 28) {
                     DisplayCutout cut = insets.getDisplayCutout();
                     if (cut != null) {

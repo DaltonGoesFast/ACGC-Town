@@ -969,7 +969,10 @@ static void aAL_pc_menu_draw(ANIMAL_LOGO_ACTOR* actor, GAME* game) {
 
   /* Hide the title's main menu items while the Options overlay is open, else
    * Start/Options/Quit bleed through the dimmed backdrop. */
-  if (!actor->pc_options_open && !pc_play_online_menu_active() && !pc_play_offline_menu_active()) {
+  /* The phone title card draws these rows. Skip the GameCube strings so they
+   * cannot show up under the buttons on a layout where the font projection works. */
+  if (!pc_touch_title_card_active() &&
+      !actor->pc_options_open && !pc_play_online_menu_active() && !pc_play_offline_menu_active()) {
     for (int i = 0; i < n_items; i++) {
       int on = (sel == i);
       int item = aAL_pc_menu_item(i);

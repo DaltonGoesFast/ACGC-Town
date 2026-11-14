@@ -19,11 +19,20 @@ struct game_s;
 
 int pc_touch_enabled(void);
 
+/* Normalized finger position (0..1 of the drawable) to window pixels. */
+void pc_touch_finger_xy(float nx, float ny, float* x, float* y);
+/* Drop held fingers. Used when the activity pauses without a finger-up. */
+void pc_touch_cancel_fingers(void);
+
 void pc_touch_note_event(const SDL_Event* e);
 void pc_touch_pulse_b(void);
 
 /* 1 if a title-menu row was tapped this frame. font_y is in the 240-tall font space. */
 int pc_touch_take_title_tap(float* font_y);
+
+/* 1 while the touch layer is drawing the phone title card. The GameCube title
+ * strings stay hidden so they do not sit under the buttons. */
+int pc_touch_title_card_active(void);
 
 int pc_touch_finger_count(void);
 int pc_touch_hud_mode(void);

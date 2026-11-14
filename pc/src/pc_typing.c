@@ -6,6 +6,9 @@
 
 #ifdef KEYBOARD_TYPING
 #include "m_font.h"
+#include "pc_settings.h"
+#include "pc_crash.h"
+#include <stdio.h>
 
 int           g_pc_typing_mode = 0;
 int           g_pc_editor_active = 0;
@@ -155,8 +158,12 @@ void pc_typing_handle_event(const SDL_Event* event) {
         const char* p = event->text.text;
         while (*p) {
             int code = pc_utf8_to_game_code(p);
-            if (code >= 0)
+            if (code >= 0) {
+                char note[32];
                 pc_typing_queue_push(code);
+                snprintf(note, sizeof(note), "ime char %c", code >= 32 && code < 127 ? code : '?');
+                pc_diag_milestone(note);
+            }
             unsigned char lead = (unsigned char)*p;
             if (lead < 0x80) p += 1;
             else if (lead < 0xE0) p += 2;
@@ -166,8 +173,53 @@ void pc_typing_handle_event(const SDL_Event* event) {
     }
 }
 
+/* The editor asked for the system keyboard. s_ime_miss counts frames it stayed hidden. */
+static int s_editor_ime = 0;
+static int s_ime_miss = 0;
+
+static void ime_place_rect(void) {
+    SDL_Rect r;
+    int dw = 0, dh = 0;
+    if (g_pc_window == NULL) return;
+    SDL_GL_GetDrawableSize(g_pc_window, &dw, &dh);
+    if (dw < 2) dw = g_pc_window_w;
+    if (dh < 2) dh = g_pc_window_h;
+    if (dw < 2 || dh < 2) return;
+    /* Same drawable the finger converter uses. Keep the field in the upper third. */
+    r.w = dw * 2 / 3;
+    if (r.w < 1) r.w = 1;
+    r.h = 72;
+    r.x = (dw - r.w) / 2;
+    r.y = dh / 5;
+    SDL_SetTextInputRect(&r);
+}
+
+int pc_typing_use_drawn_keys(void) {
+    return s_editor_ime && s_ime_miss >= 90;
+}
+
+int pc_typing_hide_gc_keyboard(void) {
+    return s_editor_ime;
+}
+
 void pc_typing_update(void) {
-    if (g_pc_typing_mode && !g_pc_editor_active) {
+    int shown = 0;
+    if (g_pc_editor_active && g_pc_settings.touch_keyboard) {
+        g_pc_typing_mode = 1;
+        if (!s_editor_ime || !SDL_IsTextInputActive()) {
+            ime_place_rect();
+            SDL_StartTextInput();
+            s_editor_ime = 1;
+            s_ime_miss = 0;
+        }
+        shown = (g_pc_window != NULL && SDL_IsScreenKeyboardShown(g_pc_window));
+        if (shown) s_ime_miss = 0;
+        else if (s_ime_miss < 1000) s_ime_miss++;
+        return;
+    }
+    if (s_editor_ime || (g_pc_typing_mode && !g_pc_editor_active)) {
+        s_editor_ime = 0;
+        s_ime_miss = 0;
         g_pc_typing_mode = 0;
         SDL_StopTextInput();
         pc_typing_queue_clear();

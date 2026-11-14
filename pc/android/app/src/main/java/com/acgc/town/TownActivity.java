@@ -1,14 +1,19 @@
 package com.acgc.town;
 
 import android.content.pm.ActivityInfo;
+import android.graphics.Rect;
+import android.os.Build;
 import android.os.Bundle;
 import android.util.Log;
+import android.view.View;
 
 import org.libsdl.app.SDLActivity;
 
 import java.io.File;
 import java.io.FileOutputStream;
 import java.io.InputStream;
+import java.util.ArrayList;
+import java.util.List;
 
 /** SDL2 activity. libmain.so is the game. Shaders are copied next to the saved disc before SDL starts. */
 public class TownActivity extends SDLActivity {
@@ -32,6 +37,52 @@ public class TownActivity extends SDLActivity {
         Log.i("ACGC", "TownActivity start, rom=" + new File(getFilesDir(), "gafe01.iso").getAbsolutePath());
         super.onCreate(savedInstanceState);
         SafeInsets.install(this);
+        View decor = getWindow().getDecorView();
+        decor.addOnLayoutChangeListener((v, l, t, r, b, ol, ot, or, ob) -> {
+            applyImmersive();
+            applyGestureExclusion();
+        });
+        applyImmersive();
+    }
+
+    @Override
+    public void onWindowFocusChanged(boolean hasFocus) {
+        super.onWindowFocusChanged(hasFocus);
+        if (hasFocus) {
+            applyImmersive();
+            applyGestureExclusion();
+        }
+    }
+
+    /** Sticky immersive fullscreen so the status bar and gesture bar do not sit in the touch stream. */
+    private void applyImmersive() {
+        View decor = getWindow().getDecorView();
+        int flags = View.SYSTEM_UI_FLAG_FULLSCREEN
+                | View.SYSTEM_UI_FLAG_HIDE_NAVIGATION
+                | View.SYSTEM_UI_FLAG_IMMERSIVE_STICKY
+                | View.SYSTEM_UI_FLAG_LAYOUT_FULLSCREEN
+                | View.SYSTEM_UI_FLAG_LAYOUT_HIDE_NAVIGATION
+                | View.SYSTEM_UI_FLAG_LAYOUT_STABLE;
+        decor.setSystemUiVisibility(flags);
+    }
+
+    /** Keep back-swipe and the notification shade off the HUD corners. */
+    private void applyGestureExclusion() {
+        if (Build.VERSION.SDK_INT < 29) return;
+        View decor = getWindow().getDecorView();
+        int w = decor.getWidth();
+        int h = decor.getHeight();
+        if (w < 2 || h < 2) return;
+        float d = getResources().getDisplayMetrics().density;
+        int edge = Math.max(1, (int) (48f * d));
+        int corner = Math.max(edge, (int) (168f * d));
+        if (corner > h) corner = h;
+        List<Rect> rects = new ArrayList<>();
+        rects.add(new Rect(0, 0, Math.min(edge, w), corner));
+        rects.add(new Rect(0, h - corner, Math.min(edge, w), h));
+        rects.add(new Rect(Math.max(0, w - edge), 0, w, corner));
+        rects.add(new Rect(Math.max(0, w - edge), h - corner, w, h));
+        decor.setSystemGestureExclusionRects(rects);
     }
 
     @Override

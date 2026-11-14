@@ -2530,9 +2530,19 @@ static void mED_set_dl(Submenu* submenu, mSM_MenuInfo_c* menu_info, GAME* game) 
     mED_Ovl_c* editor_ovl = submenu->overlay->editor_ovl;
     GRAPH* graph = game->graph;
 
+#if defined(TARGET_PC) && defined(KEYBOARD_TYPING)
+    {
+        extern int pc_typing_hide_gc_keyboard(void);
+        if (!pc_typing_hide_gc_keyboard()) {
+            mED_KeyDraw(editor_ovl, graph, menu_info->position[0], menu_info->position[1]);
+            mED_StringsDraw(submenu, editor_ovl, game, menu_info->position[0], menu_info->position[1]);
+        }
+    }
+#else
     mED_KeyDraw(editor_ovl, graph, menu_info->position[0], menu_info->position[1]);
-    mED_InkPotDraw(submenu, editor_ovl, graph, menu_info->position[0], menu_info->position[1]);
     mED_StringsDraw(submenu, editor_ovl, game, menu_info->position[0], menu_info->position[1]);
+#endif
+    mED_InkPotDraw(submenu, editor_ovl, graph, menu_info->position[0], menu_info->position[1]);
 }
 
 extern Gfx lat_end_cordT_model[];
@@ -2582,21 +2592,6 @@ static void mED_editor_ovl_draw(Submenu* submenu, GAME* game) {
         CLOSE_DISP(game->graph);
     }
 
-#if defined(TARGET_PC) && defined(KEYBOARD_TYPING)
-    {
-        extern int g_pc_typing_mode;
-        static u8 str_on[]  = "Keyboard Typing (Tab): On";
-        static u8 str_off[] = "Keyboard Typing (Tab): Off";
-        u8* str = g_pc_typing_mode ? str_on  : str_off;
-        int len = (g_pc_typing_mode ? sizeof(str_on) : sizeof(str_off)) - 1; /* drop NUL */
-        f32 scale = 0.6f;
-        f32 x = 80.0f;
-
-        (*overlay->set_char_matrix_proc)(game->graph);
-        mFont_SetLineStrings(game, str, len, x, 8.0f, 255, 255, 255, 180, FALSE, FALSE, scale, scale,
-                             mFont_MODE_POLY);
-    }
-#endif
 }
 
 extern void mED_editor_ovl_set_proc(Submenu* submenu) {
