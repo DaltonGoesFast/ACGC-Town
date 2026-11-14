@@ -187,6 +187,8 @@ static void mobile_sheet_draw(void);
 static void intent_clear(void);
 static void pc_touch_buzz(void);
 static int intent_needs_act(void);
+static int tree_walk_target(float trunk_x, float trunk_z, float px, float pz, float py,
+                            float* out_x, float* out_z);
 
 static int s_pulse_a = 0;
 static int s_pulse_b = 0;
@@ -1336,12 +1338,29 @@ static int intent_steer(signed char* stick_x, signed char* stick_y) {
             s_intent.arrive = 14.0f;
         }
     }
+    if ((s_intent.kind == INTENT_SHAKE_TREE || s_intent.kind == INTENT_CHOP_TREE)) {
+        float len = hypotf(px - s_intent.face_x, pz - s_intent.face_z);
+        float sx, sz;
+        s_intent.force_walk = 1;
+        if (len <= 42.0f) {
+            s_intent.tx = px;
+            s_intent.tz = pz;
+            s_intent.arrive = 64.0f;
+        } else if (tree_walk_target(s_intent.face_x, s_intent.face_z, px, pz,
+                                   player->actor_class.world.position.y, &sx, &sz)) {
+            s_intent.tx = sx;
+            s_intent.tz = sz;
+            s_intent.arrive = 10.0f;
+        }
+    }
     dx = s_intent.tx - px;
     dz = s_intent.tz - pz;
     dist = sqrtf(dx * dx + dz * dz);
     arrive = s_intent.arrive > 1.0f ? s_intent.arrive : TOUCH_ARRIVE;
     if (update_stall(dist)) return 0;
-    if (dist < arrive && !(intent_wants_front() && !front_on_stand(px, pz))) {
+    if (dist < arrive && !(intent_wants_front() && !front_on_stand(px, pz)) &&
+        !((s_intent.kind == INTENT_SHAKE_TREE || s_intent.kind == INTENT_CHOP_TREE) &&
+          hypotf(px - s_intent.face_x, pz - s_intent.face_z) > 42.0f)) {
         s_stall = 0;
         s_slide = 0;
         s_best_dist = -1.0f;
@@ -2060,6 +2079,159 @@ static void door_apply_stand(ACTOR* b) {
     s_intent.force_walk = 1;
 }
 
+static int fg_blocks_walk(mActor_name_t item) {
+    if (item == EMPTY_NO || item == RSV_WALL_NO) return 0;
+    if (item == EXIT_DOOR || item == EXIT_DOOR1) return 0;
+    if (item == FENCE0 || item == FENCE1 || item == WOOD_FENCE) return 1;
+    if (IS_ITEM_TREE(item) || IS_ITEM_COLLIDEABLE_TREE(item)) return 1;
+    if (item_is_notice(item) || ITEM_IS_SIGNBOARD(item) || ITEM_IS_SIGN(item)) return 1;
+    if (ITEM_NAME_GET_TYPE(item) == NAME_TYPE_STRUCT) return 1;
+    return 0;
+}
+
+/* 1 when a person cannot stand here: a solid prop, a wall, water, or a cliff. */
+static int point_blocked(float x, float z, float py) {
+    xyz_t p;
+    mActor_name_t* fg;
+    float y;
+    u32 attr;
+    p.x = x;
+    p.y = py;
+    p.z = z;
+    fg = mFI_GetUnitFG(p);
+    if (fg != NULL && fg_blocks_walk(*fg)) return 1;
+    y = mCoBG_GetBgY_OnlyCenter_FromWpos(p, 0.0f);
+    if (y > py + 28.0f || y < py - 55.0f) return 1;
+    attr = mCoBG_Wpos2Attribute(p, NULL);
+    if (mCoBG_CheckWaterAttribute(attr) || mCoBG_CheckCliffAttr(attr)) return 1;
+    return 0;
+}
+
+static int segment_clear(float x0, float z0, float x1, float z1, float py) {
+    float dx = x1 - x0;
+    float dz = z1 - z0;
+    float len = sqrtf(dx * dx + dz * dz);
+    int steps = (int)(len / 18.0f);
+    int i;
+    if (steps < 1) steps = 1;
+    if (steps > 24) steps = 24;
+    for (i = 1; i <= steps; i++) {
+        float t = (float)i / (float)steps;
+        if (point_blocked(x0 + dx * t, z0 + dz * t, py)) return 0;
+    }
+    return 1;
+}
+
+/* Nearest 26-unit side of the trunk whose path is clear. Otherwise a step
+ * around the obstacle, still heading toward a free side. */
+static int tree_walk_target(float trunk_x, float trunk_z, float px, float pz, float py,
+                            float* out_x, float* out_z) {
+    float best_d = 1.0e9f;
+    float bx = trunk_x, bz = trunk_z;
+    int found = 0;
+    int i;
+    for (i = 0; i < 16; i++) {
+        float ang = (float)i * (3.14159265f / 8.0f);
+        float sx = trunk_x + sinf(ang) * 26.0f;
+        float sz = trunk_z + cosf(ang) * 26.0f;
+        float d;
+        if (point_blocked(sx, sz, py)) continue;
+        if (!segment_clear(px, pz, sx, sz, py)) continue;
+        d = hypotf(sx - px, sz - pz);
+        if (d < best_d) {
+            best_d = d;
+            bx = sx;
+            bz = sz;
+            found = 1;
+        }
+    }
+    if (found) {
+        *out_x = bx;
+        *out_z = bz;
+        return 1;
+    }
+    /* No straight side. Step sideways from the player toward the trunk. */
+    {
+        float dx = trunk_x - px;
+        float dz = trunk_z - pz;
+        float len = sqrtf(dx * dx + dz * dz);
+        float nx, nz;
+        if (len < 1.0f) return 0;
+        dx /= len;
+        dz /= len;
+        nx = -dz;
+        nz = dx;
+        best_d = 1.0e9f;
+        found = 0;
+        for (i = 0; i < 10; i++) {
+            float mag = 36.0f + (float)(i / 2) * 36.0f;
+            float sgn = (i & 1) ? -1.0f : 1.0f;
+            float wx = px + dx * 48.0f + nx * mag * sgn;
+            float wz = pz + dz * 48.0f + nz * mag * sgn;
+            float d;
+            if (point_blocked(wx, wz, py)) continue;
+            if (!segment_clear(px, pz, wx, wz, py)) continue;
+            d = hypotf(wx - px, wz - pz);
+            if (d < 24.0f) continue;
+            if (d < best_d) {
+                best_d = d;
+                bx = wx;
+                bz = wz;
+                found = 1;
+            }
+        }
+    }
+    if (!found) return 0;
+    *out_x = bx;
+    *out_z = bz;
+    return 1;
+}
+
+/* Indoor exit rug. The room leaves when the 20-unit forward probe lands on
+ * EXIT_DOOR. That tile is the rug at the south edge. No A press. */
+static int find_exit_center(float px, float pz, float* cx, float* cz) {
+    int dx, dz, n = 0;
+    float sx = 0.0f, sz = 0.0f;
+    for (dz = -8; dz <= 8; dz++) {
+        for (dx = -8; dx <= 8; dx++) {
+            xyz_t p, c;
+            mActor_name_t* fg;
+            p.x = px + (float)dx * mFI_UT_WORLDSIZE_X_F;
+            p.y = 0.0f;
+            p.z = pz + (float)dz * mFI_UT_WORLDSIZE_Z_F;
+            fg = mFI_GetUnitFG(p);
+            if (fg == NULL || (*fg != EXIT_DOOR && *fg != EXIT_DOOR1)) continue;
+            if (!mFI_Wpos2UtCenterWpos(&c, p)) c = p;
+            sx += c.x;
+            sz += c.z;
+            n++;
+        }
+    }
+    if (n == 0) return 0;
+    *cx = sx / (float)n;
+    *cz = sz / (float)n;
+    return 1;
+}
+
+static int exit_rug_stand(float px, float pz, float tap_x, float tap_z, int have_tap,
+                          float screen_y, float* sx, float* sz, float* fx, float* fz) {
+    float cx, cz;
+    int bx, by, bw, bh;
+    int low, near;
+    if (!find_exit_center(px, pz, &cx, &cz)) return 0;
+    world_rect(&bx, &by, &bw, &bh);
+    low = (bh > 0 && screen_y > (float)by + (float)bh * 0.60f);
+    near = have_tap && hypotf(tap_x - cx, tap_z - cz) < 90.0f;
+    if (!low && !near) return 0;
+    /* Stand just north of the rug and face +Z (south). The 20-unit probe then
+     * lands on the rug. The south side of the rug is the void past the step. */
+    *fx = cx;
+    *fz = cz;
+    *sx = cx;
+    *sz = cz - 22.0f;
+    return 1;
+}
+
 static void begin_move(float x, float y, int fresh) {
     float wx, wz, dist_from_player;
     WorldHit hit;
@@ -2072,10 +2244,18 @@ static void begin_move(float x, float y, int fresh) {
         pc_touch_buzz();
         return;
     }
-    if (!tap_to_world(x, y, &wx, &wz)) return;
-
     play = get_game_play();
     player = (play != NULL) ? get_player_actor_withoutCheck(play) : NULL;
+    if (!tap_to_world(x, y, &wx, &wz)) {
+        float sx, sz, fx, fz;
+        if (player == NULL ||
+            !exit_rug_stand(player->actor_class.world.position.x, player->actor_class.world.position.z,
+                            0.0f, 0.0f, 0, y, &sx, &sz, &fx, &fz))
+            return;
+        wx = sx;
+        wz = sz;
+    }
+
     resolve_world_hit(x, y, wx, wz, &hit);
 
     if ((hit.kind == INTENT_DOOR || hit.kind == INTENT_OPEN) && s_door_block > 0) return;
@@ -2244,7 +2424,7 @@ static void begin_move(float x, float y, int fresh) {
         float dz = pz - s_intent.face_z;
         float len = sqrtf(dx * dx + dz * dz);
         s_intent.force_walk = 1;
-        if (len <= 34.0f) {
+        if (len <= 42.0f) {
             s_intent.tx = px;
             s_intent.tz = pz;
             s_intent.arrive = 64.0f;
@@ -2265,6 +2445,29 @@ static void begin_move(float x, float y, int fresh) {
         s_intent.vanilla_btn = 1;
         s_intent.arrive = 14.0f;
         s_intent.force_walk = 1;
+    }
+    /* A tap on the exit rug, or below it toward the bottom of the screen,
+     * walks onto the rug. The probe does the rest. */
+    if (player != NULL && s_intent.kind != INTENT_SHAKE_TREE && s_intent.kind != INTENT_CHOP_TREE &&
+        s_intent.kind != INTENT_READ_SIGN && !item_is_notice(s_intent.item)) {
+        float sx, sz, fx, fz;
+        if (exit_rug_stand(player->actor_class.world.position.x, player->actor_class.world.position.z,
+                           wx, wz, 1, y, &sx, &sz, &fx, &fz)) {
+            s_intent.kind = INTENT_DOOR;
+            s_intent.item = EXIT_DOOR;
+            s_intent.actor = NULL;
+            s_intent.face_x = fx;
+            s_intent.face_z = fz;
+            s_intent.tx = sx;
+            s_intent.tz = sz;
+            s_intent.face_lock = 1;
+            s_intent.face_angle = 0; /* +Z, toward the rug at the south edge */
+            s_intent.vanilla_btn = 0;
+            s_intent.arrive = 14.0f;
+            s_intent.force_walk = 1;
+            s_intent.need_tool = mPlib_PC_TOOL_NONE;
+            snprintf(s_intent.verb, sizeof(s_intent.verb), "Exit");
+        }
     }
 
     s_target_x = s_intent.tx;
