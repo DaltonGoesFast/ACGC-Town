@@ -48,6 +48,8 @@ extern void pc_creator_menu_pointer(float fx, float fy);
 #include "audio.h"
 #include "audio_defs.h"
 #include "m_collision_bg.h"
+#include "ac_mailbox.h"
+#include "ac_structure.h"
 #include <dolphin/pad.h>
 
 
@@ -58,20 +60,21 @@ extern void pc_creator_menu_pointer(float fx, float fy);
 
 #define TOUCH_STICK 80
 #define TOUCH_ARRIVE 25.0f
+#define TOUCH_STAND_ARRIVE 10.0f
 /* Semantic-touch approach radii. */
-#define TOUCH_ARRIVE_TALK 42.0f
-#define TOUCH_ARRIVE_PICK 28.0f
-#define TOUCH_ARRIVE_SIGN 30.0f
-#define TOUCH_ARRIVE_TREE 38.0f
-#define TOUCH_ARRIVE_TOOL 38.0f
-#define TOUCH_ARRIVE_OPEN 34.0f
-#define TOUCH_ARRIVE_BUG 48.0f
-#define TOUCH_ARRIVE_FISH 55.0f
+#define TOUCH_ARRIVE_TALK 38.0f
+#define TOUCH_ARRIVE_PICK 22.0f
+#define TOUCH_ARRIVE_SIGN 32.0f
+#define TOUCH_ARRIVE_TREE 34.0f
+#define TOUCH_ARRIVE_TOOL 34.0f
+#define TOUCH_ARRIVE_OPEN 30.0f
+#define TOUCH_ARRIVE_BUG 44.0f
+#define TOUCH_ARRIVE_FISH 18.0f
 #define TOUCH_ARRIVE_MAIL 36.0f
 #define TOUCH_HIT_NPC 110.0f
 #define TOUCH_HIT_FG 62.0f
 #define TOUCH_HIT_CREATURE 130.0f
-#define TOUCH_HIT_SCREEN 72.0f /* px — closer to finger wins */
+#define TOUCH_HIT_SCREEN 58.0f /* px — closer to finger wins */
 #define TOUCH_SLOW_DIST 90.0f
 #define TOUCH_EQUIP_TIMEOUT 90
 #define HUD_OFF 0
@@ -1137,7 +1140,9 @@ static int update_stall(float dist) {
 
 static int intent_fire_hook(GAME* game); /* defined after hit helpers */
 static int actor_still_alive(ACTOR* want);
-static int find_shore_stand(float target_x, float target_z, float py, float* out_x, float* out_z);
+static int find_shore_stand(float target_x, float target_z, float px, float py, float pz, float* out_x, float* out_z);
+static void latch_button(unsigned bit, const char* name);
+static void note_tap(const char* kind);
 
 /* Approach → equip → one vanilla request. */
 static int intent_steer(signed char* stick_x, signed char* stick_y) {
@@ -1161,31 +1166,40 @@ static int intent_steer(signed char* stick_x, signed char* stick_y) {
 
     /* Live-retarget insects / fish while approaching. */
     if (s_intent.kind == INTENT_CATCH_BUG || s_intent.kind == INTENT_CAST_FISH) {
-        if (!actor_still_alive(s_intent.actor)) {
-            intent_clear();
-            return 0;
-        }
-        if (s_intent.phase == INTENT_PHASE_APPROACH) {
-            float nx = s_intent.actor->world.position.x;
-            float nz = s_intent.actor->world.position.z;
-            s_intent.actor_vx = nx - s_intent.face_x;
-            s_intent.actor_vz = nz - s_intent.face_z;
-            s_intent.face_x = nx;
-            s_intent.face_z = nz;
-            if (s_intent.kind == INTENT_CATCH_BUG) {
-                float len, stand = s_intent.arrive;
-                dx = nx - player->actor_class.world.position.x;
-                dz = nz - player->actor_class.world.position.z;
-                len = sqrtf(dx * dx + dz * dz);
-                if (len > stand + 2.0f) {
-                    s_intent.tx = nx - (dx / len) * stand;
-                    s_intent.tz = nz - (dz / len) * stand;
-                }
-            } else {
-                float sx, sz;
-                if (find_shore_stand(nx, nz, player->actor_class.world.position.y, &sx, &sz)) {
-                    s_intent.tx = sx;
-                    s_intent.tz = sz;
+        if (s_intent.actor != NULL) {
+            if (!actor_still_alive(s_intent.actor)) {
+                intent_clear();
+                return 0;
+            }
+            if (s_intent.phase == INTENT_PHASE_APPROACH) {
+                float nx = s_intent.actor->world.position.x;
+                float nz = s_intent.actor->world.position.z;
+                s_intent.actor_vx = nx - s_intent.face_x;
+                s_intent.actor_vz = nz - s_intent.face_z;
+                s_intent.face_x = nx;
+                s_intent.face_z = nz;
+                if (s_intent.kind == INTENT_CATCH_BUG) {
+                    float len, stand = s_intent.arrive;
+                    px = player->actor_class.world.position.x;
+                    pz = player->actor_class.world.position.z;
+                    dx = nx - px;
+                    dz = nz - pz;
+                    len = sqrtf(dx * dx + dz * dz);
+                    if (len > stand + 2.0f) {
+                        s_intent.tx = nx - (dx / len) * stand;
+                        s_intent.tz = nz - (dz / len) * stand;
+                    } else {
+                        s_intent.tx = px;
+                        s_intent.tz = pz;
+                    }
+                } else {
+                    float sx, sz;
+                    if (find_shore_stand(nx, nz, player->actor_class.world.position.x,
+                                         player->actor_class.world.position.y,
+                                         player->actor_class.world.position.z, &sx, &sz)) {
+                        s_intent.tx = sx;
+                        s_intent.tz = sz;
+                    }
                 }
             }
         }
@@ -1193,6 +1207,9 @@ static int intent_steer(signed char* stick_x, signed char* stick_y) {
 
     if (s_intent.phase == INTENT_PHASE_ACT) {
         int ok;
+        int is_door = (s_intent.kind == INTENT_DOOR || s_intent.kind == INTENT_OPEN);
+        int max_act = is_door ? 6 : 4;
+        float push_mag = is_door ? 0.6f : 0.25f;
         s_intent.act_frames++;
         if (s_intent.act_frames == 1) {
             ok = intent_fire_hook((GAME*)play);
@@ -1201,14 +1218,14 @@ static int intent_steer(signed char* stick_x, signed char* stick_y) {
                 return 0;
             }
         }
-        if (s_intent.act_frames >= 4) {
+        if (s_intent.act_frames >= max_act) {
             intent_clear();
             return 0;
         }
         s_have_target = 1;
         dx = s_intent.face_x - player->actor_class.world.position.x;
         dz = s_intent.face_z - player->actor_class.world.position.z;
-        return stick_world_dir(play, dx, dz, 0.25f, stick_x, stick_y);
+        return stick_world_dir(play, dx, dz, push_mag, stick_x, stick_y);
     }
 
     if (s_intent.phase == INTENT_PHASE_EQUIP) {
@@ -1241,7 +1258,7 @@ static int intent_steer(signed char* stick_x, signed char* stick_y) {
     dx = s_intent.tx - px;
     dz = s_intent.tz - pz;
     dist = sqrtf(dx * dx + dz * dz);
-    arrive = s_intent.arrive > 1.0f ? s_intent.arrive : TOUCH_ARRIVE;
+    arrive = (s_intent.kind == INTENT_WALK) ? TOUCH_ARRIVE : TOUCH_STAND_ARRIVE;
     if (update_stall(dist)) return 0;
     if (dist < arrive) {
         s_stall = 0;
@@ -1404,17 +1421,55 @@ static void intent_verb_for(int kind, char* buf, size_t n) {
     snprintf(buf, n, "%s", v);
 }
 
-/* Classify FG item. Trees prefer chop when an axe is in pockets. */
-static int classify_fg_item(mActor_name_t item) {
+/* Trees with fruit, bells, or a golden shovel prefer shake unless an axe is actively held. */
+static int tree_has_harvest(mActor_name_t item) {
+    switch (item) {
+        case TREE_APPLE_FRUIT:
+        case TREE_ORANGE_FRUIT:
+        case TREE_PEACH_FRUIT:
+        case TREE_PEAR_FRUIT:
+        case TREE_CHERRY_FRUIT:
+        case TREE_PALM_FRUIT:
+        case TREE_1000BELLS:
+        case TREE_10000BELLS:
+        case TREE_30000BELLS:
+        case TREE_100BELLS:
+        case GOLD_TREE_SHOVEL:
+            return 1;
+        default:
+            return 0;
+    }
+}
+
+/* Classify FG tile at wpos, checking buried deposits first. */
+static int classify_fg_at(GAME_PLAY* play, xyz_t wpos, mActor_name_t item) {
+    if (mFI_Wpos2DepositGet(wpos)) {
+        if (ITEM_IS_BURIED_PITFALL_HOLE(item) || ITEM_IS_BURIED_PITFALL_HOLE_RSV(item)) {
+            return mPlib_PC_TouchHasToolInPockets(mPlib_PC_TOOL_SHOVEL) ? INTENT_DIG : INTENT_PITFALL_REFUSE;
+        }
+        return INTENT_DIG;
+    }
     if (item == EMPTY_NO) return INTENT_NONE;
-    if (ITEM_IS_SIGNBOARD(item) || ITEM_IS_SIGN(item)) return INTENT_READ_SIGN;
-    if (IS_ITEM_TREE(item) || IS_ITEM_COLLIDEABLE_TREE(item)) {
+    if (ITEM_IS_SIGNBOARD(item) || ITEM_IS_SIGN(item) || item == DUMMY_NAMEPLATE ||
+        item == MESSAGE_BOARD0 || item == MESSAGE_BOARD1 ||
+        item == MAP_BOARD0 || item == MAP_BOARD1 ||
+        item == MUSIC_BOARD0 || item == MUSIC_BOARD1) {
+        return INTENT_READ_SIGN;
+    }
+    if (IS_ITEM_COLLIDEABLE_TREE(item)) {
+        if (tree_has_harvest(item) && !mPlib_PC_TouchHoldingTool((GAME*)play, mPlib_PC_TOOL_AXE)) {
+            return INTENT_SHAKE_TREE;
+        }
         if (mPlib_PC_TouchHasToolInPockets(mPlib_PC_TOOL_AXE)) return INTENT_CHOP_TREE;
         return INTENT_SHAKE_TREE;
     }
-    if (ITEM_IS_BURIED_PITFALL_HOLE(item) || ITEM_IS_BURIED_PITFALL_HOLE_RSV(item))
-        return INTENT_PITFALL_REFUSE;
-    if (ITEM_IS_HOLE(item)) return INTENT_DIG;
+    if (item == SHINE_SPOT || item == HOLE_SHINE || ITEM_IS_HOLE(item) ||
+        IS_ITEM_TREE_STUMP(item) || IS_ITEM_DEAD_SAPLING(item)) {
+        return INTENT_DIG;
+    }
+    if (ITEM_IS_BURIED_PITFALL_HOLE(item) || ITEM_IS_BURIED_PITFALL_HOLE_RSV(item)) {
+        return mPlib_PC_TouchHasToolInPockets(mPlib_PC_TOOL_SHOVEL) ? INTENT_DIG : INTENT_PITFALL_REFUSE;
+    }
     if (IS_ITEM_ROCK(item)) return INTENT_HIT_ROCK;
     if (IS_ITEM_GRASS(item)) return INTENT_PULL_WEED;
     if (IS_ITEM_FLOWER(item) || ITEM_IS_ITEM1(item)) return INTENT_PICKUP;
@@ -1481,74 +1536,168 @@ static int world_xz_to_screen(float wx, float wy, float wz, float* sx, float* sy
     return 1;
 }
 
-static float screen_score(float finger_x, float finger_y, float wx, float wy, float wz, float world_fallback) {
-    float sx, sy, ddx, ddy;
-    if (world_xz_to_screen(wx, wy, wz, &sx, &sy)) {
-        ddx = sx - finger_x;
-        ddy = sy - finger_y;
-        return sqrtf(ddx * ddx + ddy * ddy);
-    }
-    return world_fallback + 1000.0f;
-}
-
-static int find_shore_stand(float target_x, float target_z, float py, float* out_x, float* out_z) {
-    static const float ox[] = {
-        0.0f, 40.0f, -40.0f, 0.0f, 0.0f, 40.0f, -40.0f, 80.0f, -80.0f, 0.0f, 0.0f, 56.0f, -56.0f
+static int find_shore_stand(float target_x, float target_z, float px, float py, float pz, float* out_x, float* out_z) {
+    static const float dir_x[8] = {
+        1.0f, -1.0f, 0.0f, 0.0f, 0.70710678f, -0.70710678f, 0.70710678f, -0.70710678f
     };
-    static const float oz[] = {
-        40.0f, 0.0f, 0.0f, -40.0f, 80.0f, 40.0f, 40.0f, 0.0f, 0.0f, -80.0f, 56.0f, 0.0f, 0.0f
+    static const float dir_z[8] = {
+        0.0f, 0.0f, 1.0f, -1.0f, 0.70710678f, 0.70710678f, -0.70710678f, -0.70710678f
     };
-    int i;
+    static const float radii[4] = { 48.0f, 64.0f, 80.0f, 96.0f };
+    int r_idx, d_idx;
     float best = 1.0e9f;
     int found = 0;
-    for (i = 0; i < 13; i++) {
-        xyz_t p;
-        u32 attr;
-        float d;
-        p.x = target_x + ox[i];
-        p.y = py;
-        p.z = target_z + oz[i];
-        attr = mCoBG_Wpos2Attribute(p, NULL);
-        if (mCoBG_CheckWaterAttribute(attr)) continue;
-        d = (p.x - target_x) * (p.x - target_x) + (p.z - target_z) * (p.z - target_z);
-        if (d < best) {
-            best = d;
-            *out_x = p.x;
-            *out_z = p.z;
-            found = 1;
+
+    for (r_idx = 0; r_idx < 4; r_idx++) {
+        float rad = radii[r_idx];
+        for (d_idx = 0; d_idx < 8; d_idx++) {
+            xyz_t p;
+            u32 attr;
+            mActor_name_t* fg;
+            float d;
+            p.x = target_x + dir_x[d_idx] * rad;
+            p.y = py;
+            p.z = target_z + dir_z[d_idx] * rad;
+            attr = mCoBG_Wpos2Attribute(p, NULL);
+            if (mCoBG_CheckWaterAttribute(attr) || mCoBG_CheckCliffAttr(attr)) continue;
+            fg = mFI_GetUnitFG(p);
+            if (fg != NULL && *fg != EMPTY_NO && !IS_ITEM_FLOWER(*fg) && !IS_ITEM_GRASS(*fg)) continue;
+            d = hypotf(p.x - target_x, p.z - target_z) + 0.35f * hypotf(p.x - px, p.z - pz);
+            if (d < best) {
+                best = d;
+                *out_x = p.x;
+                *out_z = p.z;
+                found = 1;
+            }
         }
     }
     return found;
 }
 
+static int structure_door_points(ACTOR* a, float* door_x, float* door_z, float* stand_x, float* stand_z) {
+    float ax, az, dx, dz, sx, sz;
+    if (a == NULL) return 0;
+    ax = a->world.position.x;
+    az = a->world.position.z;
+    switch (a->id) {
+        case mAc_PROFILE_HOUSE:
+        case mAc_PROFILE_COTTAGE_NPC:
+            dx = ax;
+            dz = az;
+            sx = ax;
+            sz = az + 34.0f;
+            break;
+        case mAc_PROFILE_MYHOUSE: {
+            STRUCTURE_ACTOR* st = (STRUCTURE_ACTOR*)a;
+            int direct = st->action & 1;
+            dx = st->arg0_f;
+            dz = st->arg1_f;
+            sx = dx + (direct == 0 ? 18.0f : -18.0f);
+            sz = dz + 18.0f;
+            break;
+        }
+        case mAc_PROFILE_SHOP:
+            dx = ax - 24.0f;
+            dz = az + 28.0f;
+            sx = ax - 38.0f;
+            sz = az + 42.0f;
+            break;
+        case mAc_PROFILE_CONVENI:
+            dx = ax;
+            dz = az + 62.0f;
+            sx = ax - 14.0f;
+            sz = az + 76.0f;
+            break;
+        case mAc_PROFILE_SUPER:
+        case mAc_PROFILE_DEPART:
+            dx = ax - 24.0f;
+            dz = az + 82.0f;
+            sx = ax - 38.0f;
+            sz = az + 96.0f;
+            break;
+        case mAc_PROFILE_POST_OFFICE:
+        case mAc_PROFILE_NEEDLEWORK_SHOP:
+            dx = ax - 26.0f;
+            dz = az + 36.0f;
+            sx = ax - 40.0f;
+            sz = az + 50.0f;
+            break;
+        case mAc_PROFILE_MUSEUM:
+            dx = ax;
+            dz = az + 80.0f;
+            sx = ax;
+            sz = az + 100.0f;
+            break;
+        case mAc_PROFILE_POLICE_BOX:
+            dx = ax + 10.0f;
+            dz = az + 26.0f;
+            sx = ax + 24.0f;
+            sz = az + 40.0f;
+            break;
+        case mAc_PROFILE_BRSHOP:
+            dx = ax;
+            dz = az + 40.0f;
+            sx = ax;
+            sz = az + 60.0f;
+            break;
+        case mAc_PROFILE_TENT:
+        case mAc_PROFILE_KAMAKURA:
+            dx = ax;
+            dz = az + 20.0f;
+            sx = ax;
+            sz = az + 40.0f;
+            break;
+        case mAc_PROFILE_COTTAGE_MY:
+            dx = ax + 6.0f;
+            dz = az + 6.0f;
+            sx = ax + 20.0f;
+            sz = az + 20.0f;
+            break;
+        default:
+            return 0;
+    }
+    if (door_x) *door_x = dx;
+    if (door_z) *door_z = dz;
+    if (stand_x) *stand_x = sx;
+    if (stand_z) *stand_z = sz;
+    return 1;
+}
+
 static void consider_hit(WorldHit* best, int kind, float finger_x, float finger_y,
-                         float wx, float wy, float wz, mActor_name_t item, ACTOR* actor, float bias) {
-    float sc = screen_score(finger_x, finger_y, wx, wy, wz,
-                            hypotf(wx - finger_x, wz - finger_y));
-    sc *= bias;
-    if (sc > TOUCH_HIT_SCREEN * 1.35f && actor == NULL && kind != INTENT_WALK) {
-        /* Still allow nearby FG via world distance fallback below TOUCH_HIT_FG. */
-        float wdx = wx, wdz = wz; (void)wdx; (void)wdz;
+                         float tap_wx, float tap_wz,
+                         float wx, float wy, float wz,
+                         float face_x, float face_z,
+                         mActor_name_t item, ACTOR* actor, float bias,
+                         float max_screen_px, float max_world_dist) {
+    float world_dist = hypotf(wx - tap_wx, wz - tap_wz);
+    float sx, sy, sc;
+    if (world_xz_to_screen(wx, wy, wz, &sx, &sy)) {
+        float raw_px = hypotf(sx - finger_x, sy - finger_y);
+        if (raw_px > max_screen_px && world_dist > max_world_dist) return;
+        sc = raw_px * bias;
+    } else {
+        if (world_dist > max_world_dist) return;
+        sc = (world_dist + 200.0f) * bias;
     }
     if (sc < best->score) {
         best->kind = kind;
-        best->x = wx;
-        best->z = wz;
-        best->face_x = wx;
-        best->face_z = wz;
+        best->x = face_x;
+        best->z = face_z;
+        best->face_x = face_x;
+        best->face_z = face_z;
         best->item = item;
         best->actor = actor;
         best->score = sc;
     }
 }
 
-/* Screen-space preferred hit: insects, fish, NPC, mailbox, house, FG. */
+/* Screen-space preferred hit: insects, fish, NPC, mailbox, signs, buildings, FG, water. */
 static int resolve_world_hit(float finger_x, float finger_y, float wx, float wz, WorldHit* out) {
     GAME_PLAY* play = get_game_play();
     PLAYER_ACTOR* player;
     WorldHit best;
     int i, part;
-    float py;
+    float py, min_dim, scale, px_actor, px_small_fg;
     static const float ox[] = {
         0.0f, -mFI_UT_WORLDSIZE_X_F, mFI_UT_WORLDSIZE_X_F, 0.0f, 0.0f,
         -mFI_UT_WORLDSIZE_X_F, mFI_UT_WORLDSIZE_X_F, -mFI_UT_WORLDSIZE_X_F, mFI_UT_WORLDSIZE_X_F
@@ -1576,37 +1725,68 @@ static int resolve_world_hit(float finger_x, float finger_y, float wx, float wz,
         return INTENT_WALK;
     }
     py = player->actor_class.world.position.y;
+    min_dim = (float)(g_pc_window_w < g_pc_window_h ? g_pc_window_w : g_pc_window_h);
+    if (min_dim < 1.0f) min_dim = 720.0f;
+    scale = fmaxf(0.75f, fminf(2.0f, min_dim / 720.0f));
+    px_actor = TOUCH_HIT_SCREEN * scale;
+    px_small_fg = 44.0f * scale;
 
     for (part = 0; part < ACTOR_PART_NUM; part++) {
         Actor_list* list = &play->actor_info.list[part];
         ACTOR* a;
         for (a = list->actor; a != NULL; a = a->next_actor) {
             float d = hypotf(a->world.position.x - wx, a->world.position.z - wz);
+            float door_x, door_z;
             if (a->id == mAc_PROFILE_INSECT) {
                 if (d < TOUCH_HIT_CREATURE)
-                    consider_hit(&best, INTENT_CATCH_BUG, finger_x, finger_y,
+                    consider_hit(&best, INTENT_CATCH_BUG, finger_x, finger_y, wx, wz,
                                  a->world.position.x, a->world.position.y, a->world.position.z,
-                                 EMPTY_NO, a, 0.80f);
+                                 a->world.position.x, a->world.position.z,
+                                 EMPTY_NO, a, 0.80f, px_actor, 32.0f);
             } else if (a->id == mAc_PROFILE_GYOEI) {
                 if (d < TOUCH_HIT_CREATURE)
-                    consider_hit(&best, INTENT_CAST_FISH, finger_x, finger_y,
+                    consider_hit(&best, INTENT_CAST_FISH, finger_x, finger_y, wx, wz,
                                  a->world.position.x, a->world.position.y, a->world.position.z,
-                                 EMPTY_NO, a, 0.82f);
+                                 a->world.position.x, a->world.position.z,
+                                 EMPTY_NO, a, 0.82f, px_actor, 32.0f);
             } else if (part == ACTOR_PART_NPC) {
                 if (d < TOUCH_HIT_NPC)
-                    consider_hit(&best, INTENT_TALK, finger_x, finger_y,
+                    consider_hit(&best, INTENT_TALK, finger_x, finger_y, wx, wz,
                                  a->world.position.x, a->world.position.y + 20.0f, a->world.position.z,
-                                 EMPTY_NO, a, 0.85f);
+                                 a->world.position.x, a->world.position.z,
+                                 EMPTY_NO, a, 0.85f, px_actor, 28.0f);
             } else if (a->id == mAc_PROFILE_MAILBOX) {
                 if (d < TOUCH_HIT_NPC)
-                    consider_hit(&best, INTENT_MAILBOX, finger_x, finger_y,
+                    consider_hit(&best, INTENT_MAILBOX, finger_x, finger_y, wx, wz,
                                  a->world.position.x, a->world.position.y + 20.0f, a->world.position.z,
-                                 EMPTY_NO, a, 0.88f);
-            } else if (a->id == mAc_PROFILE_HOUSE) {
+                                 a->world.position.x, a->world.position.z,
+                                 EMPTY_NO, a, 0.88f, px_actor, 26.0f);
+            } else if (a->id == mAc_PROFILE_AC_SIGN || a->id == mAc_PROFILE_RESERVE ||
+                       a->id == mAc_PROFILE_NAMEPLATE) {
                 if (d < TOUCH_HIT_NPC)
-                    consider_hit(&best, INTENT_DOOR, finger_x, finger_y,
+                    consider_hit(&best, INTENT_READ_SIGN, finger_x, finger_y, wx, wz,
+                                 a->world.position.x, a->world.position.y + 18.0f, a->world.position.z,
+                                 a->world.position.x, a->world.position.z,
+                                 EMPTY_NO, a, 0.88f, px_actor, 26.0f);
+            } else if (a->id == mAc_PROFILE_SHRINE) {
+                if (d < TOUCH_HIT_NPC)
+                    consider_hit(&best, INTENT_TALK, finger_x, finger_y, wx, wz,
                                  a->world.position.x, a->world.position.y + 20.0f, a->world.position.z,
-                                 EMPTY_NO, a, 0.95f);
+                                 a->world.position.x, a->world.position.z,
+                                 EMPTY_NO, a, 0.90f, px_actor, 26.0f);
+            } else if (a->id == mAc_PROFILE_DUMP) {
+                if (d < TOUCH_HIT_NPC)
+                    consider_hit(&best, INTENT_OPEN, finger_x, finger_y, wx, wz,
+                                 a->world.position.x, a->world.position.y + 20.0f, a->world.position.z,
+                                 a->world.position.x, a->world.position.z,
+                                 EMPTY_NO, a, 0.90f, px_actor, 26.0f);
+            } else if (structure_door_points(a, &door_x, &door_z, NULL, NULL)) {
+                float dd = hypotf(door_x - wx, door_z - wz);
+                if (dd < TOUCH_HIT_NPC || d < TOUCH_HIT_NPC)
+                    consider_hit(&best, INTENT_DOOR, finger_x, finger_y, wx, wz,
+                                 door_x, a->world.position.y + 25.0f, door_z,
+                                 door_x, door_z,
+                                 EMPTY_NO, a, 0.92f, px_actor, 28.0f);
             }
         }
     }
@@ -1614,19 +1794,43 @@ static int resolve_world_hit(float finger_x, float finger_y, float wx, float wz,
     for (i = 0; i < 9; i++) {
         xyz_t at, center;
         mActor_name_t* fg;
-        int kind;
-        float d;
+        int kind, is_tall;
+        float d, hit_y, max_px, max_w;
         at.x = wx + ox[i];
         at.y = py;
         at.z = wz + oz[i];
         fg = mFI_GetUnitFG(at);
-        if (fg == NULL || *fg == EMPTY_NO) continue;
-        kind = classify_fg_item(*fg);
-        if (kind == INTENT_NONE) continue;
+        if (fg == NULL) continue;
         if (!mFI_Wpos2UtCenterWpos(&center, at)) center = at;
+        kind = classify_fg_at(play, center, *fg);
+        if (kind == INTENT_NONE) continue;
         d = hypotf(center.x - wx, center.z - wz);
         if (d > TOUCH_HIT_FG) continue;
-        consider_hit(&best, kind, finger_x, finger_y, center.x, py + 10.0f, center.z, *fg, NULL, 1.0f);
+        is_tall = (kind == INTENT_SHAKE_TREE || kind == INTENT_CHOP_TREE ||
+                   kind == INTENT_READ_SIGN || kind == INTENT_DOOR || kind == INTENT_FURNITURE);
+        hit_y = py + ((kind == INTENT_SHAKE_TREE || kind == INTENT_CHOP_TREE) ? 28.0f :
+                      (kind == INTENT_READ_SIGN || kind == INTENT_DOOR) ? 22.0f : 6.0f);
+        max_px = is_tall ? px_actor : px_small_fg;
+        max_w = is_tall ? 26.0f : 22.0f;
+        consider_hit(&best, kind, finger_x, finger_y, wx, wz,
+                     center.x, hit_y, center.z, center.x, center.z,
+                     *fg, NULL, 1.0f, max_px, max_w);
+    }
+
+    if (best.kind == INTENT_WALK && mPlib_PC_TouchHoldingTool((GAME*)play, mPlib_PC_TOOL_ROD)) {
+        xyz_t water_pos;
+        u32 attr;
+        water_pos.x = wx;
+        water_pos.y = py;
+        water_pos.z = wz;
+        attr = mCoBG_Wpos2Attribute(water_pos, NULL);
+        if (mCoBG_CheckWaterAttribute(attr)) {
+            best.kind = INTENT_CAST_FISH;
+            best.x = wx;
+            best.z = wz;
+            best.face_x = wx;
+            best.face_z = wz;
+        }
     }
 
     *out = best;
@@ -1655,16 +1859,40 @@ static void intent_set_stand_point(TouchIntent* it, PLAYER_ACTOR* player) {
         it->arrive = TOUCH_ARRIVE;
         return;
     }
-    /* Signs: if already close, turn in place; long walks still approach the front. */
+    px = player->actor_class.world.position.x;
+    pz = player->actor_class.world.position.z;
+    /* Signs / boards: always stand south facing north so dialogue/reader triggers. */
     if (it->kind == INTENT_READ_SIGN) {
-        px = player->actor_class.world.position.x;
-        pz = player->actor_class.world.position.z;
-        dx = it->face_x - px;
-        dz = it->face_z - pz;
-        len = sqrtf(dx * dx + dz * dz);
-        if (len <= it->arrive + 8.0f) {
+        float sdx = px - it->face_x;
+        float sdz = pz - it->face_z;
+        if (sdz >= 14.0f && sdz <= 40.0f && fabsf(sdx) <= 16.0f) {
             it->tx = px;
             it->tz = pz;
+        } else {
+            it->tx = it->face_x;
+            it->tz = it->face_z + 26.0f;
+        }
+        return;
+    }
+    if (it->kind == INTENT_MAILBOX && it->actor != NULL && it->actor->id == mAc_PROFILE_MAILBOX) {
+        MAILBOX_ACTOR* mbx = (MAILBOX_ACTOR*)it->actor;
+        float posX = (mbx->arrange_idx & 1) ? -24.0f : 24.0f;
+        it->tx = it->actor->world.position.x + posX;
+        it->tz = it->actor->world.position.z + 24.0f;
+        return;
+    }
+    if (it->kind == INTENT_DOOR || it->kind == INTENT_OPEN) {
+        float door_x, door_z, stand_x, stand_z;
+        if (it->actor != NULL && structure_door_points(it->actor, &door_x, &door_z, &stand_x, &stand_z)) {
+            it->face_x = door_x;
+            it->face_z = door_z;
+            it->tx = stand_x;
+            it->tz = stand_z;
+            return;
+        }
+        if (it->actor == NULL) {
+            it->tx = it->face_x;
+            it->tz = it->face_z + 28.0f;
             return;
         }
     }
@@ -1675,7 +1903,7 @@ static void intent_set_stand_point(TouchIntent* it, PLAYER_ACTOR* player) {
         probe.z = it->face_z;
         attr = mCoBG_Wpos2Attribute(probe, NULL);
         if (it->kind == INTENT_CAST_FISH || mCoBG_CheckWaterAttribute(attr)) {
-            if (find_shore_stand(it->face_x, it->face_z, player->actor_class.world.position.y, &sx, &sz)) {
+            if (find_shore_stand(it->face_x, it->face_z, px, player->actor_class.world.position.y, pz, &sx, &sz)) {
                 it->tx = sx;
                 it->tz = sz;
                 it->arrive = (it->kind == INTENT_CAST_FISH) ? 18.0f : it->arrive;
@@ -1687,8 +1915,6 @@ static void intent_set_stand_point(TouchIntent* it, PLAYER_ACTOR* player) {
             }
         }
     }
-    px = player->actor_class.world.position.x;
-    pz = player->actor_class.world.position.z;
     dx = it->face_x - px;
     dz = it->face_z - pz;
     len = sqrtf(dx * dx + dz * dz);
@@ -1716,9 +1942,11 @@ static int intent_fire_hook(GAME* game) {
     switch (s_intent.kind) {
         case INTENT_TALK:
             ok = mPlib_PC_TouchRequestTalk(game, s_intent.actor);
+            if (ok) s_pulse_a = 1;
             break;
         case INTENT_READ_SIGN:
-            ok = mPlib_PC_TouchRequestPickup(game, s_intent.item, &target, &item_pos, 1);
+            ok = mPlib_PC_TouchRequestReadSign(game, s_intent.actor, s_intent.item, &target);
+            if (ok) s_pulse_a = 1;
             break;
         case INTENT_PICKUP:
             ok = mPlib_PC_TouchRequestPickup(game, s_intent.item, &target, &item_pos, 0);
@@ -1778,6 +2006,7 @@ static int intent_fire_hook(GAME* game) {
             float pz = pl ? pl->actor_class.world.position.z : target.z;
             s16 ang = (s16)(atan2f(target.x - px, target.z - pz) * (32768.0f / 3.14159265f));
             ok = mPlib_PC_TouchRequestDoor(game, &target, ang, s_intent.actor);
+            if (ok) s_pulse_a = 1;
             break;
         }
         case INTENT_FURNITURE:
@@ -1854,14 +2083,20 @@ static void begin_move(float x, float y, int fresh) {
     const char* kind_name;
     xyz_t center;
     if (!g_pc_settings.touch_move || !can_steer()) return;
-    if (mPlib_PC_TouchBusy((GAME*)get_game_play())) {
+    play = get_game_play();
+    player = (play != NULL) ? get_player_actor_withoutCheck(play) : NULL;
+    if (player != NULL && player->now_main_index == mPlayer_INDEX_RELAX_ROD) {
+        latch_button(PAD_BUTTON_A, "A");
+        pc_touch_buzz();
+        note_tap("reel");
+        return;
+    }
+    if (mPlib_PC_TouchBusy((GAME*)play)) {
         pc_touch_buzz();
         return;
     }
     if (!tap_to_world(x, y, &wx, &wz)) return;
 
-    play = get_game_play();
-    player = (play != NULL) ? get_player_actor_withoutCheck(play) : NULL;
     resolve_world_hit(x, y, wx, wz, &hit);
 
     if (hit.kind == INTENT_PITFALL_REFUSE) {
@@ -1970,7 +2205,7 @@ static void begin_move(float x, float y, int fresh) {
         dist_from_player = hypotf(s_intent.tx - player->actor_class.world.position.x,
                                   s_intent.tz - player->actor_class.world.position.z);
         s_running = (!s_intent.force_walk && dist_from_player > 260.0f) ? 1 : 0;
-        if (intent_needs_act() && dist_from_player <= s_intent.arrive) {
+        if (intent_needs_act() && dist_from_player <= TOUCH_STAND_ARRIVE) {
             if (s_intent.need_tool != mPlib_PC_TOOL_NONE) {
                 s_intent.phase = INTENT_PHASE_EQUIP;
                 s_intent.equip_frames = 0;
@@ -2036,6 +2271,12 @@ static void refresh_action_label(void) {
         return;
     }
 
+    player = get_player_actor_withoutCheck(play);
+    if (player != NULL && player->now_main_index == mPlayer_INDEX_RELAX_ROD) {
+        snprintf(s_action, sizeof(s_action), "Reel");
+        return;
+    }
+
     if (s_preview_kind != INTENT_NONE && s_preview_verb[0]) {
         snprintf(s_action, sizeof(s_action), "%s", s_preview_verb);
         return;
@@ -2075,7 +2316,7 @@ static void refresh_action_label(void) {
         ahead.z += cosf(player->actor_class.shape_info.rotation.y * 3.14159265f / 32768.0f) * hand_dist[i];
         fg = mFI_GetUnitFG(ahead);
         if (fg == NULL || *fg == EMPTY_NO) continue;
-        kind = classify_fg_item(*fg);
+        kind = classify_fg_at(play, ahead, *fg);
         if (kind != INTENT_NONE && kind != INTENT_WALK) {
             intent_verb_for(kind, s_action, sizeof(s_action));
             return;
@@ -3390,9 +3631,6 @@ touch_edge_pass:
         }
     }
 
-    if (s_pulse_a) { latch_button(PAD_BUTTON_A, "A"); s_pulse_a = 0; pc_touch_buzz(); }
-    if (s_pulse_b) { latch_button(PAD_BUTTON_B, "B"); s_pulse_b = 0; pc_touch_buzz(); }
-    latch_consume(buttons);
     if (s_swipe != 0) {
         if (s_swipe == 1 && stick_x != NULL && *stick_x == 0) *stick_x = 90;
         else if (s_swipe == -1 && stick_x != NULL && *stick_x == 0) *stick_x = -90;
@@ -3403,6 +3641,9 @@ touch_edge_pass:
     }
     if (s_intent.kind != INTENT_NONE && stick_x && stick_y && *stick_x == 0 && *stick_y == 0)
         (void)intent_steer(stick_x, stick_y);
+    if (s_pulse_a) { latch_button(PAD_BUTTON_A, "A"); s_pulse_a = 0; pc_touch_buzz(); }
+    if (s_pulse_b) { latch_button(PAD_BUTTON_B, "B"); s_pulse_b = 0; pc_touch_buzz(); }
+    latch_consume(buttons);
     if (s_running && s_have_target && can_steer() && buttons != NULL) *buttons |= PAD_BUTTON_B;
     if (!s_have_target) s_running = 0;
 }

@@ -42,6 +42,11 @@ static void Player_actor_SearchAnimation_Ready_rod(ACTOR* actor, GAME* game, f32
     }
 }
 
+#ifdef TARGET_PC
+static int s_pc_touch_rod_target_active = FALSE;
+static xyz_t s_pc_touch_rod_target_pos;
+#endif
+
 static void Player_actor_request_proc_index_fromReady_rod(ACTOR* actor, GAME* game) {
     static const f32 array_addX[] = {
         0.0f, -10.0f, 10.0f, -10.0f, 10.0f,
@@ -75,6 +80,14 @@ static void Player_actor_request_proc_index_fromReady_rod(ACTOR* actor, GAME* ga
         pos.x = actor->world.position.x + sin;
         pos.z = actor->world.position.z + (cos);
         pos.y = 0.0f;
+
+#ifdef TARGET_PC
+        if (s_pc_touch_rod_target_active) {
+            pos.x = s_pc_touch_rod_target_pos.x;
+            pos.z = s_pc_touch_rod_target_pos.z;
+            s_pc_touch_rod_target_active = FALSE;
+        }
+#endif
 
         ready = TRUE;
 

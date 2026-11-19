@@ -88,6 +88,7 @@ extern int mPlib_PC_TouchEquipTool(GAME* game, int tool_kind);
 extern int mPlib_PC_TouchHoldingTool(GAME* game, int tool_kind);
 extern int mPlib_PC_TouchHasToolInPockets(int tool_kind);
 extern int mPlib_PC_TouchRequestTalk(GAME* game, ACTOR* talk_actor);
+extern int mPlib_PC_TouchRequestReadSign(GAME* game, ACTOR* sign_actor, mActor_name_t item, const xyz_t* target_pos);
 extern int mPlib_PC_TouchRequestPickup(GAME* game, mActor_name_t item, const xyz_t* target_pos,
                                        const xyz_t* item_pos, int signboard_flag);
 extern int mPlib_PC_TouchRequestRemoveGrass(GAME* game, const xyz_t* target_pos, const xyz_t* grass_pos);

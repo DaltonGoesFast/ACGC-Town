@@ -1899,6 +1899,10 @@ int PC_Test_ForceRequestRemoveGrass(GAME* game, const xyz_t* target_pos, const x
     return Player_actor_request_main_remove_grass(game, target_pos, grass_pos);
 }
 
+extern void* g_pc_demo_force_talk_actor;
+extern int pc_ofurn_hide_leaf(int ut_x, int ut_z, int item);
+extern int pc_ofurn_front_press(GAME* game, int a_trigger, int b_trigger);
+
 /* Semantic touch: pocket tool match for auto-equip. Golden variants count. */
 static int mPlib_PC_item_is_tool_kind(mActor_name_t item, int tool_kind) {
     switch (tool_kind) {
@@ -1933,6 +1937,7 @@ int mPlib_PC_TouchHoldingTool(GAME* game, int tool_kind) {
     PLAYER_ACTOR* player = GET_PLAYER_ACTOR_GAME(game);
     Private_c* priv = Common_Get(now_private);
     if (player == NULL || priv == NULL) return 0;
+    if (mPlib_PC_TouchBusy(game)) return 0;
     if (!mPlib_PC_item_is_tool_kind(priv->equipment, tool_kind)) return 0;
     switch (tool_kind) {
         case mPlib_PC_TOOL_AXE:
@@ -1948,7 +1953,8 @@ int mPlib_PC_TouchHoldingTool(GAME* game, int tool_kind) {
     }
 }
 
-/* Same pocket swap + takeout path as the tool wheel / D-pad cycle. */
+/* Swap pocket tool directly into priv->equipment so Player_actor_request_change_item
+ * equips it cleanly without stalling in priority-37 TAKEOUT_ITEM. */
 int mPlib_PC_TouchEquipTool(GAME* game, int tool_kind) {
     Private_c* priv = Common_Get(now_private);
     mActor_name_t held;
@@ -1956,7 +1962,7 @@ int mPlib_PC_TouchEquipTool(GAME* game, int tool_kind) {
     if (game == NULL || priv == NULL || tool_kind == mPlib_PC_TOOL_NONE) return 0;
     if (mPlib_PC_TouchHoldingTool(game, tool_kind)) return 1;
     if (mPlib_PC_item_is_tool_kind(priv->equipment, tool_kind)) {
-        return Player_actor_request_main_takeout_item(game, mPlayer_REQUEST_PRIORITY_37);
+        return 1;
     }
     held = priv->equipment;
     for (i = 0; i < mPr_POCKETS_SLOT_COUNT; i++) {
@@ -1969,7 +1975,8 @@ int mPlib_PC_TouchEquipTool(GAME* game, int tool_kind) {
             mPr_SetPossessionItem(priv, i, EMPTY_NO, 0);
         }
         priv->equipment = slot_item;
-        return Player_actor_request_main_takeout_item(game, mPlayer_REQUEST_PRIORITY_37);
+        sAdo_SysTrgStart(NA_SE_5E);
+        return 1;
     }
     return 0;
 }
@@ -1995,66 +2002,204 @@ int mPlib_PC_TouchBusy(GAME* game) {
 }
 
 int mPlib_PC_TouchRequestTalk(GAME* game, ACTOR* talk_actor) {
-    if (game == NULL || talk_actor == NULL) return 0;
-    return mPlib_request_main_talk_type1(game, talk_actor, TRUE, FALSE);
+    ACTOR* player_actor = GET_PLAYER_ACTOR_GAME_ACTOR(game);
+    if (game == NULL || talk_actor == NULL || player_actor == NULL) return 0;
+    mPlib_PC_face_xz(player_actor, talk_actor->world.position.x, talk_actor->world.position.z);
+    Player_actor_check_forward(player_actor, game);
+    g_pc_demo_force_talk_actor = (void*)talk_actor;
+    return 1;
+}
+
+int mPlib_PC_TouchRequestReadSign(GAME* game, ACTOR* sign_actor, mActor_name_t item, const xyz_t* target_pos) {
+    ACTOR* player_actor = GET_PLAYER_ACTOR_GAME_ACTOR(game);
+    (void)item;
+    if (game == NULL || target_pos == NULL || player_actor == NULL) return 0;
+    if (sign_actor == NULL) {
+        xyz_t unit_center;
+        mActor_name_t* fg_p;
+        if (!mFI_Wpos2UtCenterWpos(&unit_center, *target_pos)) unit_center = *target_pos;
+        fg_p = mFI_GetUnitFG(unit_center);
+        if (fg_p == NULL || *fg_p == EMPTY_NO) return 0;
+    }
+    mPlib_PC_face_xz(player_actor, target_pos->x, target_pos->z);
+    Player_actor_check_forward(player_actor, game);
+    if (sign_actor != NULL) {
+        g_pc_demo_force_talk_actor = (void*)sign_actor;
+    }
+    return 1;
 }
 
 int mPlib_PC_TouchRequestPickup(GAME* game, mActor_name_t item, const xyz_t* target_pos, const xyz_t* item_pos,
                                 int signboard_flag) {
-    mActor_name_t changed;
+    ACTOR* player_actor = GET_PLAYER_ACTOR_GAME_ACTOR(game);
+    xyz_t unit_center, disp_pos;
+    mActor_name_t* fg_p;
+    mActor_name_t live_item, changed;
     int slot_idx;
-    if (game == NULL || target_pos == NULL || item_pos == NULL) return 0;
-    changed = signboard_flag ? ITM_SIGNBOARD : item;
-    slot_idx = mPlib_Get_space_putin_item_forTICKET(&changed);
-    if (slot_idx < 0) {
-        Player_actor_Request_main_refuse_pickup_all(game, FALSE);
-        return 0;
+    int bell_fits = 0;
+    (void)item;
+    (void)item_pos;
+    if (game == NULL || target_pos == NULL || player_actor == NULL) return 0;
+    if (!mFI_Wpos2UtCenterWpos(&unit_center, *target_pos)) unit_center = *target_pos;
+    fg_p = mFI_GetUnitFG(unit_center);
+    if (fg_p == NULL || *fg_p == EMPTY_NO) return 0;
+    live_item = *fg_p;
+    disp_pos = unit_center;
+    Player_actor_Get_ItemDisplayPos(&disp_pos, &unit_center);
+    changed = signboard_flag ? ITM_SIGNBOARD : live_item;
+#ifdef PC_ENHANCEMENTS
+    {
+        u32 bell_amount = mPr_GetAmountForMoneyItem(changed);
+        int own_room = (pc_net_game_role() == PC_NETGAME_ROLE_CLIENT && pc_net_game_client_own_room_local());
+        if (bell_amount > 0 && !own_room && Now_Private != NULL &&
+            (u32)Now_Private->inventory.wallet + bell_amount <= (u32)mPr_WALLET_MAX) {
+            bell_fits = 1;
+        }
     }
-    mPlib_PC_face_xz(GET_PLAYER_ACTOR_GAME_ACTOR(game), target_pos->x, target_pos->z);
-    return Player_actor_request_main_pickup(game, changed, target_pos, item_pos, slot_idx, signboard_flag);
+#endif
+    if (pc_net_game_role() == PC_NETGAME_ROLE_CLIENT && !pc_net_game_client_own_room_local() &&
+        pc_net_game_client_pickup_no_room(changed)) {
+        mPlib_PC_face_xz(player_actor, unit_center.x, unit_center.z);
+        Player_actor_Request_main_refuse_pickup_all(game, FALSE);
+        return 1;
+    }
+    slot_idx = mPlib_Get_space_putin_item_forTICKET(&changed);
+    if (slot_idx < 0 && !bell_fits) {
+        mPlib_PC_face_xz(player_actor, unit_center.x, unit_center.z);
+        Player_actor_Request_main_refuse_pickup_all(game, FALSE);
+        return 1;
+    }
+    mPlib_PC_face_xz(player_actor, unit_center.x, unit_center.z);
+    return Player_actor_request_main_pickup(game, changed, &unit_center, &disp_pos, slot_idx, signboard_flag);
 }
 
 int mPlib_PC_TouchRequestRemoveGrass(GAME* game, const xyz_t* target_pos, const xyz_t* grass_pos) {
-    if (game == NULL || target_pos == NULL || grass_pos == NULL) return 0;
-    mPlib_PC_face_xz(GET_PLAYER_ACTOR_GAME_ACTOR(game), target_pos->x, target_pos->z);
-    return Player_actor_request_main_remove_grass(game, target_pos, grass_pos);
+    ACTOR* player_actor = GET_PLAYER_ACTOR_GAME_ACTOR(game);
+    xyz_t unit_center, disp_pos;
+    mActor_name_t* fg_p;
+    (void)grass_pos;
+    if (game == NULL || target_pos == NULL || player_actor == NULL) return 0;
+    if (!mFI_Wpos2UtCenterWpos(&unit_center, *target_pos)) unit_center = *target_pos;
+    fg_p = mFI_GetUnitFG(unit_center);
+    if (fg_p == NULL || !IS_ITEM_GRASS(*fg_p)) return 0;
+    disp_pos = unit_center;
+    Player_actor_Get_ItemDisplayPos(&disp_pos, &unit_center);
+    mPlib_PC_face_xz(player_actor, unit_center.x, unit_center.z);
+    return Player_actor_request_main_remove_grass(game, &unit_center, &disp_pos);
 }
 
 int mPlib_PC_TouchRequestShakeTree(GAME* game, const xyz_t* target_pos, mActor_name_t item, int tree_ut_x,
                                    int tree_ut_z) {
-    if (game == NULL || target_pos == NULL) return 0;
-    mPlib_PC_face_xz(GET_PLAYER_ACTOR_GAME_ACTOR(game), target_pos->x, target_pos->z);
-    return Player_actor_request_main_shake_tree_all(game, target_pos, item, tree_ut_x, tree_ut_z,
+    ACTOR* player_actor = GET_PLAYER_ACTOR_GAME_ACTOR(game);
+    xyz_t unit_center;
+    mActor_name_t* fg_p;
+    int ut_x = tree_ut_x;
+    int ut_z = tree_ut_z;
+    (void)item;
+    if (game == NULL || target_pos == NULL || player_actor == NULL) return 0;
+    if (!mFI_Wpos2UtCenterWpos(&unit_center, *target_pos)) unit_center = *target_pos;
+    fg_p = mFI_GetUnitFG(unit_center);
+    if (fg_p == NULL || !IS_ITEM_COLLIDEABLE_TREE(*fg_p)) return 0;
+    if (!mFI_Wpos2UtNum(&ut_x, &ut_z, unit_center)) return 0;
+    if (!Player_actor_Check_able_shake_tree_table(player_actor, ut_x, ut_z, FALSE, 16.0f)) return 0;
+    mPlib_PC_face_xz(player_actor, unit_center.x, unit_center.z);
+    return Player_actor_request_main_shake_tree_all(game, &unit_center, *fg_p, ut_x, ut_z,
                                                     mPlayer_REQUEST_PRIORITY_5);
 }
 
 int mPlib_PC_TouchRequestSwingAxe(GAME* game, xyz_t* target_pos, mActor_name_t item, int tree_ut_x, int tree_ut_z) {
+    ACTOR* player_actor = GET_PLAYER_ACTOR_GAME_ACTOR(game);
+    xyz_t unit_center;
+    mActor_name_t* fg_p;
     mActor_name_t damage_itemNo;
-    if (game == NULL || target_pos == NULL) return 0;
+    int ut_x = tree_ut_x;
+    int ut_z = tree_ut_z;
+    (void)item;
+    if (game == NULL || target_pos == NULL || player_actor == NULL) return 0;
     if (!mPlib_PC_TouchHoldingTool(game, mPlib_PC_TOOL_AXE)) return 0;
-    mPlib_PC_face_xz(GET_PLAYER_ACTOR_GAME_ACTOR(game), target_pos->x, target_pos->z);
+    if (!mFI_Wpos2UtCenterWpos(&unit_center, *target_pos)) unit_center = *target_pos;
+    fg_p = mFI_GetUnitFG(unit_center);
+    if (fg_p == NULL || !IS_ITEM_COLLIDEABLE_TREE(*fg_p)) return 0;
+    if (!mFI_Wpos2UtNum(&ut_x, &ut_z, unit_center)) return 0;
+    mPlib_PC_face_xz(player_actor, unit_center.x, unit_center.z);
     damage_itemNo = Player_actor_GetitemNo_forDamageAxe(Player_actor_Get_ItemNoSubmenu(), FALSE);
     if (damage_itemNo == EMPTY_NO) {
-        return Player_actor_request_main_broken_axe_type_swing(game, target_pos, item, tree_ut_x, tree_ut_z,
+        return Player_actor_request_main_broken_axe_type_swing(game, &unit_center, *fg_p, ut_x, ut_z,
                                                                mPlayer_REQUEST_PRIORITY_4);
     }
-    return Player_actor_request_main_swing_axe_all(game, target_pos, item, damage_itemNo, tree_ut_x, tree_ut_z,
+    return Player_actor_request_main_swing_axe_all(game, &unit_center, *fg_p, damage_itemNo, ut_x, ut_z,
                                                    mPlayer_REQUEST_PRIORITY_4);
 }
 
 int mPlib_PC_TouchRequestDig(GAME* game, const xyz_t* target_pos, mActor_name_t item) {
-    if (game == NULL || target_pos == NULL) return 0;
+    PLAYER_ACTOR* player = GET_PLAYER_ACTOR_GAME(game);
+    xyz_t unit_center;
+    mActor_name_t hit_item = EMPTY_NO;
+    int gold_shovel, dig_status;
+    (void)item;
+    if (game == NULL || target_pos == NULL || player == NULL) return 0;
     if (!mPlib_PC_TouchHoldingTool(game, mPlib_PC_TOOL_SHOVEL)) return 0;
-    mPlib_PC_face_xz(GET_PLAYER_ACTOR_GAME_ACTOR(game), target_pos->x, target_pos->z);
-    return Player_actor_request_main_dig_scoop_all(game, target_pos, item, mPlayer_REQUEST_PRIORITY_4);
+    if (!mFI_Wpos2UtCenterWpos(&unit_center, *target_pos)) unit_center = *target_pos;
+    mPlib_PC_face_xz(&player->actor_class, unit_center.x, unit_center.z);
+    gold_shovel = (player->item_kind == mPlayer_ITEM_KIND_GOLD_SHOVEL);
+    dig_status = mFI_GetDigStatus(&hit_item, unit_center, gold_shovel);
+    switch (dig_status) {
+        case mFI_DIGSTATUS_FILLIN:
+            return Player_actor_request_main_fill_scoop_all(game, &unit_center, mPlayer_REQUEST_PRIORITY_4);
+        case mFI_DIGSTATUS_DIG:
+        case mFI_DIGSTATUS_PUT_ITEM:
+            return Player_actor_request_main_dig_scoop_all(game, &unit_center, hit_item, mPlayer_REQUEST_PRIORITY_4);
+        case mFI_DIGSTATUS_GET_ITEM:
+            if (pc_net_game_role() == PC_NETGAME_ROLE_CLIENT) {
+                int ut_x, ut_z;
+                mActor_name_t* raw_fg_p = mFI_GetUnitFG(unit_center);
+                mActor_name_t raw_fg = raw_fg_p != NULL ? *raw_fg_p : (mActor_name_t)EMPTY_NO;
+                int have_free_slot =
+                    (Now_Private != NULL && mPr_GetPossessionItemIdx(Now_Private, (mActor_name_t)EMPTY_NO) >= 0);
+
+                if (raw_fg == (mActor_name_t)SHINE_SPOT) {
+                    if (have_free_slot && mFI_Wpos2UtNum(&ut_x, &ut_z, unit_center)) {
+                        pc_net_game_request_dig_shine_with_grant(ut_x, ut_z, (int)hit_item);
+                    }
+                    return 1;
+                } else if (gold_shovel && raw_fg == (mActor_name_t)EMPTY_NO && hit_item == ITM_MONEY_100) {
+                    int hn = mCoBG_GetHoleNumber(unit_center);
+                    if (have_free_slot && hn >= 0 && mFI_Wpos2UtNum(&ut_x, &ut_z, unit_center)) {
+                        pc_net_game_request_dig_hole_with_grant(ut_x, ut_z, hn, (int)ITM_MONEY_100);
+                    }
+                    return 1;
+                } else if (mFI_Wpos2UtNum(&ut_x, &ut_z, unit_center)) {
+                    if (pc_net_game_request_dig_buried(ut_x, ut_z)) {
+                        return 1;
+                    }
+                    if (pc_net_game_client_link_state() != PC_NETGAME_LINK_READY) {
+                        return 1;
+                    }
+                }
+            }
+            return Player_actor_request_main_get_scoop_all(game, &unit_center, hit_item, mPlayer_REQUEST_PRIORITY_4);
+        case mFI_DIGSTATUS_MISS:
+            return Player_actor_request_main_air_scoop_all(game, mPlayer_REQUEST_PRIORITY_4);
+        case mFI_DIGSTATUS_CANCEL:
+        default:
+            return Player_actor_request_main_reflect_scoop_all(game, &unit_center, hit_item, NULL,
+                                                               mPlayer_REQUEST_PRIORITY_4);
+    }
 }
 
 int mPlib_PC_TouchRequestHitRock(GAME* game, const xyz_t* target_pos, mActor_name_t item) {
-    if (game == NULL || target_pos == NULL) return 0;
+    ACTOR* player_actor = GET_PLAYER_ACTOR_GAME_ACTOR(game);
+    xyz_t unit_center;
+    mActor_name_t* fg_p;
+    (void)item;
+    if (game == NULL || target_pos == NULL || player_actor == NULL) return 0;
     if (!mPlib_PC_TouchHoldingTool(game, mPlib_PC_TOOL_SHOVEL)) return 0;
-    mPlib_PC_face_xz(GET_PLAYER_ACTOR_GAME_ACTOR(game), target_pos->x, target_pos->z);
+    if (!mFI_Wpos2UtCenterWpos(&unit_center, *target_pos)) unit_center = *target_pos;
+    fg_p = mFI_GetUnitFG(unit_center);
+    if (fg_p == NULL || !IS_ITEM_ROCK(*fg_p)) return 0;
+    mPlib_PC_face_xz(player_actor, unit_center.x, unit_center.z);
     /* Rock hit is the shovel reflect-scoop request (same branch as vanilla rock hits). */
-    return Player_actor_request_main_reflect_scoop_all(game, target_pos, item, NULL, mPlayer_REQUEST_PRIORITY_4);
+    return Player_actor_request_main_reflect_scoop_all(game, &unit_center, *fg_p, NULL, mPlayer_REQUEST_PRIORITY_4);
 }
 
 int mPlib_PC_TouchRequestSwingNet(GAME* game) {
@@ -2064,10 +2209,17 @@ int mPlib_PC_TouchRequestSwingNet(GAME* game) {
 }
 
 int mPlib_PC_TouchRequestCastRod(GAME* game, const xyz_t* bobber_pos) {
+    int ok;
     if (game == NULL || bobber_pos == NULL) return 0;
     if (!mPlib_PC_TouchHoldingTool(game, mPlib_PC_TOOL_ROD)) return 0;
     mPlib_PC_face_xz(GET_PLAYER_ACTOR_GAME_ACTOR(game), bobber_pos->x, bobber_pos->z);
-    return Player_actor_request_main_cast_rod(game, bobber_pos, mPlayer_REQUEST_PRIORITY_21);
+    s_pc_touch_rod_target_pos = *bobber_pos;
+    s_pc_touch_rod_target_active = TRUE;
+    ok = Player_actor_request_main_ready_rod(game, mPlayer_REQUEST_PRIORITY_21);
+    if (!ok) {
+        s_pc_touch_rod_target_active = FALSE;
+    }
+    return ok;
 }
 
 int mPlib_PC_TouchRequestMailbox(GAME* game, ACTOR* mailbox_actor) {
@@ -2088,25 +2240,32 @@ int mPlib_PC_TouchRequestMailbox(GAME* game, ACTOR* mailbox_actor) {
 }
 
 int mPlib_PC_TouchRequestDoor(GAME* game, const xyz_t* pos, s16 angle_y, void* door_label) {
-    if (game == NULL || pos == NULL) return 0;
-    mPlib_PC_face_xz(GET_PLAYER_ACTOR_GAME_ACTOR(game), pos->x, pos->z);
+    ACTOR* player_actor = GET_PLAYER_ACTOR_GAME_ACTOR(game);
+    (void)angle_y;
+    if (game == NULL || pos == NULL || player_actor == NULL) return 0;
+    mPlib_PC_face_xz(player_actor, pos->x, pos->z);
+    Player_actor_check_forward(player_actor, game);
     if (door_label != NULL) {
-        if (mPlib_request_main_door_type1(game, pos, angle_y, 0, door_label)) return 1;
-        if (mPlib_request_main_door_type2(game, pos, angle_y, 0, door_label)) return 1;
+        g_pc_demo_force_talk_actor = door_label;
     }
-    return Player_actor_request_main_knock_door(game, pos, angle_y, mPlayer_REQUEST_PRIORITY_4);
+    return 1;
 }
 
 int mPlib_PC_TouchRequestPickupFurniture(GAME* game, mActor_name_t item, const xyz_t* item_pos) {
-    int slot_idx;
-    if (game == NULL || item_pos == NULL) return 0;
-    slot_idx = mPr_GetPossessionItemIdxWithCond(Now_Private, EMPTY_NO, mPr_ITEM_COND_NORMAL);
-    if (slot_idx < 0) {
-        Player_actor_Request_main_refuse_pickup_all(game, FALSE);
-        return 0;
+    ACTOR* player_actor = GET_PLAYER_ACTOR_GAME_ACTOR(game);
+    xyz_t unit_center;
+    mActor_name_t* fg_p;
+    int ut_x, ut_z;
+    (void)item;
+    if (game == NULL || item_pos == NULL || player_actor == NULL) return 0;
+    if (!mFI_Wpos2UtCenterWpos(&unit_center, *item_pos)) unit_center = *item_pos;
+    fg_p = mFI_GetUnitFG(unit_center);
+    if (fg_p == NULL || *fg_p == EMPTY_NO) return 0;
+    mPlib_PC_face_xz(player_actor, unit_center.x, unit_center.z);
+    if (mFI_Wpos2UtNum(&ut_x, &ut_z, unit_center) && pc_ofurn_hide_leaf(ut_x, ut_z, (int)*fg_p)) {
+        return pc_ofurn_front_press(game, 0, 1) ? 1 : 0;
     }
-    mPlib_PC_face_xz(GET_PLAYER_ACTOR_GAME_ACTOR(game), item_pos->x, item_pos->z);
-    return Player_actor_request_main_pickup_furniture(game, slot_idx, item, item_pos);
+    return mPlib_PC_TouchRequestPickup(game, *fg_p, &unit_center, &unit_center, 0);
 }
 
 /* PUPPET ACTION_EXT real-process verification (worker P2), TEST-ONLY: the only caller is pc_net_game.c's pcnetgame_aext_test_hook()
