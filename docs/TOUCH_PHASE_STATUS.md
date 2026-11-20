@@ -26,10 +26,10 @@ Phase 2 UI (sheet polish, emotes, confirms) remains out of scope until after sem
   - `include/m_player_lib.h` — declarations (including `mPlib_PC_TouchRequestReadSign`)
   - `pc/src/pc_touch.c` — bounded screen-space hit test, player-side cliff/obstacle-free shore stands, per-building doorstep offsets, preview, approach → equip → one hook (`Reel` tap while `RELAX_ROD`), `intent_steer` before latch consume
   - `pc/include/pc_touch.h` — comment
-  - `pc/android/app/build.gradle` — bumped Android `versionCode 41` (`0.26.5`) for semantic-touch test release (`v0.26.5-semantic-touch`)
+  - `pc/android/app/build.gradle` — bumped Android `versionCode 48` (`0.27.9`) for semantic-touch test release (`v0.27.9-semantic-touch`)
   - `docs/ANDROID.md` — touch behavior notes
   - `docs/TOUCH_PHASE_STATUS.md` — this handoff
-- Works now (compiled cleanly on PC & Android debug APK `versionCode 41`; verify on device):
+- Works now (compiled cleanly on PC & Android debug APK `versionCode 48`; verify on device):
   - Finger-down preview shows verb (`Talk`, `Read`, `Pick`, `Shake`, `Chop`, `Catch`, `Cast`, `Reel`, `Dig`, `Hit`, `Mail`, `Open`, `Grab`, `Pull`)
   - Short release commits; drag cancels preview and steers; approach stops at `TOUCH_STAND_ARRIVE` on computed stand points
   - Bounded screen-space hit test prevents nearby items/actors from hijacking empty ground taps
@@ -38,7 +38,7 @@ Phase 2 UI (sheet polish, emotes, confirms) remains out of scope until after sem
   - Villager talk and building doors trigger via `Player_actor_check_forward` + `g_pc_demo_force_talk_actor` + `PAD_BUTTON_A`; rod casting goes through `READY_ROD` so `UKI_ACTOR` spawns cleanly; tapping while `RELAX_ROD` active reels in
   - Pickups snap to tile center, allow full-pocket Bell bags that fit in wallet without spurious failure toasts, and route placed 3D outdoor furniture through `pc_ofurn_front_press(game, 0, 1)`
 - Known bugs / follow-ups:
-  - Phone playtest still required (compiled cleanly via `pc/build64` `ac_pc` and Android debug APK `versionCode 41`; on-device playtest pending)
+  - Phone playtest still required (compiled cleanly via `pc/build64` `ac_pc` and Android debug APK `versionCode 48`; on-device playtest pending)
   - Balloons / slingshot still out of scope
 - Do not regress:
   - Pocket Camp move: tap-to-move + press-drag distance speed + run via far/double tap
